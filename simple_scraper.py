@@ -5,6 +5,7 @@ from typing import Optional, Dict, Any, List
 import requests
 import feedparser
 from bs4 import BeautifulSoup
+from tqdm import tqdm
 
 RSS_SOURCES = [
     {
@@ -16,12 +17,24 @@ RSS_SOURCES = [
         "url": "https://feeds.bbci.co.uk/news/world/rss.xml",
     },
     {
-        "name": "MarketWatch",
-        "url": "https://feeds.content.dowjones.io/public/rss/mw_topstories",
+        "name": "Nasdaq",
+        "url": "https://www.nasdaq.com/feed/rssoutbound?category=Markets",
     },
     {
-        "name": "Bloomberg",
-        "url": "https://feeds.bloomberg.com/markets/news.rss",
+        "name": "Nasdaq",
+        "url": "https://www.nasdaq.com/feed/rssoutbound?category=Investing",
+    },
+    {
+        "name": "Stockbiz",
+        "url": "http://en.stockbiz.vn/RSS/News/Financial.ashx",
+    },
+    {
+        "name": "Stockbiz",
+        "url": "http://en.stockbiz.vn/RSS/News/Market.ashx",
+    },
+    {
+        "name": "CBS MoneyWatch",
+        "url": "https://www.cbsnews.com/latest/rss/moneywatch",
     },
 ]
 OUTPUT_JSON = "cnbc_articles.json"
@@ -68,7 +81,18 @@ def extract_main_text(html: str) -> str:
             seen.add(t)
             deduped.append(t)
 
-    return "\n".join(deduped).strip()
+    text = "\n".join(deduped).strip()
+
+    # Strip trailing boilerplate some sites append
+    noise_markers = [
+        "This data feed is not available",
+    ]
+    for marker in noise_markers:
+        idx = text.find(marker)
+        if idx != -1:
+            text = text[:idx].strip()
+
+    return text
 
 
 def scrape_article(url: str, session: requests.Session) -> Dict[str, Any]:
@@ -126,7 +150,17 @@ def main():
     seen = set()
     source_by_link = {}
     for source in RSS_SOURCES:
-        feed = feedparser.parse(source["url"])
+        try:
+            resp = requests.get(
+                source["url"],
+                timeout=REQUEST_TIMEOUT,
+                headers={"User-Agent": "Mozilla/5.0"},
+            )
+            resp.raise_for_status()
+            feed = feedparser.parse(resp.text)
+        except Exception as e:
+            print(f"Warning: failed to fetch RSS from {source['name']}: {e}")
+            continue
         # RSS entries -> unique links across all sources
         for entry in feed.entries:
             link = entry.get("link")
@@ -140,8 +174,7 @@ def main():
     session = requests.Session()
     articles: List[Dict[str, Any]] = []
 
-    for i, link in enumerate(links, 1):
-        print(f"[{i}/{len(links)}] Scraping: {link}")
+    for link in tqdm(links, desc="Scraping articles"):
         article = scrape_article(link, session)
         source_meta = source_by_link.get(link, {})
         article["source"] = source_meta.get("name")
