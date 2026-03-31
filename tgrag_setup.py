@@ -25,9 +25,6 @@ from sentence_transformers import SentenceTransformer
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from neo4j import GraphDatabase
 
-# ---------------------------------------------------------------------------
-# Config
-# ---------------------------------------------------------------------------
 EMBED_MODEL_NAME = "BAAI/bge-m3"
 DATA_PATH = Path("cnbc_articles.json")
 
@@ -53,10 +50,6 @@ def safe_parse_datetime(value: str):
     except Exception:
         return None
 
-
-# ---------------------------------------------------------------------------
-# Neo4j helpers
-# ---------------------------------------------------------------------------
 def get_existing_article_ids(driver) -> set[str]:
     with driver.session() as session:
         rows = session.run(
@@ -65,9 +58,8 @@ def get_existing_article_ids(driver) -> set[str]:
     return {r["aid"] for r in rows}
 
 
-# ---------------------------------------------------------------------------
-# 1. Load + chunk
-# ---------------------------------------------------------------------------
+# Load and chunk
+
 def load_and_chunk(skip_ids: set[str] | None = None) -> list[dict]:
     splitter = RecursiveCharacterTextSplitter(
         chunk_size=512,
@@ -120,10 +112,8 @@ def load_and_chunk(skip_ids: set[str] | None = None) -> list[dict]:
     )
     return chunks
 
+# Embedding
 
-# ---------------------------------------------------------------------------
-# 2. Embed
-# ---------------------------------------------------------------------------
 def embed_chunks(chunks: list[dict]) -> list[dict]:
     if not chunks:
         print("No new chunks to embed")
@@ -141,9 +131,8 @@ def embed_chunks(chunks: list[dict]) -> list[dict]:
     return chunks
 
 
-# ---------------------------------------------------------------------------
-# 3. Populate Neo4j temporal graph
-# ---------------------------------------------------------------------------
+# Populate Neo4j
+
 def populate_neo4j(chunks: list[dict], reset: bool = False) -> None:
     print("Connecting to Neo4j...")
     driver = GraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASSWORD))
@@ -244,9 +233,6 @@ def populate_neo4j(chunks: list[dict], reset: bool = False) -> None:
     print("Neo4j temporal graph updated successfully")
 
 
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
 def main():
     parser = argparse.ArgumentParser(description="TG-RAG setup")
     parser.add_argument(
