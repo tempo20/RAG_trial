@@ -2,16 +2,21 @@
 Temporal-Graph RAG Setup
 
 Reads cnbc_articles.json, chunks the articles, embeds them,
-and populates the Neo4j temporal graph.
+extracts entities (via Qwen2.5-7B-Instruct), and populates
+the Neo4j temporal graph.
 
 Usage:
-    python tgrag_setup.py            # incremental (add new articles only)
-    python tgrag_setup.py --reset    # wipe graph and rebuild from scratch
+    python tgrag_setup.py                    # incremental update
+    python tgrag_setup.py --reset            # wipe graph and rebuild
+    python tgrag_setup.py --skip-entities    # skip entity extraction
 """
 
 import argparse
-import os
+import gc
 import json
+import os
+import re
+from collections import defaultdict
 from pathlib import Path
 from urllib.parse import urlparse
 from datetime import timezone
@@ -26,6 +31,7 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 from neo4j import GraphDatabase
 
 EMBED_MODEL_NAME = "BAAI/bge-m3"
+EXTRACTION_MODEL_NAME = "Qwen/Qwen2.5-7B-Instruct"
 DATA_PATH = Path("cnbc_articles.json")
 
 NEO4J_URI = os.getenv("NEO4J_URI", "bolt://localhost:7687")
@@ -50,6 +56,107 @@ def safe_parse_datetime(value: str):
     except Exception:
         return None
 
+
+def canonicalize(name: str) -> str:
+    """Normalize an entity name for deduplication."""
+    return re.sub(r"\s+", " ", name.strip()).lower()
+
+
+# Entity extraction 
+
+EXTRACTION_PROMPT = """\
+You are an entity and relationship extractor for news articles.
+
+Extract all named entities and relationships from the article below.
+
+Entity types: PERSON, ORG, STOCK, EVENT, LOCATION, CONCEPT
+
+Output ONLY valid JSON (no markdown, no explanation):
+{{"entities": [{{"name": "...", "type": "..."}}], "relationships": [{{"source": "...", "target": "...", "type": "..."}}]}}
+
+Article:
+{text}"""
+
+
+def load_extraction_model():
+    from transformers import AutoModelForCausalLM, AutoTokenizer, pipeline as _pipeline
+    print(f"Loading extraction model ({EXTRACTION_MODEL_NAME})...")
+    tokenizer = AutoTokenizer.from_pretrained(
+        EXTRACTION_MODEL_NAME, local_files_only=True
+    )
+    model = AutoModelForCausalLM.from_pretrained(
+        EXTRACTION_MODEL_NAME, local_files_only=True
+    )
+    return _pipeline("text-generation", model=model, tokenizer=tokenizer)
+
+
+def _parse_extraction_json(raw: str) -> dict:
+    """Best-effort parse of model output into {entities, relationships}."""
+    raw = re.sub(r"<think>.*?</think>", "", raw, flags=re.DOTALL)
+    raw = re.sub(r"<think>.*", "", raw, flags=re.DOTALL)
+
+    match = re.search(r"\{.*\}", raw, flags=re.DOTALL)
+    if match:
+        try:
+            data = json.loads(match.group())
+            entities = [
+                e for e in data.get("entities", [])
+                if isinstance(e, dict) and "name" in e and "type" in e
+            ]
+            relationships = [
+                r for r in data.get("relationships", [])
+                if isinstance(r, dict)
+                and "source" in r and "target" in r and "type" in r
+            ]
+            return {"entities": entities, "relationships": relationships}
+        except (json.JSONDecodeError, TypeError):
+            pass
+    return {"entities": [], "relationships": []}
+
+
+def extract_entities(article_text: str, pipe) -> dict:
+    prompt = EXTRACTION_PROMPT.format(text=article_text[:4000])
+    messages = [{"role": "user", "content": prompt}]
+    out = pipe(messages, max_new_tokens=1024, do_sample=False)
+    raw = out[0]["generated_text"][-1]["content"]
+    return _parse_extraction_json(raw)
+
+
+def extract_all_entities(
+    chunks: list[dict],
+    pipe,
+) -> dict[str, dict]:
+    """Group chunks by article, extract entities per article."""
+    articles: dict[str, str] = {}
+    for c in chunks:
+        aid = c["article_id"]
+        if aid not in articles:
+            articles[aid] = ""
+        articles[aid] += c["text"] + "\n"
+
+    entity_data: dict[str, dict] = {}
+    total = len(articles)
+    for idx, (aid, text) in enumerate(articles.items(), 1):
+        print(f"  Extracting entities [{idx}/{total}] {aid[:60]}...")
+        result = extract_entities(text, pipe)
+        for e in result["entities"]:
+            e["canonical_name"] = canonicalize(e["name"])
+        for r in result["relationships"]:
+            r["source_canonical"] = canonicalize(r["source"])
+            r["target_canonical"] = canonicalize(r["target"])
+        entity_data[aid] = result
+
+    ent_count = sum(len(d["entities"]) for d in entity_data.values())
+    rel_count = sum(len(d["relationships"]) for d in entity_data.values())
+    print(
+        f"Extracted {ent_count} entities and {rel_count} relationships "
+        f"from {total} articles"
+    )
+    return entity_data
+
+
+# Existing-article check 
+
 def get_existing_article_ids(driver) -> set[str]:
     with driver.session() as session:
         rows = session.run(
@@ -58,7 +165,7 @@ def get_existing_article_ids(driver) -> set[str]:
     return {r["aid"] for r in rows}
 
 
-# Load and chunk
+# Load and chunk 
 
 def load_and_chunk(skip_ids: set[str] | None = None) -> list[dict]:
     splitter = RecursiveCharacterTextSplitter(
@@ -112,7 +219,8 @@ def load_and_chunk(skip_ids: set[str] | None = None) -> list[dict]:
     )
     return chunks
 
-# Embedding
+
+# Embedding 
 
 def embed_chunks(chunks: list[dict]) -> list[dict]:
     if not chunks:
@@ -131,9 +239,13 @@ def embed_chunks(chunks: list[dict]) -> list[dict]:
     return chunks
 
 
-# Populate Neo4j
+# Populate Neo4j 
 
-def populate_neo4j(chunks: list[dict], reset: bool = False) -> None:
+def populate_neo4j(
+    chunks: list[dict],
+    reset: bool = False,
+    entity_data: dict[str, dict] | None = None,
+) -> None:
     print("Connecting to Neo4j...")
     driver = GraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASSWORD))
     driver.verify_connectivity()
@@ -155,6 +267,12 @@ def populate_neo4j(chunks: list[dict], reset: bool = False) -> None:
             FOR (c:Chunk) REQUIRE c.chunk_uid IS UNIQUE
             """
         )
+        session.run(
+            """
+            CREATE CONSTRAINT entity_canonical_unique IF NOT EXISTS
+            FOR (e:Entity) REQUIRE e.canonical_name IS UNIQUE
+            """
+        )
 
         if not chunks:
             print("No new chunks to load")
@@ -163,6 +281,7 @@ def populate_neo4j(chunks: list[dict], reset: bool = False) -> None:
 
         new_article_ids = list({c["article_id"] for c in chunks})
 
+        # Upsert chunks 
         print(f"Upserting {len(chunks)} chunks from {len(new_article_ids)} new articles...")
         for c in chunks:
             chunk_uid = f"{c['article_id']}_chunk_{c['chunk_id']}"
@@ -201,6 +320,7 @@ def populate_neo4j(chunks: list[dict], reset: bool = False) -> None:
                 },
             )
 
+        # NEXT_CHUNK edges
         print("Adding NEXT_CHUNK edges for new articles...")
         session.run(
             """
@@ -215,6 +335,7 @@ def populate_neo4j(chunks: list[dict], reset: bool = False) -> None:
             {"new_ids": new_article_ids},
         )
 
+        # NEAR_IN_TIME edges
         print("Adding NEAR_IN_TIME edges for new articles...")
         session.run(
             """
@@ -229,6 +350,66 @@ def populate_neo4j(chunks: list[dict], reset: bool = False) -> None:
             {"new_ids": new_article_ids},
         )
 
+        # Entity nodes + MENTIONS + RELATED_TO
+        if entity_data:
+            print("Creating Entity nodes and MENTIONS edges...")
+            for aid in new_article_ids:
+                art_ents = entity_data.get(aid)
+                if not art_ents:
+                    continue
+
+                for ent in art_ents.get("entities", []):
+                    session.run(
+                        """
+                        MERGE (e:Entity {canonical_name: $canonical_name})
+                        SET e.name = $name,
+                            e.type = $type
+                        """,
+                        {
+                            "canonical_name": ent["canonical_name"],
+                            "name": ent["name"],
+                            "type": ent.get("type", "CONCEPT"),
+                        },
+                    )
+
+                article_chunks = [c for c in chunks if c["article_id"] == aid]
+                for c in article_chunks:
+                    chunk_uid = f"{c['article_id']}_chunk_{c['chunk_id']}"
+                    chunk_lower = c["text"].lower()
+                    for ent in art_ents.get("entities", []):
+                        if ent["canonical_name"] in chunk_lower:
+                            session.run(
+                                """
+                                MATCH (ch:Chunk {chunk_uid: $chunk_uid})
+                                MATCH (e:Entity {canonical_name: $cname})
+                                MERGE (ch)-[:MENTIONS]->(e)
+                                """,
+                                {
+                                    "chunk_uid": chunk_uid,
+                                    "cname": ent["canonical_name"],
+                                },
+                            )
+
+                for rel in art_ents.get("relationships", []):
+                    session.run(
+                        """
+                        MATCH (e1:Entity {canonical_name: $src})
+                        MATCH (e2:Entity {canonical_name: $tgt})
+                        MERGE (e1)-[r:RELATED_TO]->(e2)
+                        SET r.relation_type = $rel_type
+                        """,
+                        {
+                            "src": rel["source_canonical"],
+                            "tgt": rel["target_canonical"],
+                            "rel_type": rel["type"],
+                        },
+                    )
+
+            ent_nodes = session.run(
+                "MATCH (e:Entity) RETURN count(e) AS cnt"
+            ).single()["cnt"]
+            print(f"Graph now has {ent_nodes} Entity nodes")
+
     driver.close()
     print("Neo4j temporal graph updated successfully")
 
@@ -239,6 +420,11 @@ def main():
         "--reset",
         action="store_true",
         help="Wipe the entire graph and rebuild from scratch",
+    )
+    parser.add_argument(
+        "--skip-entities",
+        action="store_true",
+        help="Skip LLM-based entity extraction (faster setup)",
     )
     args = parser.parse_args()
 
@@ -252,8 +438,22 @@ def main():
         print(f"Found {len(skip_ids)} articles already in graph")
 
     chunks = load_and_chunk(skip_ids=skip_ids)
+
+    # Entity extraction with larger model (freed before embedding)
+    entity_data = None
+    if not args.skip_entities and chunks:
+        pipe = load_extraction_model()
+        entity_data = extract_all_entities(chunks, pipe)
+        del pipe
+        gc.collect()
+        try:
+            import torch
+            torch.cuda.empty_cache()
+        except Exception:
+            pass
+
     chunks = embed_chunks(chunks)
-    populate_neo4j(chunks, reset=args.reset)
+    populate_neo4j(chunks, reset=args.reset, entity_data=entity_data)
     print("\nSetup complete. You can now run:  python chatter.py")
 
 
