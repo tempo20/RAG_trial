@@ -16,6 +16,7 @@ Usage:
 import json
 import os
 import re
+import time
 import warnings
 from datetime import datetime, timezone
 
@@ -68,20 +69,34 @@ def strip_think_tags(text: str) -> str:
     return text.strip()
 
 
-# ── Temporal Query Decomposition ────────────────────────────────────
+# Temporal Query Decomposition 
+
+TIME_WORDS = re.compile(
+    r"\b(yesterday|last\s+week|this\s+week|last\s+month|this\s+month|"
+    r"today|ago|before\s+\w+day|after\s+\w+day|since|until|between|"
+    r"january|february|march|april|may|june|july|august|"
+    r"september|october|november|december|"
+    r"\d{4}[-/]\d{2}|\d{1,2}/\d{1,2})\b",
+    re.IGNORECASE,
+)
+
+MULTI_TIME_WORDS = re.compile(
+    r"\b(compare|vs\.?|versus|differ)",
+    re.IGNORECASE,
+)
+
+FROM_TO_PATTERN = re.compile(
+    r"from\s+(.+?)\s+to\s+(.+?)[\?\.\!,]?\s*$",
+    re.IGNORECASE,
+)
 
 DECOMPOSE_PROMPT = """\
-Analyze this question and identify any time references. \
-If the question compares multiple time periods, decompose it into separate sub-queries.
+Analyze this question and decompose it into separate sub-queries for each time period.
 
 Rules:
 - Today is {today}.
-- If no time reference exists, return the original query with null dates.
 - Use ISO format YYYY-MM-DD for dates.
-- "last week" = the 7 days before today.
-- "yesterday" = one day before today.
-- "this week" = from the most recent Monday to today.
-- "this month" = from the 1st of the current month to today.
+- Each sub-query should target one time period.
 
 Output ONLY valid JSON (no markdown):
 {{"sub_queries": [{{"query": "...", "time_start": "YYYY-MM-DD or null", "time_end": "YYYY-MM-DD or null"}}]}}
@@ -101,12 +116,81 @@ def resolve_date(date_str: str | None) -> int | None:
     return None
 
 
+def _resolve_time_phrase(phrase: str) -> tuple[str | None, str | None]:
+    """Resolve a single time phrase to (start_date, end_date) strings."""
+    now = datetime.now(timezone.utc)
+    p = phrase.strip().lower()
+
+    if p == "yesterday":
+        dt = dateparser.parse("yesterday", settings={"RETURN_AS_TIMEZONE_AWARE": True})
+        d = dt.strftime("%Y-%m-%d") if dt else None
+        return d, d
+    if "last week" in p:
+        s = dateparser.parse("7 days ago", settings={"RETURN_AS_TIMEZONE_AWARE": True})
+        e = dateparser.parse("1 day ago", settings={"RETURN_AS_TIMEZONE_AWARE": True})
+        return (
+            s.strftime("%Y-%m-%d") if s else None,
+            e.strftime("%Y-%m-%d") if e else None,
+        )
+    if "this week" in p:
+        days_back = now.weekday()
+        s = dateparser.parse(
+            f"{days_back} days ago", settings={"RETURN_AS_TIMEZONE_AWARE": True}
+        )
+        return s.strftime("%Y-%m-%d") if s else None, now.strftime("%Y-%m-%d")
+    if "last month" in p:
+        s = dateparser.parse("1 month ago", settings={"RETURN_AS_TIMEZONE_AWARE": True})
+        return s.strftime("%Y-%m-%d") if s else None, now.strftime("%Y-%m-%d")
+    if "this month" in p:
+        return now.strftime("%Y-%m-01"), now.strftime("%Y-%m-%d")
+    if p == "today":
+        d = now.strftime("%Y-%m-%d")
+        return d, d
+
+    dt = dateparser.parse(p, settings={"RETURN_AS_TIMEZONE_AWARE": True})
+    if dt:
+        d = dt.strftime("%Y-%m-%d")
+        return d, d
+    return None, None
+
+
+def _extract_single_time_range(query: str) -> dict:
+    """Use dateparser directly to resolve time expressions without LLM."""
+    time_matches = TIME_WORDS.findall(query)
+    if not time_matches:
+        return {"query": query, "time_start": None, "time_end": None}
+    start, end = _resolve_time_phrase(time_matches[0])
+    return {"query": query, "time_start": start, "time_end": end}
+
+
 def decompose_query(query: str, pipe) -> list[dict]:
-    """Split a query into temporal sub-queries."""
+    """Resolve temporal references. Uses regex whenever possible, LLM only as last resort."""
+    has_time = TIME_WORDS.search(query)
+
+    if not has_time:
+        return [{"query": query, "time_start": None, "time_end": None}]
+
+    # Handle "from X to Y" pattern with regex (no LLM needed)
+    ft = FROM_TO_PATTERN.search(query)
+    if ft:
+        period_a, period_b = ft.group(1).strip(), ft.group(2).strip()
+        a_start, a_end = _resolve_time_phrase(period_a)
+        b_start, b_end = _resolve_time_phrase(period_b)
+        if a_start or b_start:
+            return [
+                {"query": query, "time_start": a_start, "time_end": a_end},
+                {"query": query, "time_start": b_start, "time_end": b_end},
+            ]
+
+    has_multi = MULTI_TIME_WORDS.search(query)
+    if not has_multi:
+        return [_extract_single_time_range(query)]
+
+    # True multi-period query (compare/vs) -- use LLM to decompose
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     prompt = DECOMPOSE_PROMPT.format(today=today, query=query)
     messages = [{"role": "user", "content": prompt}]
-    out = pipe(messages, max_new_tokens=512, do_sample=False)
+    out = pipe(messages, max_new_tokens=256, do_sample=False)
     raw = out[0]["generated_text"][-1]["content"]
     raw = strip_think_tags(raw)
 
@@ -129,10 +213,10 @@ def decompose_query(query: str, pipe) -> list[dict]:
         except (json.JSONDecodeError, TypeError):
             pass
 
-    return [{"query": query, "time_start": None, "time_end": None}]
+    return [_extract_single_time_range(query)]
 
 
-# ── Three-Layer Retrieval ───────────────────────────────────────────
+# Three-Layer Retrieval 
 
 def three_layer_retrieve(
     query: str,
@@ -150,7 +234,7 @@ def three_layer_retrieve(
     half_life_seconds = recency_half_life_days * 86400.0
 
     with driver.session() as session:
-        # ── Layer 1: Temporal subgraph filter ──
+        # Layer 1: Temporal subgraph filter 
         time_clauses = ""
         params: dict = {"source_filter": source_filter}
         if time_start is not None:
@@ -178,7 +262,7 @@ def three_layer_retrieve(
             params,
         ).data()
 
-        # ── Layer 2: Entity-based coarse retrieval ──
+        # Layer 2: Entity-based coarse retrieval 
         query_lower = query.lower()
         entity_rows = session.run(
             "MATCH (e:Entity) RETURN e.canonical_name AS cname, e.name AS name"
@@ -237,7 +321,7 @@ def three_layer_retrieve(
             ).data()
             entity_chunk_uids = {r["chunk_uid"] for r in ent_chunks}
 
-    # ── Layer 3: Semantic fine-grained retrieval ──
+    # Layer 3: Semantic fine-grained retrieval 
     scored = []
     for r in rows:
         emb = np.array(r["embedding"], dtype=np.float32)
@@ -304,64 +388,25 @@ def three_layer_retrieve(
     return expanded_list[:expanded_k]
 
 
-# ── Generation ──────────────────────────────────────────────────────
+# Generation 
 
-SYSTEM_PROMPT = (
-    "Answer the user's question using only the provided context. "
-    "If there is not enough evidence, say so clearly."
+SYSTEM_PROMPT_TEMPLATE = (
+    "You are a news assistant. Answer the user's question using only the "
+    "provided context. The articles in your database span from {date_min} "
+    "to {date_max}. If there is not enough evidence, say so clearly."
 )
 
-AGGREGATE_PROMPT = """\
-You were asked: {query}
-
-Here are answers from different time periods:
-
-{sub_answers_text}
-
-Synthesize these into a single coherent answer. \
-Highlight any temporal differences or changes."""
-
-
-def generate_answer(query: str, context: str, pipe) -> str:
+def generate_answer(query: str, context: str, pipe, system_prompt: str) -> str:
     messages = [
-        {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user", "content": f"Context:\n{context}\n\nQuestion: {query}"},
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": f"Context:\n{context}\n\nQuestion: {query}\n\nAnswer directly and concisely."},
     ]
-    out = pipe(messages, max_new_tokens=1024, do_sample=False)
+    out = pipe(messages, max_new_tokens=512, do_sample=False)
     raw = out[0]["generated_text"][-1]["content"]
     return strip_think_tags(raw)
 
 
-def aggregate_answers(
-    query: str, sub_answers: list[dict], pipe
-) -> str:
-    """Merge multiple sub-answers into one response."""
-    if len(sub_answers) == 1:
-        return sub_answers[0]["answer"]
-
-    parts = []
-    for i, sa in enumerate(sub_answers, 1):
-        label = ""
-        if sa.get("time_start") or sa.get("time_end"):
-            label = f" ({sa.get('time_start', '?')} to {sa.get('time_end', '?')})"
-        parts.append(f"{i}.{label}\n{sa['answer']}")
-
-    sub_text = "\n\n".join(parts)
-    messages = [
-        {"role": "system", "content": SYSTEM_PROMPT},
-        {
-            "role": "user",
-            "content": AGGREGATE_PROMPT.format(
-                query=query, sub_answers_text=sub_text
-            ),
-        },
-    ]
-    out = pipe(messages, max_new_tokens=1024, do_sample=False)
-    raw = out[0]["generated_text"][-1]["content"]
-    return strip_think_tags(raw)
-
-
-# ── Main loop ───────────────────────────────────────────────────────
+# Main loop 
 
 def main():
     print("Loading embedding model...")
@@ -374,7 +419,22 @@ def main():
     driver = GraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASSWORD))
     driver.verify_connectivity()
 
-    print("\n--- TG-RAG Chatbot ready ---")
+    with driver.session() as session:
+        date_range = session.run(
+            """
+            MATCH (a:Article)
+            WHERE a.published IS NOT NULL
+            RETURN min(a.published) AS earliest, max(a.published) AS latest
+            """
+        ).single()
+    date_min = date_range["earliest"] or "unknown"
+    date_max = date_range["latest"] or "unknown"
+    system_prompt = SYSTEM_PROMPT_TEMPLATE.format(
+        date_min=date_min, date_max=date_max
+    )
+
+    print(f"\n--- TG-RAG Chatbot ready ---")
+    print(f"Articles from {date_min} to {date_max}")
     print("Type your question (or 'quit' to exit).\n")
 
     while True:
@@ -388,17 +448,19 @@ def main():
             print("Bye!")
             break
 
+        t0 = time.perf_counter()
+
         source_filter = extract_source_filter(query)
         if source_filter:
             print(f"  [source filter: {source_filter}]")
 
-        # ── Step 1: Temporal Query Decomposition ──
+        # Step 1: Temporal Query Decomposition 
         sub_queries = decompose_query(query, pipe)
         if len(sub_queries) > 1:
             print(f"  [decomposed into {len(sub_queries)} sub-queries]")
 
-        # ── Step 2: Three-layer retrieval + generation per sub-query ──
-        sub_answers: list[dict] = []
+        # Step 2: Three-layer retrieval per sub-query
+        all_contexts: list[str] = []
         for sq in sub_queries:
             ts_start = resolve_date(sq["time_start"])
             ts_end = resolve_date(sq["time_end"])
@@ -422,33 +484,24 @@ def main():
                 time_end=ts_end,
             )
 
-            if not retrieved:
-                sub_answers.append({
-                    "query": sq["query"],
-                    "answer": "No relevant information found for this time period.",
-                    "time_start": sq.get("time_start"),
-                    "time_end": sq.get("time_end"),
-                })
-                continue
+            if retrieved:
+                period_label = ""
+                if sq.get("time_start") and sq.get("time_end"):
+                    period_label = f"[{sq['time_start']} to {sq['time_end']}] "
+                for x in retrieved:
+                    if x.get("text"):
+                        all_contexts.append(f"{period_label}{x['text']}")
 
-            context = "\n\n".join(
-                x["text"] for x in retrieved if x.get("text")
-            )
-            answer = generate_answer(sq["query"], context, pipe)
-            sub_answers.append({
-                "query": sq["query"],
-                "answer": answer,
-                "time_start": sq.get("time_start"),
-                "time_end": sq.get("time_end"),
-            })
-
-        # ── Step 3: Aggregate sub-answers ──
-        if not sub_answers:
+        # Step 3: Single generation from merged context
+        if not all_contexts:
             print("Assistant: No relevant chunks found.\n")
             continue
 
-        final = aggregate_answers(query, sub_answers, pipe)
-        print(f"\nAssistant: {final}\n")
+        context = "\n\n".join(all_contexts)
+        final = generate_answer(query, context, pipe, system_prompt)
+        elapsed = time.perf_counter() - t0
+        print(f"\nAssistant: {final}")
+        print(f"  [{elapsed:.1f}s]\n")
 
     driver.close()
 

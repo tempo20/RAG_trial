@@ -3,3 +3,4 @@ venv/
 *.txt 
 *.json
 *.ipynb
+__pycache__/
