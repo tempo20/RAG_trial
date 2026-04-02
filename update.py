@@ -7,12 +7,12 @@ extracts entities, and loads new articles into the Neo4j temporal graph.
 Usage:
     python update.py                    # scrape + incremental graph update
     python update.py --reset            # scrape + wipe graph and rebuild
-    python update.py --skip-entities    # skip LLM entity extraction
+    python update.py --skip-entities    # skip NER extraction
+    python update.py --cooccur-mode article
 """
 
 import argparse
 import gc
-import sys
 
 from simple_scraper import main as scrape
 from tgrag_setup import (
@@ -34,7 +34,16 @@ def main():
     parser.add_argument(
         "--skip-entities",
         action="store_true",
-        help="Skip LLM-based entity extraction (faster setup)",
+        help="Skip NER-based entity extraction (faster setup)",
+    )
+    parser.add_argument(
+        "--cooccur-mode",
+        choices=["chunk", "article"],
+        default="chunk",
+        help=(
+            "How to build RELATED_TO edges: "
+            "'chunk' (default, lower noise) or 'article' (denser recall)"
+        ),
     )
     args = parser.parse_args()
 
@@ -64,7 +73,11 @@ def main():
     entity_data = None
     if not args.skip_entities and chunks:
         pipe = load_extraction_model()
-        entity_data = extract_all_entities(chunks, pipe)
+        entity_data = extract_all_entities(
+            chunks,
+            pipe,
+            cooccur_mode=args.cooccur_mode,
+        )
         del pipe
         gc.collect()
         try:

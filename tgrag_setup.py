@@ -2,13 +2,14 @@
 Temporal-Graph RAG Setup
 
 Reads cnbc_articles.json, chunks the articles, embeds them,
-extracts entities (via Qwen2.5-7B-Instruct), and populates
+extracts entities (via GLiNER), and populates
 the Neo4j temporal graph.
 
 Usage:
     python tgrag_setup.py                    # incremental update
     python tgrag_setup.py --reset            # wipe graph and rebuild
-    python tgrag_setup.py --skip-entities    # skip entity extraction
+    python tgrag_setup.py --skip-entities    # skip NER extraction
+    python tgrag_setup.py --cooccur-mode article
 """
 
 import argparse
@@ -17,6 +18,7 @@ import json
 import os
 import re
 from collections import defaultdict
+from itertools import combinations
 from pathlib import Path
 from urllib.parse import urlparse
 from datetime import timezone
@@ -31,7 +33,9 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 from neo4j import GraphDatabase
 
 EMBED_MODEL_NAME = "BAAI/bge-m3"
-EXTRACTION_MODEL_NAME = "Qwen/Qwen2.5-7B-Instruct"
+EXTRACTION_MODEL_NAME = "urchade/gliner_medium-v2.1"
+COOCCUR_DEFAULT_MODE = "chunk"
+NER_THRESHOLD = 0.35
 DATA_PATH = Path("cnbc_articles.json")
 
 NEO4J_URI = os.getenv("NEO4J_URI", "bolt://localhost:7687")
@@ -62,89 +66,219 @@ def canonicalize(name: str) -> str:
     return re.sub(r"\s+", " ", name.strip()).lower()
 
 
-# Entity extraction 
+# NER extraction
+GLINER_LABELS = [
+    "person",
+    "organization",
+    "company",
+    "stock ticker",
+    "stock index",
+    "etf",
+    "commodity",
+    "currency",
+    "cryptocurrency",
+    "location",
+    "country",
+    "city",
+    "event",
+    "product",
+    "sector",
+    "industry",
+    "law",
+    "government agency",
+    "economic indicator",
+    "technology",
+    "concept",
+]
 
-EXTRACTION_PROMPT = """\
-You are an entity and relationship extractor for news articles.
 
-Extract all named entities and relationships from the article below.
+def _normalize_label(label: str) -> str:
+    label = (label or "").strip().lower()
+    return re.sub(r"[\s\-]+", "_", label)
 
-Entity types: PERSON, ORG, STOCK, EVENT, LOCATION, CONCEPT
 
-Output ONLY valid JSON (no markdown, no explanation):
-{{"entities": [{{"name": "...", "type": "..."}}], "relationships": [{{"source": "...", "target": "...", "type": "..."}}]}}
+def _map_raw_label_to_type(raw_label: str) -> str:
+    lbl = _normalize_label(raw_label)
 
-Article:
-{text}"""
+    person_tokens = {
+        "person", "individual", "executive", "analyst", "investor",
+        "founder", "politician", "official",
+    }
+    org_tokens = {
+        "org", "organization", "company", "corporation", "bank",
+        "institution", "agency", "government_agency", "brand",
+    }
+    stock_tokens = {
+        "stock", "stock_ticker", "ticker", "symbol", "equity",
+        "index", "stock_index", "etf", "fund", "bond", "commodity",
+        "currency", "cryptocurrency", "crypto", "token",
+    }
+    event_tokens = {
+        "event", "earnings", "ipo", "merger", "acquisition",
+        "lawsuit", "conference", "meeting", "election", "launch",
+    }
+    location_tokens = {
+        "location", "loc", "city", "country", "region",
+        "state", "continent", "address",
+    }
+
+    if any(tok in lbl for tok in person_tokens):
+        return "PERSON"
+    if any(tok in lbl for tok in org_tokens):
+        return "ORG"
+    if any(tok in lbl for tok in stock_tokens):
+        return "STOCK"
+    if any(tok in lbl for tok in event_tokens):
+        return "EVENT"
+    if any(tok in lbl for tok in location_tokens):
+        return "LOCATION"
+    return "CONCEPT"
 
 
 def load_extraction_model():
-    from transformers import AutoModelForCausalLM, AutoTokenizer, pipeline as _pipeline
+    try:
+        from gliner import GLiNER
+    except ImportError as exc:
+        raise RuntimeError(
+            "GLiNER is not installed. Install it with: pip install gliner"
+        ) from exc
+
     print(f"Loading extraction model ({EXTRACTION_MODEL_NAME})...")
-    tokenizer = AutoTokenizer.from_pretrained(
-        EXTRACTION_MODEL_NAME, local_files_only=True
-    )
-    model = AutoModelForCausalLM.from_pretrained(
-        EXTRACTION_MODEL_NAME, local_files_only=True
-    )
-    return _pipeline("text-generation", model=model, tokenizer=tokenizer)
-
-
-def _parse_extraction_json(raw: str) -> dict:
-    """Best-effort parse of model output into {entities, relationships}."""
-    raw = re.sub(r"<think>.*?</think>", "", raw, flags=re.DOTALL)
-    raw = re.sub(r"<think>.*", "", raw, flags=re.DOTALL)
-
-    match = re.search(r"\{.*\}", raw, flags=re.DOTALL)
-    if match:
-        try:
-            data = json.loads(match.group())
-            entities = [
-                e for e in data.get("entities", [])
-                if isinstance(e, dict) and "name" in e and "type" in e
-            ]
-            relationships = [
-                r for r in data.get("relationships", [])
-                if isinstance(r, dict)
-                and "source" in r and "target" in r and "type" in r
-            ]
-            return {"entities": entities, "relationships": relationships}
-        except (json.JSONDecodeError, TypeError):
-            pass
-    return {"entities": [], "relationships": []}
+    try:
+        return GLiNER.from_pretrained(EXTRACTION_MODEL_NAME, local_files_only=True)
+    except TypeError:
+        return GLiNER.from_pretrained(EXTRACTION_MODEL_NAME)
+    except Exception:
+        return GLiNER.from_pretrained(EXTRACTION_MODEL_NAME)
 
 
 def extract_entities(article_text: str, pipe) -> dict:
-    prompt = EXTRACTION_PROMPT.format(text=article_text[:4000])
-    messages = [{"role": "user", "content": prompt}]
-    out = pipe(messages, max_new_tokens=1024, do_sample=False)
-    raw = out[0]["generated_text"][-1]["content"]
-    return _parse_extraction_json(raw)
+    text = article_text[:8000]
+    try:
+        preds = pipe.predict_entities(
+            text, labels=GLINER_LABELS, threshold=NER_THRESHOLD
+        )
+    except TypeError:
+        try:
+            preds = pipe.predict_entities(text, GLINER_LABELS, NER_THRESHOLD)
+        except TypeError:
+            preds = pipe.predict_entities(text, GLINER_LABELS)
+
+    entities = []
+    for pred in preds:
+        if not isinstance(pred, dict):
+            continue
+        name = (pred.get("text") or "").strip()
+        if not name:
+            continue
+        raw_label = str(pred.get("label") or "concept").strip()
+        ent_type = _map_raw_label_to_type(raw_label)
+        score = float(pred.get("score", 0.0) or 0.0)
+        entities.append(
+            {
+                "name": name,
+                "type": ent_type,
+                "raw_label": raw_label,
+                "score": score,
+            }
+        )
+
+    return {"entities": entities, "relationships": []}
+
+
+def _build_cooccurrence_relationships(
+    entities: list[dict],
+    chunk_texts: list[str],
+    mode: str,
+) -> list[dict]:
+    rel_type = "CO_OCCURS_ARTICLE" if mode == "article" else "CO_OCCURS_CHUNK"
+    canonicals = sorted({e["canonical_name"] for e in entities if e.get("canonical_name")})
+
+    if len(canonicals) < 2:
+        return []
+
+    pairs: set[tuple[str, str]] = set()
+    if mode == "article":
+        for src, tgt in combinations(canonicals, 2):
+            pairs.add((src, tgt))
+    else:
+        for text in chunk_texts:
+            chunk_lower = text.lower()
+            mentioned = sorted([c for c in canonicals if c in chunk_lower])
+            if len(mentioned) < 2:
+                continue
+            for src, tgt in combinations(mentioned, 2):
+                pairs.add((src, tgt))
+
+    relationships = []
+    for src, tgt in sorted(pairs):
+        relationships.append(
+            {
+                "source": src,
+                "target": tgt,
+                "source_canonical": src,
+                "target_canonical": tgt,
+                "type": rel_type,
+            }
+        )
+    return relationships
 
 
 def extract_all_entities(
     chunks: list[dict],
     pipe,
+    cooccur_mode: str = COOCCUR_DEFAULT_MODE,
 ) -> dict[str, dict]:
     """Group chunks by article, extract entities per article."""
-    articles: dict[str, str] = {}
+    cooccur_mode = (cooccur_mode or COOCCUR_DEFAULT_MODE).lower()
+    if cooccur_mode not in {"chunk", "article"}:
+        raise ValueError("cooccur_mode must be 'chunk' or 'article'")
+
+    article_texts: dict[str, list[str]] = defaultdict(list)
     for c in chunks:
         aid = c["article_id"]
-        if aid not in articles:
-            articles[aid] = ""
-        articles[aid] += c["text"] + "\n"
+        article_texts[aid].append(c["text"])
 
     entity_data: dict[str, dict] = {}
-    total = len(articles)
-    for idx, (aid, text) in enumerate(articles.items(), 1):
+    total = len(article_texts)
+    print(f"Using co-occurrence mode: {cooccur_mode}")
+
+    for idx, (aid, texts) in enumerate(article_texts.items(), 1):
         print(f"  Extracting entities [{idx}/{total}] {aid[:60]}...")
+        text = "\n".join(texts)
         result = extract_entities(text, pipe)
-        for e in result["entities"]:
-            e["canonical_name"] = canonicalize(e["name"])
-        for r in result["relationships"]:
-            r["source_canonical"] = canonicalize(r["source"])
-            r["target_canonical"] = canonicalize(r["target"])
-        entity_data[aid] = result
+
+        deduped: dict[str, dict] = {}
+        for ent in result["entities"]:
+            cname = canonicalize(ent["name"])
+            if not cname:
+                continue
+            candidate = {
+                "name": ent["name"],
+                "type": ent.get("type", "CONCEPT"),
+                "raw_label": ent.get("raw_label", "concept"),
+                "canonical_name": cname,
+                "_score": float(ent.get("score", 0.0) or 0.0),
+            }
+            prev = deduped.get(cname)
+            if prev is None or candidate["_score"] > prev["_score"]:
+                deduped[cname] = candidate
+
+        entities = []
+        for e in deduped.values():
+            e.pop("_score", None)
+            entities.append(e)
+
+        relationships = _build_cooccurrence_relationships(
+            entities,
+            texts,
+            cooccur_mode,
+        )
+
+        entity_data[aid] = {
+            "entities": entities,
+            "relationships": relationships,
+        }
 
     ent_count = sum(len(d["entities"]) for d in entity_data.values())
     rel_count = sum(len(d["relationships"]) for d in entity_data.values())
@@ -362,13 +496,17 @@ def populate_neo4j(
                     session.run(
                         """
                         MERGE (e:Entity {canonical_name: $canonical_name})
-                        SET e.name = $name,
-                            e.type = $type
+                        ON CREATE SET e.name = $name,
+                                      e.type = $type,
+                                      e.raw_label = $raw_label
+                        ON MATCH SET e.name = $name,
+                                     e.type = $type
                         """,
                         {
                             "canonical_name": ent["canonical_name"],
                             "name": ent["name"],
                             "type": ent.get("type", "CONCEPT"),
+                            "raw_label": ent.get("raw_label", "concept"),
                         },
                     )
 
@@ -424,7 +562,16 @@ def main():
     parser.add_argument(
         "--skip-entities",
         action="store_true",
-        help="Skip LLM-based entity extraction (faster setup)",
+        help="Skip NER-based entity extraction (faster setup)",
+    )
+    parser.add_argument(
+        "--cooccur-mode",
+        choices=["chunk", "article"],
+        default=COOCCUR_DEFAULT_MODE,
+        help=(
+            "How to build RELATED_TO edges: "
+            "'chunk' (default, lower noise) or 'article' (denser recall)"
+        ),
     )
     args = parser.parse_args()
 
@@ -439,11 +586,15 @@ def main():
 
     chunks = load_and_chunk(skip_ids=skip_ids)
 
-    # Entity extraction with larger model (freed before embedding)
+    # NER extraction (freed before embedding)
     entity_data = None
     if not args.skip_entities and chunks:
         pipe = load_extraction_model()
-        entity_data = extract_all_entities(chunks, pipe)
+        entity_data = extract_all_entities(
+            chunks,
+            pipe,
+            cooccur_mode=args.cooccur_mode,
+        )
         del pipe
         gc.collect()
         try:
