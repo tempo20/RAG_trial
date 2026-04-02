@@ -16,6 +16,7 @@ import argparse
 import gc
 import json
 import os
+import csv
 import re
 from collections import defaultdict
 from itertools import combinations
@@ -62,8 +63,65 @@ def safe_parse_datetime(value: str):
 
 
 def canonicalize(name: str) -> str:
-    """Normalize an entity name for deduplication."""
-    return re.sub(r"\s+", " ", name.strip()).lower()
+    """Normalize an entity name (for dedup + exact mapping).
+
+    Rule: lowercase, trim, strip punctuation, collapse repeated spaces.
+    """
+    if name is None:
+        return ""
+    s = str(name).strip().lower()
+    # Strip punctuation but keep alphanumerics/underscore and spaces.
+    s = re.sub(r"[^\w\s]+", " ", s)
+    return re.sub(r"\s+", " ", s).strip()
+
+
+def load_ticker_company_map(csv_path: Path) -> dict[str, str]:
+    """Load ticker mapping for exact normalized company/alias -> ticker.
+
+    Expected CSV columns:
+      - ticker (e.g. NVDA)
+      - company_name (e.g. NVIDIA)
+      - aliases (optional; separated by ';' or ','; can be empty)
+    """
+    if not csv_path.is_file():
+        raise FileNotFoundError(f"Ticker map CSV not found: {csv_path.resolve()}")
+
+    lookup: dict[str, str] = {}
+    with csv_path.open("r", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        required = {"ticker", "company_name"}
+        missing = required - set(reader.fieldnames or [])
+        if missing:
+            raise ValueError(
+                f"Ticker map CSV missing required columns: {sorted(missing)}. "
+                f"Found columns: {reader.fieldnames}"
+            )
+
+        for row in reader:
+            ticker = (row.get("ticker") or "").strip().upper()
+            company_name = (row.get("company_name") or "").strip()
+            aliases_raw = row.get("aliases") or ""
+
+            if not ticker or not company_name:
+                continue
+
+            keys: list[str] = [company_name]
+            # aliases can be separated by ';' or ','; normalize each token.
+            aliases_parts = re.split(r"\s*[;,]\s*", aliases_raw.strip())
+            keys.extend([p for p in aliases_parts if p])
+
+            for k in keys:
+                nk = canonicalize(k)
+                if not nk:
+                    continue
+                if nk in lookup and lookup[nk] != ticker:
+                    # Deterministic behavior: keep first, warn.
+                    # (Ambiguous mapping is worse than missing it for your exact-match approach.)
+                    print(f"[ticker-map] WARNING: {nk!r} maps to multiple tickers ({lookup[nk]} vs {ticker}); keeping {lookup[nk]}")
+                    continue
+                lookup[nk] = ticker
+
+    return lookup
 
 
 # NER extraction
@@ -203,8 +261,8 @@ def _build_cooccurrence_relationships(
             pairs.add((src, tgt))
     else:
         for text in chunk_texts:
-            chunk_lower = text.lower()
-            mentioned = sorted([c for c in canonicals if c in chunk_lower])
+            chunk_norm = canonicalize(text)
+            mentioned = sorted([c for c in canonicals if c in chunk_norm])
             if len(mentioned) < 2:
                 continue
             for src, tgt in combinations(mentioned, 2):
@@ -228,6 +286,7 @@ def extract_all_entities(
     chunks: list[dict],
     pipe,
     cooccur_mode: str = COOCCUR_DEFAULT_MODE,
+    ticker_lookup: dict[str, str] | None = None,
 ) -> dict[str, dict]:
     """Group chunks by article, extract entities per article."""
     cooccur_mode = (cooccur_mode or COOCCUR_DEFAULT_MODE).lower()
@@ -260,6 +319,8 @@ def extract_all_entities(
                 "canonical_name": cname,
                 "_score": float(ent.get("score", 0.0) or 0.0),
             }
+            if ticker_lookup and cname in ticker_lookup:
+                candidate["mapped_ticker"] = ticker_lookup[cname]
             prev = deduped.get(cname)
             if prev is None or candidate["_score"] > prev["_score"]:
                 deduped[cname] = candidate
@@ -498,24 +559,27 @@ def populate_neo4j(
                         MERGE (e:Entity {canonical_name: $canonical_name})
                         ON CREATE SET e.name = $name,
                                       e.type = $type,
-                                      e.raw_label = $raw_label
+                                      e.raw_label = $raw_label,
+                                      e.mapped_ticker = $mapped_ticker
                         ON MATCH SET e.name = $name,
-                                     e.type = $type
+                                     e.type = $type,
+                                     e.mapped_ticker = CASE WHEN $mapped_ticker IS NULL THEN e.mapped_ticker ELSE $mapped_ticker END
                         """,
                         {
                             "canonical_name": ent["canonical_name"],
                             "name": ent["name"],
                             "type": ent.get("type", "CONCEPT"),
                             "raw_label": ent.get("raw_label", "concept"),
+                            "mapped_ticker": ent.get("mapped_ticker"),
                         },
                     )
 
                 article_chunks = [c for c in chunks if c["article_id"] == aid]
                 for c in article_chunks:
                     chunk_uid = f"{c['article_id']}_chunk_{c['chunk_id']}"
-                    chunk_lower = c["text"].lower()
+                    chunk_norm = canonicalize(c["text"])
                     for ent in art_ents.get("entities", []):
-                        if ent["canonical_name"] in chunk_lower:
+                        if ent["canonical_name"] in chunk_norm:
                             session.run(
                                 """
                                 MATCH (ch:Chunk {chunk_uid: $chunk_uid})
@@ -573,6 +637,12 @@ def main():
             "'chunk' (default, lower noise) or 'article' (denser recall)"
         ),
     )
+    parser.add_argument(
+        "--ticker-map",
+        type=Path,
+        default=Path("ticker_company_map.csv"),
+        help="CSV mapping of company_name/aliases to stock ticker (exact match).",
+    )
     args = parser.parse_args()
 
     skip_ids: set[str] = set()
@@ -590,10 +660,16 @@ def main():
     entity_data = None
     if not args.skip_entities and chunks:
         pipe = load_extraction_model()
+
+        # Deterministic exact mapping (no fuzzy matching) from company/alias -> ticker.
+        # If the file is missing, we fail loudly to avoid building an unlinked graph.
+        ticker_lookup = load_ticker_company_map(args.ticker_map)
+
         entity_data = extract_all_entities(
             chunks,
             pipe,
             cooccur_mode=args.cooccur_mode,
+            ticker_lookup=ticker_lookup,
         )
         del pipe
         gc.collect()

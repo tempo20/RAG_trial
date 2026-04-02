@@ -72,10 +72,15 @@ def strip_think_tags(text: str) -> str:
 # Temporal Query Decomposition 
 
 TIME_WORDS = re.compile(
+    # NOTE: ordering matters: put full date patterns before month-only.
     r"\b(yesterday|last\s+week|this\s+week|last\s+month|this\s+month|"
     r"today|ago|before\s+\w+day|after\s+\w+day|since|until|between|"
-    r"january|february|march|april|may|june|july|august|"
-    r"september|october|november|december|"
+    r"(?:january|february|march|april|may|june|july|august|"
+    r"september|october|november|december)\s+\d{1,2}(?:st|nd|rd|th)?(?:,)?\s+\d{4}|"
+    r"(?:january|february|march|april|may|june|july|august|"
+    r"september|october|november|december)\s+\d{4}|"
+    r"\d{4}[-/]\d{2}[-/]\d{2}|"
+    r"\d{1,2}[-/]\d{1,2}[-/]\d{2,4}|"
     r"\d{4}[-/]\d{2}|\d{1,2}/\d{1,2})\b",
     re.IGNORECASE,
 )
@@ -114,6 +119,13 @@ def resolve_date(date_str: str | None) -> int | None:
     if dt:
         return int(dt.timestamp())
     return None
+
+
+def ts_to_datestr(ts: int | None) -> str | None:
+    """Convert unix timestamp seconds to YYYY-MM-DD (UTC)."""
+    if ts is None:
+        return None
+    return datetime.fromtimestamp(ts, tz=timezone.utc).date().isoformat()
 
 
 def _resolve_time_phrase(phrase: str) -> tuple[str | None, str | None]:
@@ -159,7 +171,15 @@ def _extract_single_time_range(query: str) -> dict:
     time_matches = TIME_WORDS.findall(query)
     if not time_matches:
         return {"query": query, "time_start": None, "time_end": None}
-    start, end = _resolve_time_phrase(time_matches[0])
+
+    # TIME_WORDS can yield multiple overlapping candidates. Prefer the "most specific"
+    # match (typically contains a 4-digit year and is longer).
+    def _match_score(m: str) -> tuple[int, int]:
+        year_bonus = 1 if re.search(r"\d{4}", m) else 0
+        return (year_bonus, len(m))
+
+    best = max(time_matches, key=_match_score)
+    start, end = _resolve_time_phrase(best)
     return {"query": query, "time_start": start, "time_end": end}
 
 
@@ -182,6 +202,29 @@ def decompose_query(query: str, pipe) -> list[dict]:
                 {"query": query, "time_start": b_start, "time_end": b_end},
             ]
 
+    # Common multi-period phrasing without requiring "vs/compare".
+    # Example: "over last week and this week"
+    if re.search(r"\blast\s+week\b", query, flags=re.IGNORECASE) and re.search(
+        r"\bthis\s+week\b", query, flags=re.IGNORECASE
+    ):
+        last_start, last_end = _resolve_time_phrase("last week")
+        this_start, this_end = _resolve_time_phrase("this week")
+        if last_start or this_start:
+            return [
+                {"query": query, "time_start": last_start, "time_end": last_end},
+                {"query": query, "time_start": this_start, "time_end": this_end},
+            ]
+    if re.search(r"\blast\s+month\b", query, flags=re.IGNORECASE) and re.search(
+        r"\bthis\s+month\b", query, flags=re.IGNORECASE
+    ):
+        last_start, last_end = _resolve_time_phrase("last month")
+        this_start, this_end = _resolve_time_phrase("this month")
+        if last_start or this_start:
+            return [
+                {"query": query, "time_start": last_start, "time_end": last_end},
+                {"query": query, "time_start": this_start, "time_end": this_end},
+            ]
+
     has_multi = MULTI_TIME_WORDS.search(query)
     if not has_multi:
         return [_extract_single_time_range(query)]
@@ -190,7 +233,7 @@ def decompose_query(query: str, pipe) -> list[dict]:
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     prompt = DECOMPOSE_PROMPT.format(today=today, query=query)
     messages = [{"role": "user", "content": prompt}]
-    out = pipe(messages, max_new_tokens=256, do_sample=False)
+    out = pipe(messages, max_new_tokens=512, do_sample=False)
     raw = out[0]["generated_text"][-1]["content"]
     raw = strip_think_tags(raw)
 
@@ -232,6 +275,7 @@ def three_layer_retrieve(
     qvec = embed_model.encode([query], normalize_embeddings=True)[0]
     now_ts = int(datetime.now(timezone.utc).timestamp())
     half_life_seconds = recency_half_life_days * 86400.0
+    market_texts: list[str] = []
 
     with driver.session() as session:
         # Layer 1: Temporal subgraph filter 
@@ -321,6 +365,167 @@ def three_layer_retrieve(
             ).data()
             entity_chunk_uids = {r["chunk_uid"] for r in ent_chunks}
 
+        # Market bar retrieval:
+        # - preferred: resolve tickers via Entity -> ALIASES_TICKER
+        # - fallback: if the user explicitly mentions a ticker like "AAPL", fetch it directly
+        tickers: list[str] = []
+        if matched_entities:
+            tickers_rows = session.run(
+                """
+                MATCH (e:Entity)-[:ALIASES_TICKER]->(i:Instrument)
+                WHERE e.canonical_name IN $enames
+                RETURN DISTINCT i.ticker AS ticker
+                """,
+                {"enames": matched_entities},
+            ).data()
+            tickers = [r["ticker"] for r in tickers_rows if r.get("ticker")]
+
+            def _fmt_num(x) -> str:
+                if x is None:
+                    return "NA"
+                try:
+                    return f"{float(x):.2f}"
+                except Exception:
+                    return str(x)
+
+            # Fallback: if we couldn't find any Instrument tickers via ALIASES_TICKER
+            # (common when the graph only has company-name entities like "NVIDIA"),
+            # try a simple consonant-based abbreviation match against Instrument tickers.
+            if not tickers and matched_entities:
+                vowels = set("aeiou")
+
+                def consonant_abbr(s: str) -> str:
+                    letters = [ch for ch in (s or "").lower() if ch.isalpha()]
+                    cons = [ch for ch in letters if ch not in vowels]
+                    return "".join(cons).upper()
+
+                candidates: set[str] = set()
+                for en in matched_entities:
+                    abbr = consonant_abbr(en)
+                    if 2 <= len(abbr) <= 6:
+                        candidates.add(abbr)
+
+                if candidates:
+                    cand_rows = session.run(
+                        """
+                        MATCH (i:Instrument)
+                        WHERE i.ticker IN $cands
+                        RETURN DISTINCT i.ticker AS ticker
+                        """,
+                        {"cands": sorted(candidates)},
+                    ).data()
+                    tickers = [r["ticker"] for r in cand_rows if r.get("ticker")]
+        if not tickers:
+            # Extract possible tickers from the query. Keep it conservative: 1-5 uppercase letters.
+            explicit = sorted({t.upper() for t in re.findall(r"\b[A-Z]{1,5}\b", query)})
+            if explicit:
+                cand_rows = session.run(
+                    """
+                    MATCH (i:Instrument)
+                    WHERE i.ticker IN $cands
+                    RETURN DISTINCT i.ticker AS ticker
+                    """,
+                    {"cands": explicit},
+                ).data()
+                tickers = [r["ticker"] for r in cand_rows if r.get("ticker")]
+
+            dstart = ts_to_datestr(time_start)
+            dend = ts_to_datestr(time_end)
+            is_exact_day = dstart is not None and dend is not None and dstart == dend
+
+            for ticker in tickers:
+                bars = session.run(
+                    """
+                    MATCH (i:Instrument {ticker: $ticker})<-[:FOR_INSTRUMENT]-(b:MarketBar)
+                    WHERE ($dstart IS NULL OR b.bar_date >= date($dstart))
+                      AND ($dend IS NULL OR b.bar_date <= date($dend))
+                    RETURN b.bar_date AS bar_date,
+                           b.open AS open,
+                           b.high AS high,
+                           b.low AS low,
+                           b.close AS close
+                    ORDER BY b.bar_date DESC
+                    LIMIT $limit
+                    """,
+                    {
+                        "ticker": ticker,
+                        "dstart": dstart,
+                        "dend": dend,
+                        "limit": 7,
+                    },
+                ).data()
+
+                # If the user asked for an exact date and that date had no trading bar
+                # (weekend/holiday/missing series), fall back to the nearest *previous*
+                # trading day only.
+                if not bars and is_exact_day:
+                    prev = session.run(
+                        """
+                        MATCH (i:Instrument {ticker: $ticker})<-[:FOR_INSTRUMENT]-(b:MarketBar)
+                        WHERE b.bar_date < date($dstart)
+                        RETURN b.bar_date AS bar_date,
+                               b.open AS open,
+                               b.high AS high,
+                               b.low AS low,
+                               b.close AS close
+                        ORDER BY b.bar_date DESC
+                        LIMIT 1
+                        """,
+                        {"ticker": ticker, "dstart": dstart},
+                    ).data()
+                    bars = prev
+
+                if not bars:
+                    continue
+
+                # Sort ascending for start/end summary.
+                bars_sorted = sorted(bars, key=lambda r: r["bar_date"])
+                start_close = bars_sorted[0].get("close")
+                end_close = bars_sorted[-1].get("close")
+
+                pct_change = None
+                if start_close is not None and end_close is not None:
+                    try:
+                        pct_change = (
+                            (float(end_close) - float(start_close)) / float(start_close) * 100.0
+                        )
+                    except Exception:
+                        pct_change = None
+
+                lows = [b.get("low") for b in bars_sorted if b.get("low") is not None]
+                highs = [b.get("high") for b in bars_sorted if b.get("high") is not None]
+                min_low = min(float(x) for x in lows) if lows else None
+                max_high = max(float(x) for x in highs) if highs else None
+
+                line_items = []
+                for b in bars:
+                    bd = b["bar_date"]
+                    bd_s = bd.isoformat() if hasattr(bd, "isoformat") else str(bd)
+                    line_items.append(
+                        f"{bd_s}: O={_fmt_num(b.get('open'))} C={_fmt_num(b.get('close'))}"
+                    )
+
+                start_bd = bars_sorted[0]["bar_date"]
+                end_bd = bars_sorted[-1]["bar_date"]
+                start_bd_s = start_bd.isoformat() if hasattr(start_bd, "isoformat") else str(start_bd)
+                end_bd_s = end_bd.isoformat() if hasattr(end_bd, "isoformat") else str(end_bd)
+
+                summary = (
+                    f"Market bars for {ticker} in window: {start_bd_s} to {end_bd_s} "
+                    f"(start close={_fmt_num(start_close)}, end close={_fmt_num(end_close)}"
+                )
+                if is_exact_day and start_bd_s != dstart:
+                    summary += ", used nearest previous trading day"
+                if pct_change is not None:
+                    summary += f", pct_change={pct_change:.2f}%"
+                if min_low is not None:
+                    summary += f", min low={_fmt_num(min_low)}"
+                if max_high is not None:
+                    summary += f", max high={_fmt_num(max_high)}"
+                summary += ")"
+
+                market_texts.append(summary + "\n" + "\n".join(line_items))
+
     # Layer 3: Semantic fine-grained retrieval 
     scored = []
     for r in rows:
@@ -385,15 +590,16 @@ def three_layer_retrieve(
     expanded_list = sorted(
         expanded.values(), key=lambda x: x.get("score", 0), reverse=True
     )
-    return expanded_list[:expanded_k]
+    return expanded_list[:expanded_k], market_texts
 
 
 # Generation 
 
 SYSTEM_PROMPT_TEMPLATE = (
-    "You are a news assistant. Answer the user's question using only the "
-    "provided context. The articles in your database span from {date_min} "
-    "to {date_max}. If there is not enough evidence, say so clearly."
+    "You are a finance assistant. Answer the user's question using only the "
+    "provided context (news chunks and, when available, market data snippets). "
+    "The articles in your database span from {date_min} to {date_max}. "
+    "If there is not enough evidence, say so clearly."
 )
 
 def generate_answer(query: str, context: str, pipe, system_prompt: str) -> str:
@@ -472,7 +678,7 @@ def main():
                     f"{sq.get('time_end', '?')}]"
                 )
 
-            retrieved = three_layer_retrieve(
+            retrieved_chunks, market_texts = three_layer_retrieve(
                 query=sq["query"],
                 embed_model=embed_model,
                 driver=driver,
@@ -484,13 +690,21 @@ def main():
                 time_end=ts_end,
             )
 
-            if retrieved:
+            if retrieved_chunks:
                 period_label = ""
                 if sq.get("time_start") and sq.get("time_end"):
                     period_label = f"[{sq['time_start']} to {sq['time_end']}] "
-                for x in retrieved:
+                for x in retrieved_chunks:
                     if x.get("text"):
                         all_contexts.append(f"{period_label}{x['text']}")
+
+            # Always include market snippets when available, even if we had no news chunks.
+            if market_texts:
+                period_label = ""
+                if sq.get("time_start") and sq.get("time_end"):
+                    period_label = f"[{sq['time_start']} to {sq['time_end']}] "
+                for t in market_texts:
+                    all_contexts.append(f"{period_label}{t}")
 
         # Step 3: Single generation from merged context
         if not all_contexts:
