@@ -536,10 +536,25 @@ def three_layer_retrieve(
                 tickers = [r["ticker"] for r in cand_rows if r.get("ticker")]
         # Fallback 3: explicit canonical name in the query (e.g. "NVIDIA")
         if not tickers:
+            matched: list[tuple[str, str]] = []
             for canonical, ticker in ticker_lookup.items():
-                if canonical in expanded_query_lower:
-                    tickers.append(ticker)
-            tickers = list(set(tickers))
+                if canonical in query_lower:
+                    matched.append((canonical, ticker))
+            # prefer longest canonical match (most specific)
+            if matched:
+                matched.sort(key=lambda x: len(x[0]), reverse=True)
+                tickers = [matched[0][1]]
+
+        # Fetch and summarise bars for every resolved ticker
+        if tickers:
+            query_relevant = []
+            for ticker in tickers:
+                for canonical, t in ticker_lookup.items():
+                    if t == ticker and canonical in query_lower:
+                        query_relevant.append(ticker)
+                        break
+            if query_relevant:
+                tickers = list(set(query_relevant))
 
         # Fetch and summarise bars for every resolved ticker
         for ticker in tickers:
