@@ -14,9 +14,11 @@ Downstream, articles connect to prices via paths like:
   (:Article)-[:HAS_CHUNK]->(:Chunk)-[:MENTIONS]->(:Entity)-[:ALIASES_TICKER]->(:Instrument)<-[:FOR_INSTRUMENT]-(:MarketBar)
 
 Usage:
-  python hist_to_db.py
+  python hist_to_db.py              # FinanceToolkit download, then Neo4j ingest (FMP_API_KEY)
+  python hist_to_db.py --no-fetch   # use existing parquet only (no API call)
   python hist_to_db.py --parquet custom.parquet --batch-size 2000
-  python hist_to_db.py --skip-link   # only bars/instruments, no Entity links
+  python hist_to_db.py --skip-link  # only bars/instruments, no Entity links
+  python hist_to_db.py --fetch-only # only write hist_data.parquet (FMP_API_KEY)
 """
 
 from __future__ import annotations
@@ -37,6 +39,45 @@ NEO4J_USER = os.getenv("NEO4J_USER", "neo4j")
 NEO4J_PASSWORD = os.getenv("NEO4J_PASSWORD", "password")
 
 DEFAULT_PARQUET = Path("hist_data.parquet")
+
+# Same universe as get_fin.ipynb (FinanceToolkit / FMP).
+TOP_100_TICKERS = [
+    "AAPL", "MSFT", "GOOGL", "AMZN", "NVDA", "META", "TSLA", "LLY", "AVGO",
+    "JPM", "V", "XOM", "UNH", "MA", "COST", "HD", "PG", "JNJ", "ORCL",
+    "ADBE", "CRM", "KO", "PEP", "ABBV", "CVX", "MRK", "BAC", "WMT", "MCD",
+    "CSCO", "ACN", "INTC", "AMD", "NFLX", "QCOM", "TXN", "LIN", "NEE", "PM",
+    "AMGN", "IBM", "HON", "INTU", "UPS", "RTX", "LOW", "CAT", "SPGI", "GS",
+    "BLK", "DE", "TMO", "ISRG", "AXP", "SYK", "BKNG", "MDLZ", "GILD", "ADP",
+    "LMT", "CB", "MO", "ZTS", "PNC", "CI", "MMC", "PLD", "ELV", "DUK",
+    "SO", "VRTX", "REGN", "BDX", "ETN", "APD", "SHW", "ITW", "EOG", "FDX",
+]
+
+
+def fetch_historical_to_parquet(
+    parquet_path: Path = DEFAULT_PARQUET,
+    tickers: list[str] | None = None,
+    start_date: str = "2017-12-31",
+    api_key: str | None = None,
+) -> None:
+    """Download wide-panel historical data (FinanceToolkit) and save like get_fin.ipynb."""
+    try:
+        from financetoolkit import Toolkit
+    except ImportError as e:
+        raise SystemExit(
+            "financetoolkit is required for the default run and --fetch-only. "
+            "Install it (e.g. pip install financetoolkit), or use --no-fetch with an existing parquet."
+        ) from e
+    key = api_key or os.getenv("FMP_API_KEY")
+    if not key:
+        raise SystemExit(
+            "FMP_API_KEY not set in environment (required for FinanceToolkit download). "
+            "Set FMP_API_KEY or run with --no-fetch if parquet already exists."
+        )
+    universe = tickers if tickers is not None else TOP_100_TICKERS
+    companies = Toolkit(universe, api_key=key, start_date=start_date)
+    hist_data = companies.get_historical_data()
+    hist_data.to_parquet(parquet_path, index=True)
+
 
 # Wide hist_data columns: metric (level 0) × ticker (level 1)
 METRIC_TO_PROP = {
@@ -192,7 +233,41 @@ def main() -> None:
         action="store_true",
         help="Do not create Entity-[:ALIASES_TICKER]->Instrument edges",
     )
+    parser.add_argument(
+        "--no-fetch",
+        action="store_true",
+        help="Skip FinanceToolkit; ingest existing parquet only",
+    )
+    parser.add_argument(
+        "--fetch-only",
+        action="store_true",
+        help="Only write parquet (FMP_API_KEY); do not connect to Neo4j",
+    )
+    parser.add_argument(
+        "--start-date",
+        default="2017-12-31",
+        help="Toolkit start_date for download (default run or --fetch-only); default: 2017-12-31",
+    )
     args = parser.parse_args()
+
+    if args.fetch_only and args.no_fetch:
+        raise SystemExit("Cannot combine --fetch-only with --no-fetch.")
+
+    if args.fetch_only:
+        print(f"Fetching historical data -> {args.parquet.resolve()} ...")
+        fetch_historical_to_parquet(
+            parquet_path=args.parquet,
+            start_date=args.start_date,
+        )
+        print("Parquet written. Done (fetch-only).")
+        return
+
+    if not args.no_fetch:
+        print(f"Fetching historical data -> {args.parquet.resolve()} ...")
+        fetch_historical_to_parquet(
+            parquet_path=args.parquet,
+            start_date=args.start_date,
+        )
 
     if not args.parquet.is_file():
         raise SystemExit(f"Parquet not found: {args.parquet.resolve()}")

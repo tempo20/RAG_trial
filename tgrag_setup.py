@@ -579,7 +579,8 @@ def populate_neo4j(
                     chunk_uid = f"{c['article_id']}_chunk_{c['chunk_id']}"
                     chunk_norm = canonicalize(c["text"])
                     for ent in art_ents.get("entities", []):
-                        if ent["canonical_name"] in chunk_norm:
+                        cname = ent["canonical_name"]
+                        if cname and cname in chunk_norm:
                             session.run(
                                 """
                                 MATCH (ch:Chunk {chunk_uid: $chunk_uid})

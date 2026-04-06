@@ -24,14 +24,14 @@ RSS_SOURCES = [
         "name": "Nasdaq",
         "url": "https://www.nasdaq.com/feed/rssoutbound?category=Investing",
     },
-    {
-        "name": "Stockbiz",
-        "url": "http://en.stockbiz.vn/RSS/News/Financial.ashx",
-    },
-    {
-        "name": "Stockbiz",
-        "url": "http://en.stockbiz.vn/RSS/News/Market.ashx",
-    },
+    # {
+    #     "name": "Stockbiz",
+    #     "url": "http://en.stockbiz.vn/RSS/News/Financial.ashx",
+    # },
+    # {
+    #     "name": "Stockbiz",
+    #     "url": "http://en.stockbiz.vn/RSS/News/Market.ashx",
+    # },
     {
         "name": "CBS MoneyWatch",
         "url": "https://www.cbsnews.com/latest/rss/moneywatch",

@@ -17,10 +17,11 @@ import gc
 from simple_scraper import main as scrape
 from tgrag_setup import (
     load_and_chunk, embed_chunks, populate_neo4j,
-    get_existing_article_ids, load_extraction_model,
+    get_existing_article_ids, load_extraction_model, load_ticker_company_map,
     extract_all_entities,
     NEO4J_URI, NEO4J_USER, NEO4J_PASSWORD,
 )
+from pathlib import Path
 from neo4j import GraphDatabase
 
 
@@ -69,14 +70,16 @@ def main():
         print(f"Found {len(skip_ids)} articles already in graph")
 
     chunks = load_and_chunk(skip_ids=skip_ids)
-
     entity_data = None
+    TICKER_MAP_PATH = Path("ticker_company_map.csv")
     if not args.skip_entities and chunks:
         pipe = load_extraction_model()
+        ticker_lookup = load_ticker_company_map(TICKER_MAP_PATH)
         entity_data = extract_all_entities(
             chunks,
             pipe,
             cooccur_mode=args.cooccur_mode,
+            ticker_lookup=ticker_lookup,
         )
         del pipe
         gc.collect()
@@ -87,7 +90,7 @@ def main():
             pass
 
     chunks = embed_chunks(chunks)
-    populate_neo4j(chunks, reset=args.reset, entity_data=entity_data)
+    populate_neo4j(chunks, reset=args.reset, entity_data=entity_data if not args.skip_entities else None)
 
     print()
     print("Update complete. You can now run:  python chatter.py")
