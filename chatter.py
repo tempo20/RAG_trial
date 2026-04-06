@@ -580,7 +580,8 @@ def three_layer_retrieve(
             )
 
         entity_boost = 1.0 if r["chunk_uid"] in entity_chunk_uids else 0.0
-        score = (0.70 * sim) + (0.20 * recency_weight) + (0.10 * entity_boost)
+        # score = (0.70 * sim) + (0.20 * recency_weight) + (0.10 * entity_boost)
+        score = (0.55 * sim) + (0.15 * recency_weight) + (0.30 * entity_boost)
 
         r["semantic_sim"] = sim
         r["recency_weight"] = recency_weight
@@ -735,8 +736,8 @@ def main():
                 embed_model=embed_model,
                 driver=driver,
                 ticker_lookup=ticker_lookup,
-                top_k=3,
-                expanded_k=6,
+                top_k=4, # prev 3
+                expanded_k=8, #prev 6
                 recency_half_life_days=5,
                 source_filter=source_filter,
                 time_start=ts_start,
