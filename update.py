@@ -42,8 +42,9 @@ def main():
         choices=["chunk", "article"],
         default="chunk",
         help=(
-            "How to build RELATED_TO edges: "
-            "'chunk' (default, lower noise) or 'article' (denser recall)"
+            "How to build co-occurrence edges: "
+            "'chunk' -> :CO_OCCURS_CHUNK (default, lower noise) or "
+            "'article' -> :CO_OCCURS_ARTICLE (denser recall)"
         ),
     )
     args = parser.parse_args()

@@ -554,6 +554,93 @@ def retrieve_target_anchored_chunks(
     with driver.session() as session:
         return session.run(query, params).data()
 
+def retrieve_semantic_expansion_chunks(
+    driver,
+    target: QueryTarget,
+    source_filter: str | None = None,
+    time_start: int | None = None,
+    time_end: int | None = None,
+    allowed_relations: set[str] | None = None,
+    allowed_neighbor_types: set[str] | None = None,
+    min_relation_confidence: float = 0.0,
+    max_neighbor_entities: int = 5,
+    max_extra_chunks: int = 6,
+) -> list[dict]:
+    if not target.entity_canonical:
+        return []
+
+    if allowed_relations is None:
+        allowed_relations = {
+            "ACQUIRED",
+            "PARTNERED_WITH",
+            "INVESTED_IN",
+            "LAUNCHED",
+            "SUPPLIED",
+            "REPORTED",
+            "COMPETES_WITH",
+        }
+
+    if allowed_neighbor_types is None:
+        allowed_neighbor_types = {"ORG", "PRODUCT", "EVENT", "STOCK"}
+
+    params = {
+        "target_entity": target.entity_canonical,
+        "source_filter": source_filter,
+        "allowed_relations": list(allowed_relations),
+        "allowed_neighbor_types": list(allowed_neighbor_types),
+        "min_relation_confidence": float(min_relation_confidence),
+        "max_neighbor_entities": max_neighbor_entities,
+        "max_extra_chunks": max_extra_chunks,
+    }
+
+    time_clause = ""
+    if time_start is not None:
+        time_clause += " AND c.published_ts >= $ts_start"
+        params["ts_start"] = time_start
+    if time_end is not None:
+        time_clause += " AND c.published_ts <= $ts_end"
+        params["ts_end"] = time_end
+
+    query = f"""
+    MATCH (:Entity {{canonical_name: $target_entity}})-[r]-(n:Entity)
+    WHERE type(r) IN $allowed_relations
+        AND n.type IN $allowed_neighbor_types
+        AND n.canonical_name <> $target_entity
+        AND coalesce(r.confidence, 0.0) >= $min_relation_confidence
+        AND r.source_chunk_uid IS NOT NULL
+    WITH
+        n,
+        type(r) AS relation_type,
+        coalesce(r.confidence, 0.0) AS relation_confidence,
+        r.source_chunk_uid AS relation_source_chunk_uid,
+        r.extractor AS relation_extractor
+    ORDER BY relation_confidence DESC, n.canonical_name
+    LIMIT $max_neighbor_entities
+
+    MATCH (c:Chunk)
+    WHERE c.chunk_uid = relation_source_chunk_uid
+    MATCH (c)<-[:HAS_CHUNK]-(a:Article)
+    WHERE ($source_filter IS NULL OR c.source = $source_filter)
+    {time_clause}
+    RETURN DISTINCT
+        c.chunk_uid                AS chunk_uid,
+        c.text                     AS text,
+        c.embedding                AS embedding,
+        c.published_ts             AS published_ts,
+        c.source                   AS source,
+        a.title                    AS title,
+        a.url                      AS url,
+        c.article_id               AS article_id,
+        c.chunk_id                 AS chunk_id,
+        relation_type              AS relation_type,
+        relation_confidence        AS relation_confidence,
+        relation_source_chunk_uid  AS relation_source_chunk_uid,
+        relation_extractor         AS relation_extractor
+    LIMIT $max_extra_chunks
+    """
+    with driver.session() as session:
+        return session.run(query, params).data()
+
 def retrieve_controlled_expansion_chunks(
     driver,
     target: QueryTarget,
@@ -590,19 +677,18 @@ def retrieve_controlled_expansion_chunks(
         params["ts_end"] = time_end
 
     query = f"""
-    MATCH (:Entity {{canonical_name: $target_entity}})-[r:RELATED_TO]-(n:Entity)
-    WHERE r.relation_type = 'CO_OCCURS_CHUNK'
-      AND coalesce(r.weight, 0) >= $min_edge_weight
-      AND n.type IN $allowed_neighbor_types
-      AND n.canonical_name <> $target_entity
-    WITH n
-    ORDER BY n.canonical_name
+    MATCH (:Entity {{canonical_name: $target_entity}})-[r:CO_OCCURS_CHUNK]-(n:Entity)
+    WHERE coalesce(r.weight, 0) >= $min_edge_weight
+        AND n.type IN $allowed_neighbor_types
+        AND n.canonical_name <> $target_entity
+    WITH n, r.weight AS edge_weight
+    ORDER BY edge_weight DESC, n.canonical_name
     LIMIT $max_neighbor_entities
 
     MATCH (c:Chunk)-[:MENTIONS]->(n)
     MATCH (c)<-[:HAS_CHUNK]-(a:Article)
     WHERE ($source_filter IS NULL OR c.source = $source_filter)
-      {time_clause}
+        {time_clause}
       AND NOT EXISTS {{
           MATCH (c)-[:MENTIONS]->(:Entity {{canonical_name: $target_entity}})
       }}
@@ -621,7 +707,8 @@ def retrieve_controlled_expansion_chunks(
         a.title        AS title,
         a.url          AS url,
         c.article_id   AS article_id,
-        c.chunk_id     AS chunk_id
+        c.chunk_id     AS chunk_id,
+        edge_weight    AS edge_weight
     LIMIT $max_extra_chunks
     """
     with driver.session() as session:
@@ -702,18 +789,67 @@ def three_layer_retrieve(
 
         expanded = {s["chunk_uid"]: s for s in seeds}
 
-        # STEP 7: controlled graph expansion only if strict recall is low
-        if len(seeds) < MIN_STRICT_CHUNKS_BEFORE_EXPANSION:
+        for s in expanded.values():
+            s["expansion_kind"] = "direct"
+
+        # STEP 7A: semantic expansion first
+        if len(expanded) < MIN_STRICT_CHUNKS_BEFORE_EXPANSION:
+            semantic_rows = retrieve_semantic_expansion_chunks(
+                driver=driver,
+                target=target,
+                source_filter=source_filter,
+                time_start=time_start,
+                time_end=time_end,
+                allowed_relations={
+                    "ACQUIRED",
+                    "PARTNERED_WITH",
+                    "INVESTED_IN",
+                    "LAUNCHED",
+                    "SUPPLIED",
+                    "REPORTED",
+                    "COMPETES_WITH",
+                },
+                allowed_neighbor_types={"ORG", "PRODUCT", "EVENT", "STOCK"},
+                min_relation_confidence=0.50,
+                max_neighbor_entities=5,
+                max_extra_chunks=4,
+            )
+
+            for r in semantic_rows:
+                uid = r.get("chunk_uid")
+                if not uid or uid in expanded:
+                    continue
+
+                emb = np.array(r["embedding"], dtype=np.float32)
+                sim = cosine_sim(qvec, emb)
+
+                ts = r.get("published_ts")
+                if ts is None:
+                    recency_weight = 0.85
+                else:
+                    age = max(0, now_ts - int(ts))
+                    recency_weight = float(np.exp(-np.log(2) * age / half_life_seconds))
+
+                relation_confidence = float(r.get("relation_confidence", 0.0) or 0.0)
+                relation_bonus = min(max(relation_confidence, 0.0), 1.0) * 0.10
+
+                score = ((0.72 * sim) + (0.13 * recency_weight) + relation_bonus) * 0.80
+                r["score"] = score
+                r["expansion_kind"] = "semantic"
+                expanded[uid] = r
+
+        # STEP 7B: co-occurrence only if still too few chunks
+        if len(expanded) < MIN_STRICT_CHUNKS_BEFORE_EXPANSION:
             extra_rows = retrieve_controlled_expansion_chunks(
                 driver=driver,
                 target=target,
                 source_filter=source_filter,
                 time_start=time_start,
                 time_end=time_end,
-                min_edge_weight=2,
+                min_edge_weight=3,
                 allowed_neighbor_types={"ORG", "PRODUCT", "EVENT", "STOCK"},
-                max_neighbor_entities=5,
-                max_extra_chunks=6,
+                max_neighbor_entities=3,
+                max_extra_chunks=3,
             )
 
             for r in extra_rows:
@@ -731,9 +867,12 @@ def three_layer_retrieve(
                     age = max(0, now_ts - int(ts))
                     recency_weight = float(np.exp(-np.log(2) * age / half_life_seconds))
 
-                # slight penalty so direct anchored evidence still wins
-                score = ((0.80 * sim) + (0.20 * recency_weight)) * 0.90
+                edge_weight = float(r.get("edge_weight", 0))
+                edge_bonus = min(edge_weight / 5.0, 1.0) * 0.05
+
+                score = ((0.70 * sim) + (0.15 * recency_weight) + edge_bonus) * 0.60
                 r["score"] = score
+                r["expansion_kind"] = "cooccurrence"
                 expanded[uid] = r
 
         # local same-article chunk expansion remains okay
@@ -770,10 +909,18 @@ def three_layer_retrieve(
                                 "article_id": n.get("article_id"),
                                 "chunk_id": n.get("chunk_id"),
                                 "score": s["score"] * 0.95,
+                                "expansion_kind": "adjacent_chunk",
                             }
 
+        expanded_values = list(expanded.values())
+        
+        expanded_values = [
+            x for x in expanded_values
+            if x.get("expansion_kind") == "direct" or x.get("score", 0.0) >= 0.35
+        ]
+
         expanded_list = sorted(
-            expanded.values(),
+            expanded_values,
             key=lambda x: x.get("score", 0),
             reverse=True,
         )
@@ -825,6 +972,22 @@ def build_structured_context(
             title = ch.get("title", "NO TITLE")
             lines.append(f"[TITLE: {title}]")
             lines.append(f"[ARTICLE URL: {url}]")
+
+            expansion_kind = ch.get("expansion_kind", "unknown")
+            lines.append(f"[EVIDENCE TYPE: {expansion_kind}]")
+
+            if ch.get("relation_type"):
+                lines.append(f"[SEMANTIC RELATION: {ch['relation_type']}]")
+            if ch.get("relation_confidence") is not None:
+                try:
+                    lines.append(f"[RELATION CONFIDENCE: {float(ch['relation_confidence']):.2f}]")
+                except Exception:
+                    pass
+            if ch.get("relation_source_chunk_uid"):
+                lines.append(f"[RELATION SOURCE CHUNK: {ch['relation_source_chunk_uid']}]")
+            if ch.get("edge_weight") is not None:
+                lines.append(f"[COOCCUR WEIGHT: {ch['edge_weight']}]")
+
             lines.append(ch.get("text", ""))
             lines.append("")
 

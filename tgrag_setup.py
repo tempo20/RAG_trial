@@ -178,6 +178,10 @@ def _map_raw_label_to_type(raw_label: str) -> str:
         "event", "earnings", "ipo", "merger", "acquisition",
         "lawsuit", "conference", "meeting", "election", "launch",
     }
+    product_tokens = {
+        "product", "device", "service", "platform",
+        "chip", "model", "software", "app", "vehicle",
+    }
     location_tokens = {
         "location", "loc", "city", "country", "region",
         "state", "continent", "address",
@@ -189,6 +193,8 @@ def _map_raw_label_to_type(raw_label: str) -> str:
         return "ORG"
     if any(tok in lbl for tok in stock_tokens):
         return "STOCK"
+    if any(tok in lbl for tok in product_tokens):
+        return "PRODUCT"
     if any(tok in lbl for tok in event_tokens):
         return "EVENT"
     if any(tok in lbl for tok in location_tokens):
@@ -250,7 +256,45 @@ def extract_entities(article_text: str, pipe) -> dict:
 MIN_CANONICAL_LEN = 4
 ALLOWED_REL_TYPES = {"ORG", "PERSON", "STOCK", "EVENT", "PRODUCT"}
 NOISE_PATTERN = re.compile(r'^\$?[\d,\.]+[bm]?$', re.IGNORECASE)
+ALLOWED_SEMANTIC_EDGE_TYPES = {
+    "ACQUIRED",
+    "PARTNERED_WITH",
+    "INVESTED_IN",
+    "LAUNCHED",
+    "SUPPLIED",
+    "REPORTED",
+    "COMPETES_WITH",
+}
 
+SEMANTIC_EXTRACTOR_NAME = "rule_based_relation_v1"
+SEMANTIC_MAX_GAP = 120
+
+DIRECTED_RELATION_PATTERNS = {
+    "ACQUIRED": [
+        r"(?:acquired|bought|purchased|to acquire|buying)",
+    ],
+    "INVESTED_IN": [
+        r"(?:invested in|backed|took a stake in|stake in)",
+    ],
+    "LAUNCHED": [
+        r"(?:launched|unveiled|introduced|released)",
+    ],
+    "SUPPLIED": [
+        r"(?:supplied|will supply|to supply|providing|provides)",
+    ],
+    "REPORTED": [
+        r"(?:reported|posted|announced)",
+    ],
+}
+
+UNDIRECTED_RELATION_PATTERNS = {
+    "PARTNERED_WITH": [
+        r"(?:partnered with|partnership with|teamed up with|collaborated with|joined forces with)",
+    ],
+    "COMPETES_WITH": [
+        r"(?:competes with|competing with|rival to|rivals|competition with)",
+    ],
+}
 
 def _in_text(canonical: str, text: str) -> bool:
     return bool(re.search(r'\b' + re.escape(canonical) + r'\b', text))
@@ -301,6 +345,115 @@ def _build_cooccurrence_relationships(
         )
     return relationships
 
+def _chunk_uid(chunk: dict) -> str:
+    return f"{chunk['article_id']}_chunk_{chunk['chunk_id']}"
+
+
+def _entity_is_semantic_candidate(ent: dict) -> bool:
+    cname = ent.get("canonical_name")
+    if not cname:
+        return False
+    if len(cname) < MIN_CANONICAL_LEN:
+        return False
+    if NOISE_PATTERN.match(cname):
+        return False
+    return ent.get("type") in {"ORG", "STOCK", "PRODUCT", "EVENT"}
+
+
+def _mentioned_entities_in_chunk(entities: list[dict], chunk_text: str) -> list[dict]:
+    chunk_norm = canonicalize(chunk_text)
+    mentioned = []
+    for ent in entities:
+        if not _entity_is_semantic_candidate(ent):
+            continue
+        cname = ent.get("canonical_name")
+        if cname and _in_text(cname, chunk_norm):
+            mentioned.append(ent)
+    return mentioned
+
+
+def _relation_match(text_norm: str, left: str, pattern: str, right: str) -> bool:
+    return bool(
+        re.search(
+            rf"\b{re.escape(left)}\b.{{0,{SEMANTIC_MAX_GAP}}}{pattern}.{{0,{SEMANTIC_MAX_GAP}}}\b{re.escape(right)}\b",
+            text_norm,
+        )
+    )
+
+
+def _extract_semantic_relationships(
+    article_chunks: list[dict],
+    entities: list[dict],
+) -> list[dict]:
+    relationships: list[dict] = []
+    seen: set[tuple[str, str, str, str]] = set()
+
+    for chunk in article_chunks:
+        chunk_text = chunk["text"]
+        chunk_norm = canonicalize(chunk_text)
+        chunk_uid = _chunk_uid(chunk)
+
+        mentioned_entities = _mentioned_entities_in_chunk(entities, chunk_text)
+        mentioned = sorted({e["canonical_name"] for e in mentioned_entities})
+
+        if len(mentioned) < 2:
+            continue
+
+        # Directed relations
+        for src in mentioned:
+            for tgt in mentioned:
+                if src == tgt:
+                    continue
+
+                for rel_type, patterns in DIRECTED_RELATION_PATTERNS.items():
+                    for pattern in patterns:
+                        if _relation_match(chunk_norm, src, pattern, tgt):
+                            key = (rel_type, src, tgt, chunk_uid)
+                            if key in seen:
+                                continue
+                            seen.add(key)
+                            relationships.append(
+                                {
+                                    "source_canonical": src,
+                                    "target_canonical": tgt,
+                                    "type": rel_type,
+                                    "confidence": 0.90,
+                                    "source_chunk_uid": chunk_uid,
+                                    "extractor": SEMANTIC_EXTRACTOR_NAME,
+                                }
+                            )
+
+        # Undirected relations
+        for src, tgt in combinations(mentioned, 2):
+            for rel_type, patterns in UNDIRECTED_RELATION_PATTERNS.items():
+                matched = False
+                for pattern in patterns:
+                    if (
+                        _relation_match(chunk_norm, src, pattern, tgt)
+                        or _relation_match(chunk_norm, tgt, pattern, src)
+                    ):
+                        matched = True
+                        break
+
+                if matched:
+                    left, right = sorted([src, tgt])
+                    key = (rel_type, left, right, chunk_uid)
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    relationships.append(
+                        {
+                            "source_canonical": left,
+                            "target_canonical": right,
+                            "type": rel_type,
+                            "confidence": 0.85,
+                            "source_chunk_uid": chunk_uid,
+                            "extractor": SEMANTIC_EXTRACTOR_NAME,
+                        }
+                    )
+
+    return relationships
+
 
 def extract_all_entities(
     chunks: list[dict],
@@ -313,17 +466,18 @@ def extract_all_entities(
     if cooccur_mode not in {"chunk", "article"}:
         raise ValueError("cooccur_mode must be 'chunk' or 'article'")
 
-    article_texts: dict[str, list[str]] = defaultdict(list)
+    article_chunks: dict[str, list[dict]] = defaultdict(list)
     for c in chunks:
         aid = c["article_id"]
-        article_texts[aid].append(c["text"])
+        article_chunks[aid].append(c)
 
     entity_data: dict[str, dict] = {}
-    total = len(article_texts)
+    total = len(article_chunks)
     print(f"Using co-occurrence mode: {cooccur_mode}")
 
-    for idx, (aid, texts) in enumerate(article_texts.items(), 1):
+    for idx, (aid, chunks_for_article) in enumerate(article_chunks.items(), 1):
         print(f"  Extracting entities [{idx}/{total}] {aid[:60]}...")
+        texts = [c["text"] for c in chunks_for_article]
         text = "\n".join(texts)
         result = extract_entities(text, pipe)
 
@@ -350,15 +504,20 @@ def extract_all_entities(
             e.pop("_score", None)
             entities.append(e)
 
-        relationships = _build_cooccurrence_relationships(
+        cooccurrence_relationships = _build_cooccurrence_relationships(
             entities,
             texts,
             cooccur_mode,
         )
 
+        semantic_relationships = _extract_semantic_relationships(
+            chunks_for_article,
+            entities,
+        )
+
         entity_data[aid] = {
             "entities": entities,
-            "relationships": relationships,
+            "relationships": cooccurrence_relationships + semantic_relationships,
         }
 
     ent_count = sum(len(d["entities"]) for d in entity_data.values())
@@ -565,9 +724,8 @@ def populate_neo4j(
             {"new_ids": new_article_ids},
         )
 
-        # Entity nodes + MENTIONS + RELATED_TO
         if entity_data:
-            print("Creating Entity nodes and MENTIONS edges...")
+            print("Creating Entity nodes, MENTIONS edges, co-occurrence edges, and semantic edges...")
             for aid in new_article_ids:
                 art_ents = entity_data.get(aid)
                 if not art_ents:
@@ -614,21 +772,78 @@ def populate_neo4j(
                             )
 
                 for rel in art_ents.get("relationships", []):
-                    session.run(
-                        """
-                        MATCH (e1:Entity {canonical_name: $src})
-                        MATCH (e2:Entity {canonical_name: $tgt})
-                        MERGE (e1)-[r:RELATED_TO]->(e2)
-                        ON CREATE SET r.relation_type = $rel_type, r.weight = 1
-                        ON MATCH SET r.weight = r.weight + 1
-                        """,
-                        {
-                            "src": rel["source_canonical"],
-                            "tgt": rel["target_canonical"],
-                            "rel_type": rel["type"],
-                        },
-                    )
+                    rel_type = rel.get("type")
+                    src = rel.get("source_canonical")
+                    tgt = rel.get("target_canonical")
 
+                    if not src or not tgt or src == tgt:
+                        continue
+
+                    if rel_type == "CO_OCCURS_CHUNK":
+                        src_c, tgt_c = sorted([src, tgt])
+                        session.run(
+                            """
+                            MATCH (e1:Entity {canonical_name: $src})
+                            MATCH (e2:Entity {canonical_name: $tgt})
+                            MERGE (e1)-[r:CO_OCCURS_CHUNK]-(e2)
+                            ON CREATE SET r.weight = 1
+                            ON MATCH SET r.weight = r.weight + 1
+                            """,
+                            {
+                                "src": src_c,
+                                "tgt": tgt_c,
+                            },
+                        )
+
+                    elif rel_type == "CO_OCCURS_ARTICLE":
+                        src_c, tgt_c = sorted([src, tgt])
+                        session.run(
+                            """
+                            MATCH (e1:Entity {canonical_name: $src})
+                            MATCH (e2:Entity {canonical_name: $tgt})
+                            MERGE (e1)-[r:CO_OCCURS_ARTICLE]-(e2)
+                            ON CREATE SET r.weight = 1
+                            ON MATCH SET r.weight = r.weight + 1
+                            """,
+                            {
+                                "src": src_c,
+                                "tgt": tgt_c,
+                            },
+                        )
+
+                    elif rel_type in ALLOWED_SEMANTIC_EDGE_TYPES:
+                        cypher = f"""
+                        MATCH (e1:Entity {{canonical_name: $src}})
+                        MATCH (e2:Entity {{canonical_name: $tgt}})
+                        MERGE (e1)-[r:{rel_type}]->(e2)
+                        ON CREATE SET
+                            r.confidence = $confidence,
+                            r.source_chunk_uid = $source_chunk_uid,
+                            r.extractor = $extractor
+                        ON MATCH SET
+                            r.confidence = CASE
+                                WHEN $confidence > coalesce(r.confidence, 0.0) THEN $confidence
+                                ELSE r.confidence
+                            END,
+                            r.source_chunk_uid = CASE
+                                WHEN $confidence > coalesce(r.confidence, 0.0) THEN $source_chunk_uid
+                                ELSE r.source_chunk_uid
+                            END,
+                            r.extractor = CASE
+                                WHEN $confidence > coalesce(r.confidence, 0.0) THEN $extractor
+                                ELSE r.extractor
+                            END
+                        """
+                        session.run(
+                            cypher,
+                            {
+                                "src": src,
+                                "tgt": tgt,
+                                "confidence": float(rel.get("confidence", 0.0) or 0.0),
+                                "source_chunk_uid": rel.get("source_chunk_uid"),
+                                "extractor": rel.get("extractor", SEMANTIC_EXTRACTOR_NAME),
+                            },
+                        )
             ent_nodes = session.run(
                 "MATCH (e:Entity) RETURN count(e) AS cnt"
             ).single()["cnt"]
@@ -655,8 +870,9 @@ def main():
         choices=["chunk", "article"],
         default=COOCCUR_DEFAULT_MODE,
         help=(
-            "How to build RELATED_TO edges: "
-            "'chunk' (default, lower noise) or 'article' (denser recall)"
+            "How to build co-occurrence edges: "
+            "'chunk' -> :CO_OCCURS_CHUNK (default, lower noise) or "
+            "'article' -> :CO_OCCURS_ARTICLE (denser recall)"
         ),
     )
     parser.add_argument(
