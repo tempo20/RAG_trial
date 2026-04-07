@@ -149,6 +149,9 @@ GLINER_LABELS = [
     "concept",
 ]
 
+def in_text(canonical: str, text: str) -> bool:
+    pattern = r'\b' + re.escape(canonical) + r'\b'
+    return bool(re.search(pattern, text))
 
 def _normalize_label(label: str) -> str:
     label = (label or "").strip().lower()
@@ -244,13 +247,30 @@ def extract_entities(article_text: str, pipe) -> dict:
     return {"entities": entities, "relationships": []}
 
 
+MIN_CANONICAL_LEN = 4
+ALLOWED_REL_TYPES = {"ORG", "PERSON", "STOCK", "EVENT", "PRODUCT"}
+NOISE_PATTERN = re.compile(r'^\$?[\d,\.]+[bm]?$', re.IGNORECASE)
+
+
+def _in_text(canonical: str, text: str) -> bool:
+    return bool(re.search(r'\b' + re.escape(canonical) + r'\b', text))
+
+
 def _build_cooccurrence_relationships(
     entities: list[dict],
     chunk_texts: list[str],
     mode: str,
 ) -> list[dict]:
     rel_type = "CO_OCCURS_ARTICLE" if mode == "article" else "CO_OCCURS_CHUNK"
-    canonicals = sorted({e["canonical_name"] for e in entities if e.get("canonical_name")})
+
+    canonicals = sorted({
+        e["canonical_name"]
+        for e in entities
+        if e.get("canonical_name")
+        and len(e["canonical_name"]) >= MIN_CANONICAL_LEN
+        and e.get("type") in ALLOWED_REL_TYPES
+        and not NOISE_PATTERN.match(e["canonical_name"])
+    })
 
     if len(canonicals) < 2:
         return []
@@ -262,7 +282,7 @@ def _build_cooccurrence_relationships(
     else:
         for text in chunk_texts:
             chunk_norm = canonicalize(text)
-            mentioned = sorted([c for c in canonicals if c in chunk_norm])
+            mentioned = sorted([c for c in canonicals if _in_text(c, chunk_norm)])
             if len(mentioned) < 2:
                 continue
             for src, tgt in combinations(mentioned, 2):
@@ -580,7 +600,7 @@ def populate_neo4j(
                     chunk_norm = canonicalize(c["text"])
                     for ent in art_ents.get("entities", []):
                         cname = ent["canonical_name"]
-                        if cname and cname in chunk_norm:
+                        if cname and _in_text(cname, chunk_norm):
                             session.run(
                                 """
                                 MATCH (ch:Chunk {chunk_uid: $chunk_uid})
@@ -599,7 +619,8 @@ def populate_neo4j(
                         MATCH (e1:Entity {canonical_name: $src})
                         MATCH (e2:Entity {canonical_name: $tgt})
                         MERGE (e1)-[r:RELATED_TO]->(e2)
-                        SET r.relation_type = $rel_type
+                        ON CREATE SET r.relation_type = $rel_type, r.weight = 1
+                        ON MATCH SET r.weight = r.weight + 1
                         """,
                         {
                             "src": rel["source_canonical"],

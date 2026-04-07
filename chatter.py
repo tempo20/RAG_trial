@@ -32,6 +32,8 @@ import numpy as np
 from sentence_transformers import SentenceTransformer
 from neo4j import GraphDatabase
 from transformers import pipeline
+from dataclasses import dataclass
+from typing import Optional
 
 from tgrag_setup import EMBED_MODEL_NAME, NEO4J_URI, NEO4J_USER, NEO4J_PASSWORD, load_ticker_company_map, canonicalize
 from pathlib import Path
@@ -366,6 +368,285 @@ def _build_market_summary(ticker: str, bars: list[dict], dstart: str | None) -> 
 
     return summary + "\n" + "\n".join(line_items)
 
+QUERY_TYPE_SINGLE = "single_entity_company"
+QUERY_TYPE_MULTI = "multi_entity_company"
+QUERY_TYPE_GENERAL = "general"
+
+COMPARE_WORDS = re.compile(r"\b(compare|vs\.?|versus|against)\b", re.IGNORECASE)
+
+@dataclass
+class QueryTarget:
+    query_type: str
+    entity_canonical: Optional[str]
+    display_name: Optional[str]
+    ticker: Optional[str]
+    confidence: float
+    ambiguous: bool
+    candidates: list[tuple[str, str, str]]
+
+
+def classify_query_type(query: str) -> str:
+    if COMPARE_WORDS.search(query):
+        return QUERY_TYPE_MULTI
+    return QUERY_TYPE_SINGLE
+
+
+def normalize_query_for_matching(query: str) -> str:
+    q = canonicalize(query)
+    stop_phrases = [
+        "latest news on", "latest news about", "news on", "news about",
+        "what is the latest news on", "what is the latest news about",
+        "what happened to", "tell me about", "latest on"
+    ]
+    for phrase in stop_phrases:
+        q = q.replace(canonicalize(phrase), " ")
+    q = re.sub(r"\s+", " ", q).strip()
+    return q
+
+
+def get_entity_name_map(driver) -> dict[str, str]:
+    with driver.session() as session:
+        rows = session.run(
+            "MATCH (e:Entity) RETURN e.canonical_name AS cname, e.name AS name"
+        ).data()
+    out = {}
+    for r in rows:
+        cname = r.get("cname")
+        if cname:
+            out[cname] = r.get("name") or cname
+    return out
+
+
+def resolve_query_target(query: str, ticker_lookup: dict[str, str], driver) -> QueryTarget:
+    query_type = classify_query_type(query)
+    q_norm = normalize_query_for_matching(query)
+    entity_name_map = get_entity_name_map(driver)
+
+    # Tier 1: explicit ticker in query
+    explicit_tickers = sorted({t.upper() for t in re.findall(r"\b[A-Z]{1,5}\b", query)})
+    if explicit_tickers:
+        with driver.session() as session:
+            rows = session.run(
+                """
+                MATCH (i:Instrument)
+                WHERE i.ticker IN $tickers
+                RETURN i.ticker AS ticker
+                """,
+                {"tickers": explicit_tickers},
+            ).data()
+        valid = [r["ticker"] for r in rows if r.get("ticker")]
+        if valid:
+            ticker = valid[0]
+            canonicals = [c for c, tk in ticker_lookup.items() if tk == ticker]
+            canonical = max(canonicals, key=len) if canonicals else None
+            display = entity_name_map.get(canonical, canonical or ticker)
+            return QueryTarget(
+                query_type=query_type,
+                entity_canonical=canonical,
+                display_name=display,
+                ticker=ticker,
+                confidence=0.99,
+                ambiguous=False,
+                candidates=[(canonical or "", display or "", ticker)],
+            )
+
+    # Tier 2: exact alias/company match
+    exact_hits = []
+    for canonical, ticker in ticker_lookup.items():
+        if canonical == q_norm:
+            exact_hits.append((canonical, entity_name_map.get(canonical, canonical), ticker))
+    if len(exact_hits) == 1:
+        c, d, t = exact_hits[0]
+        return QueryTarget(query_type, c, d, t, 0.98, False, [(c, d, t)])
+
+    # Tier 3: exact canonical phrase in query
+    phrase_hits = []
+    for canonical, ticker in ticker_lookup.items():
+        if re.search(r"\b" + re.escape(canonical) + r"\b", q_norm):
+            phrase_hits.append((canonical, entity_name_map.get(canonical, canonical), ticker))
+
+    if phrase_hits:
+        phrase_hits.sort(key=lambda x: len(x[0]), reverse=True)
+        best = phrase_hits[0]
+        ambiguous = len({t for _, _, t in phrase_hits}) > 1
+        return QueryTarget(
+            query_type=query_type,
+            entity_canonical=best[0],
+            display_name=best[1],
+            ticker=best[2],
+            confidence=0.95,
+            ambiguous=ambiguous,
+            candidates=phrase_hits[:5],
+        )
+
+    # Tier 4: exact entity canonical in DB
+    if q_norm in entity_name_map:
+        return QueryTarget(
+            query_type=QUERY_TYPE_SINGLE,
+            entity_canonical=q_norm,
+            display_name=entity_name_map[q_norm],
+            ticker=ticker_lookup.get(q_norm),
+            confidence=0.85,
+            ambiguous=False,
+            candidates=[(q_norm, entity_name_map[q_norm], ticker_lookup.get(q_norm, ""))],
+        )
+
+    return QueryTarget(
+        query_type=QUERY_TYPE_GENERAL,
+        entity_canonical=None,
+        display_name=None,
+        ticker=None,
+        confidence=0.0,
+        ambiguous=False,
+        candidates=[],
+    )
+
+def retrieve_target_anchored_chunks(
+    driver,
+    target: QueryTarget,
+    source_filter: str | None = None,
+    time_start: int | None = None,
+    time_end: int | None = None,
+) -> list[dict]:
+    if not target.entity_canonical and not target.ticker:
+        return []
+
+    params = {
+        "target_entity": target.entity_canonical,
+        "target_ticker": target.ticker,
+        "source_filter": source_filter,
+    }
+
+    time_clause = ""
+    if time_start is not None:
+        time_clause += " AND c.published_ts >= $ts_start"
+        params["ts_start"] = time_start
+    if time_end is not None:
+        time_clause += " AND c.published_ts <= $ts_end"
+        params["ts_end"] = time_end
+
+    query = f"""
+    MATCH (c:Chunk)<-[:HAS_CHUNK]-(a:Article)
+    WHERE ($source_filter IS NULL OR c.source = $source_filter)
+      {time_clause}
+      AND (
+        ($target_entity IS NOT NULL AND EXISTS {{
+            MATCH (c)-[:MENTIONS]->(:Entity {{canonical_name: $target_entity}})
+        }})
+        OR
+        ($target_ticker IS NOT NULL AND EXISTS {{
+            MATCH (c)-[:MENTIONS_INSTRUMENT]->(:Instrument {{ticker: $target_ticker}})
+        }})
+      )
+    RETURN DISTINCT
+        c.chunk_uid    AS chunk_uid,
+        c.text         AS text,
+        c.embedding    AS embedding,
+        c.published_ts AS published_ts,
+        c.source       AS source,
+        a.title        AS title,
+        a.url          AS url,
+        c.article_id   AS article_id,
+        c.chunk_id     AS chunk_id
+    """
+    with driver.session() as session:
+        return session.run(query, params).data()
+
+def retrieve_controlled_expansion_chunks(
+    driver,
+    target: QueryTarget,
+    source_filter: str | None = None,
+    time_start: int | None = None,
+    time_end: int | None = None,
+    min_edge_weight: int = 2,
+    allowed_neighbor_types: set[str] | None = None,
+    max_neighbor_entities: int = 5,
+    max_extra_chunks: int = 6,
+) -> list[dict]:
+    if not target.entity_canonical:
+        return []
+
+    if allowed_neighbor_types is None:
+        allowed_neighbor_types = {"ORG", "PRODUCT", "EVENT", "STOCK"}
+
+    params = {
+        "target_entity": target.entity_canonical,
+        "target_ticker": target.ticker,
+        "source_filter": source_filter,
+        "min_edge_weight": min_edge_weight,
+        "allowed_neighbor_types": list(allowed_neighbor_types),
+        "max_neighbor_entities": max_neighbor_entities,
+        "max_extra_chunks": max_extra_chunks,
+    }
+
+    time_clause = ""
+    if time_start is not None:
+        time_clause += " AND c.published_ts >= $ts_start"
+        params["ts_start"] = time_start
+    if time_end is not None:
+        time_clause += " AND c.published_ts <= $ts_end"
+        params["ts_end"] = time_end
+
+    query = f"""
+    MATCH (:Entity {{canonical_name: $target_entity}})-[r:RELATED_TO]-(n:Entity)
+    WHERE r.relation_type = 'CO_OCCURS_CHUNK'
+      AND coalesce(r.weight, 0) >= $min_edge_weight
+      AND n.type IN $allowed_neighbor_types
+      AND n.canonical_name <> $target_entity
+    WITH n
+    ORDER BY n.canonical_name
+    LIMIT $max_neighbor_entities
+
+    MATCH (c:Chunk)-[:MENTIONS]->(n)
+    MATCH (c)<-[:HAS_CHUNK]-(a:Article)
+    WHERE ($source_filter IS NULL OR c.source = $source_filter)
+      {time_clause}
+      AND NOT EXISTS {{
+          MATCH (c)-[:MENTIONS]->(:Entity {{canonical_name: $target_entity}})
+      }}
+      AND (
+          $target_ticker IS NULL OR
+          NOT EXISTS {{
+              MATCH (c)-[:MENTIONS_INSTRUMENT]->(:Instrument {{ticker: $target_ticker}})
+          }}
+      )
+    RETURN DISTINCT
+        c.chunk_uid    AS chunk_uid,
+        c.text         AS text,
+        c.embedding    AS embedding,
+        c.published_ts AS published_ts,
+        c.source       AS source,
+        a.title        AS title,
+        a.url          AS url,
+        c.article_id   AS article_id,
+        c.chunk_id     AS chunk_id
+    LIMIT $max_extra_chunks
+    """
+    with driver.session() as session:
+        return session.run(query, params).data()
+
+def fetch_market_text_for_target(
+    driver,
+    target: QueryTarget,
+    time_start: int | None = None,
+    time_end: int | None = None,
+) -> list[str]:
+    if not target.ticker:
+        return []
+
+    now = datetime.now(timezone.utc)
+    if time_start is None and time_end is None and DEFAULT_MARKET_LOOKBACK_DAYS:
+        market_dstart = (now - timedelta(days=DEFAULT_MARKET_LOOKBACK_DAYS)).strftime("%Y-%m-%d")
+        market_dend = now.strftime("%Y-%m-%d")
+    else:
+        market_dstart = ts_to_datestr(time_start)
+        market_dend = ts_to_datestr(time_end)
+
+    with driver.session() as session:
+        bars = _fetch_market_bars(session, target.ticker, market_dstart, market_dend, limit=7)
+        if not bars:
+            return []
+        return [_build_market_summary(target.ticker, bars, market_dstart)]
 
 def three_layer_retrieve(
     query: str,
@@ -379,257 +660,99 @@ def three_layer_retrieve(
     time_start: int | None = None,
     time_end: int | None = None,
 ):
-    qvec = embed_model.encode([query], normalize_embeddings=True)[0]
-    now_ts = int(datetime.now(timezone.utc).timestamp())
-    half_life_seconds = recency_half_life_days * 86400.0
-    market_texts: list[str] = []
+    # STEP 1: resolve one target from the query
+    target = resolve_query_target(query, ticker_lookup, driver)
 
-    # ------------------------------------------------------------------
-    # Derive market date window.  When no time filter is passed by the
-    # user, we default to the past DEFAULT_MARKET_LOOKBACK_DAYS days so
-    # "latest news on Nvidia" still returns recent price bars.
-    # ------------------------------------------------------------------
-    now = datetime.now(timezone.utc)
-    if time_start is None and time_end is None and DEFAULT_MARKET_LOOKBACK_DAYS:
-        market_dstart = (now - timedelta(days=DEFAULT_MARKET_LOOKBACK_DAYS)).strftime("%Y-%m-%d")
-        market_dend   = now.strftime("%Y-%m-%d")
-    else:
-        market_dstart = ts_to_datestr(time_start)
-        market_dend   = ts_to_datestr(time_end)
+    # Strict path for single-company queries
+    if target.query_type == QUERY_TYPE_SINGLE and target.entity_canonical:
+        # STEP 2: only retrieve chunks directly anchored to target entity/ticker
+        anchored_rows = retrieve_target_anchored_chunks(
+            driver=driver,
+            target=target,
+            source_filter=source_filter,
+            time_start=time_start,
+            time_end=time_end,
+        )
 
-    with driver.session() as session:
-        # Layer 1: Temporal subgraph filter
-        time_clauses = ""
-        params: dict = {"source_filter": source_filter}
-        if time_start is not None:
-            time_clauses += " AND c.published_ts >= $ts_start"
-            params["ts_start"] = time_start
-        if time_end is not None:
-            time_clauses += " AND c.published_ts <= $ts_end"
-            params["ts_end"] = time_end
+        # score only the anchored rows
+        qvec = embed_model.encode([query], normalize_embeddings=True)[0]
+        now_ts = int(datetime.now(timezone.utc).timestamp())
+        half_life_seconds = recency_half_life_days * 86400.0
 
-        rows = session.run(
-            f"""
-            MATCH (c:Chunk)<-[:HAS_CHUNK]-(a:Article)
-            WHERE ($source_filter IS NULL OR c.source = $source_filter)
-            {time_clauses}
-            RETURN c.chunk_uid    AS chunk_uid,
-                   c.text         AS text,
-                   c.embedding    AS embedding,
-                   c.published_ts AS published_ts,
-                   c.source       AS source,
-                   a.title        AS title,
-                   a.url          AS url,
-                   c.article_id   AS article_id,
-                   c.chunk_id     AS chunk_id
-            """,
-            params,
-        ).data()
+        scored = []
+        for r in anchored_rows:
+            emb = np.array(r["embedding"], dtype=np.float32)
+            sim = cosine_sim(qvec, emb)
 
-        # Layer 2: Entity-based coarse retrieval
-        query_lower = query.lower()
+            ts = r.get("published_ts")
+            if ts is None:
+                recency_weight = 0.85
+            else:
+                age = max(0, now_ts - int(ts))
+                recency_weight = float(np.exp(-np.log(2) * age / half_life_seconds))
 
-        expanded_query_lower = query_lower
-        for canonical, ticker in ticker_lookup.items():
-            if canonical in query_lower:
-                for other_canonical, other_ticker in ticker_lookup.items():
-                    if other_ticker == ticker and other_canonical not in expanded_query_lower:
-                        expanded_query_lower += " " + other_canonical
+            score = (0.80 * sim) + (0.20 * recency_weight)
+            r["score"] = score
+            scored.append(r)
 
-        entity_rows = session.run(
-            "MATCH (e:Entity) RETURN e.canonical_name AS cname, e.name AS name"
-        ).data()
+        scored.sort(key=lambda x: x["score"], reverse=True)
+        seeds = scored[:top_k]
 
-        matched_entities: list[str] = []
-        for e in entity_rows:
-            cname = e["cname"]
-            name_lower = e["name"].lower()
-            if cname in expanded_query_lower or name_lower in expanded_query_lower:
-                matched_entities.append(cname)
-                continue
-            for word in cname.split():
-                if len(word) > 3 and re.search(
-                    r"\b" + re.escape(word) + r"\b", query_lower
-                ):
-                    matched_entities.append(cname)
-                    break
-
-        if matched_entities:
-            related = session.run(
-                """
-                MATCH (e:Entity)-[:RELATED_TO]-(e2:Entity)
-                WHERE e.canonical_name IN $enames
-                RETURN DISTINCT e2.canonical_name AS cname
-                """,
-                {"enames": matched_entities},
-            ).data()
-            for r in related:
-                if r["cname"] not in matched_entities:
-                    matched_entities.append(r["cname"])
-
-        entity_chunk_uids: set[str] = set()
-        if matched_entities:
-            ent_params: dict = {
-                "enames": matched_entities,
-                "source_filter": source_filter,
-            }
-            ent_time = ""
-            if time_start is not None:
-                ent_time += " AND c.published_ts >= $ts_start"
-                ent_params["ts_start"] = time_start
-            if time_end is not None:
-                ent_time += " AND c.published_ts <= $ts_end"
-                ent_params["ts_end"] = time_end
-
-            ent_chunks = session.run(
-                f"""
-                MATCH (c:Chunk)-[:MENTIONS]->(e:Entity)
-                WHERE e.canonical_name IN $enames
-                  AND ($source_filter IS NULL OR c.source = $source_filter)
-                  {ent_time}
-                RETURN DISTINCT c.chunk_uid AS chunk_uid
-                """,
-                ent_params,
-            ).data()
-            entity_chunk_uids = {r["chunk_uid"] for r in ent_chunks}
-
-        # ------------------------------------------------------------------
-        # Market bar retrieval — runs unconditionally whenever tickers
-        # can be resolved (previously this block was guarded by `if not
-        # tickers`, which meant bars were only fetched when ticker lookup
-        # FAILED — the opposite of the intended behaviour).
-        # ------------------------------------------------------------------
-        tickers: list[str] = []
-
-        # Primary: resolve via Entity -> ALIASES_TICKER (preferred path)
-        if matched_entities:
-            tickers_rows = session.run(
-                """
-                MATCH (e:Entity)-[:ALIASES_TICKER]->(i:Instrument)
-                WHERE e.canonical_name IN $enames
-                RETURN DISTINCT i.ticker AS ticker
-                """,
-                {"enames": matched_entities},
-            ).data()
-            tickers = [r["ticker"] for r in tickers_rows if r.get("ticker")]
-
-        # Fallback 1: consonant-abbreviation heuristic
-        if not tickers and matched_entities:
-            for en in matched_entities:
-                t = ticker_lookup.get(en)
-                if t:
-                    tickers.append(t)
-            tickers = list(set(tickers))
-
-        # Fallback 2: explicit uppercase token in the query (e.g. "NVDA")
-        if not tickers:
-            explicit = sorted({t.upper() for t in re.findall(r"\b[A-Z]{1,5}\b", query)})
-            if explicit:
-                cand_rows = session.run(
+        # keep local chunk expansion only
+        expanded = {s["chunk_uid"]: s for s in seeds}
+        with driver.session() as session:
+            for s in seeds:
+                neighbors = session.run(
                     """
-                    MATCH (i:Instrument)
-                    WHERE i.ticker IN $cands
-                    RETURN DISTINCT i.ticker AS ticker
+                    MATCH (c:Chunk {chunk_uid: $chunk_uid})
+                    OPTIONAL MATCH (c)-[:NEXT_CHUNK]->(n1:Chunk)
+                    OPTIONAL MATCH (c)<-[:NEXT_CHUNK]-(p1:Chunk)
+                    WITH collect(DISTINCT n1) + collect(DISTINCT p1) AS nearby
+                    UNWIND nearby AS n
+                    WITH n
+                    WHERE n IS NOT NULL
+                      AND ($source_filter IS NULL OR n.source = $source_filter)
+                    RETURN collect(n) AS nearby
                     """,
-                    {"cands": explicit},
-                ).data()
-                tickers = [r["ticker"] for r in cand_rows if r.get("ticker")]
-        # Fallback 3: explicit canonical name in the query (e.g. "NVIDIA")
-        if not tickers:
-            matched: list[tuple[str, str]] = []
-            for canonical, ticker in ticker_lookup.items():
-                if canonical in query_lower:
-                    matched.append((canonical, ticker))
-            # prefer longest canonical match (most specific)
-            if matched:
-                matched.sort(key=lambda x: len(x[0]), reverse=True)
-                tickers = [matched[0][1]]
+                    {
+                        "chunk_uid": s["chunk_uid"],
+                        "source_filter": source_filter,
+                    },
+                ).single()
 
-        # Fetch and summarise bars for every resolved ticker
-        if tickers:
-            query_relevant = []
-            for ticker in tickers:
-                for canonical, t in ticker_lookup.items():
-                    if t == ticker and canonical in query_lower:
-                        query_relevant.append(ticker)
-                        break
-            if query_relevant:
-                tickers = list(set(query_relevant))
+                if neighbors and neighbors["nearby"]:
+                    for n in neighbors["nearby"]:
+                        uid = n.get("chunk_uid")
+                        if uid and uid not in expanded:
+                            expanded[uid] = {
+                                "chunk_uid": uid,
+                                "text": n.get("text", ""),
+                                "source": n.get("source"),
+                                "title": s["title"],
+                                "url": s["url"],
+                                "article_id": n.get("article_id"),
+                                "chunk_id": n.get("chunk_id"),
+                                "score": s["score"] * 0.95,
+                            }
 
-        # Fetch and summarise bars for every resolved ticker
-        for ticker in tickers:
-            bars = _fetch_market_bars(
-                session, ticker, market_dstart, market_dend, limit=7
-            )
-            if bars:
-                market_texts.append(_build_market_summary(ticker, bars, market_dstart))
+        expanded_list = sorted(
+            expanded.values(),
+            key=lambda x: x.get("score", 0),
+            reverse=True,
+        )
 
-    # Layer 3: Semantic fine-grained retrieval
-    scored = []
-    for r in rows:
-        emb = np.array(r["embedding"], dtype=np.float32)
-        sim = cosine_sim(qvec, emb)
+        # STEP 3: only fetch market data for the resolved target ticker
+        market_texts = fetch_market_text_for_target(
+            driver=driver,
+            target=target,
+            time_start=time_start,
+            time_end=time_end,
+        )
 
-        ts = r.get("published_ts")
-        if ts is None:
-            recency_weight = 0.85
-        else:
-            age = max(0, now_ts - int(ts))
-            recency_weight = float(
-                np.exp(-np.log(2) * age / half_life_seconds)
-            )
+        return expanded_list[:expanded_k], market_texts, target
 
-        entity_boost = 1.0 if r["chunk_uid"] in entity_chunk_uids else 0.0
-        # score = (0.70 * sim) + (0.20 * recency_weight) + (0.10 * entity_boost)
-        score = (0.55 * sim) + (0.15 * recency_weight) + (0.30 * entity_boost)
-
-        r["semantic_sim"] = sim
-        r["recency_weight"] = recency_weight
-        r["entity_match"] = bool(entity_boost)
-        r["score"] = score
-        scored.append(r)
-
-    scored.sort(key=lambda x: x["score"], reverse=True)
-    seeds = scored[:top_k]
-
-    # Graph expansion via NEXT_CHUNK neighbours
-    expanded = {s["chunk_uid"]: s for s in seeds}
-    with driver.session() as session:
-        for s in seeds:
-            neighbors = session.run(
-                """
-                MATCH (c:Chunk {chunk_uid: $chunk_uid})
-                OPTIONAL MATCH (c)-[:NEXT_CHUNK]->(n1:Chunk)
-                OPTIONAL MATCH (c)<-[:NEXT_CHUNK]-(p1:Chunk)
-                WITH collect(DISTINCT n1) + collect(DISTINCT p1) AS nearby
-                UNWIND nearby AS n
-                WITH n
-                WHERE n IS NOT NULL
-                  AND ($source_filter IS NULL OR n.source = $source_filter)
-                RETURN collect(n) AS nearby
-                """,
-                {"chunk_uid": s["chunk_uid"], "source_filter": source_filter},
-            ).single()
-
-            if neighbors and neighbors["nearby"]:
-                for n in neighbors["nearby"]:
-                    uid = n.get("chunk_uid")
-                    if uid and uid not in expanded:
-                        expanded[uid] = {
-                            "chunk_uid": uid,
-                            "text": n.get("text", ""),
-                            "source": n.get("source"),
-                            "title": s["title"],
-                            "url": s["url"],
-                            "article_id": n.get("article_id"),
-                            "chunk_id": n.get("chunk_id"),
-                            "score": s["score"] * 0.95,
-                        }
-
-    expanded_list = sorted(
-        expanded.values(), key=lambda x: x.get("score", 0), reverse=True
-    )
-    return expanded_list[:expanded_k], market_texts
+    # fallback path for non-single-entity queries
+    return [], [], target
 
 
 # Generation
@@ -643,6 +766,41 @@ SYSTEM_PROMPT_TEMPLATE = (
     "news developments. If there is not enough evidence, say so clearly. "
 )
 
+def build_structured_context(
+    query: str,
+    target: QueryTarget,
+    retrieved_chunks: list[dict],
+    market_texts: list[str],
+) -> str:
+    lines = []
+
+    lines.append(f"TARGET ENTITY: {target.display_name or 'unknown'}")
+    lines.append(f"TARGET CANONICAL: {target.entity_canonical or 'unknown'}")
+    lines.append(f"TARGET TICKER: {target.ticker or 'unknown'}")
+    lines.append(f"TARGET CONFIDENCE: {target.confidence:.2f}")
+    lines.append("")
+
+    lines.append("PRIMARY NEWS EVIDENCE:")
+    if not retrieved_chunks:
+        lines.append("No directly anchored news chunks found.")
+    else:
+        for ch in retrieved_chunks:
+            url = ch.get("url", "NO URL")
+            title = ch.get("title", "NO TITLE")
+            lines.append(f"[TITLE: {title}]")
+            lines.append(f"[ARTICLE URL: {url}]")
+            lines.append(ch.get("text", ""))
+            lines.append("")
+
+    lines.append("MARKET DATA:")
+    if not market_texts:
+        lines.append("No market data available.")
+    else:
+        for mt in market_texts:
+            lines.append(mt)
+            lines.append("")
+
+    return "\n".join(lines)
 
 def generate_answer(query: str, context: str, pipe, system_prompt: str) -> str:
     messages = [
@@ -652,8 +810,12 @@ def generate_answer(query: str, context: str, pipe, system_prompt: str) -> str:
             "content": (
                 f"Context:\n{context}\n\n"
                 f"Question: {query}\n\n"
-                "Answer directly and concisely. If market data is present, "
-                "summarise the price trend and link it to the news."
+                "Instructions:\n"
+                "1. Use only the target entity and target ticker shown in the context.\n"
+                "2. Do not use market data for any other company.\n"
+                "3. If the context is ambiguous or insufficient, say so clearly.\n"
+                "4. Prioritize directly anchored news evidence over general background.\n"
+                "5. If market data is included, only connect it to the named target.\n"
             ),
         },
     ]
@@ -661,6 +823,96 @@ def generate_answer(query: str, context: str, pipe, system_prompt: str) -> str:
     raw = out[0]["generated_text"][-1]["content"]
     return strip_think_tags(raw)
 
+
+TEST_QUERIES = [
+    # Exact company names
+    {"query": "What is the latest news on Google?", "entity": "google", "ticker": "GOOGL"},
+    {"query": "What is the latest news on Nvidia?", "entity": "nvidia", "ticker": "NVDA"},
+    {"query": "What is the latest news on Apple?", "entity": "apple", "ticker": "AAPL"},
+    {"query": "What is the latest news on Visa?", "entity": "visa", "ticker": "V"},
+    {"query": "What is the latest news on Microsoft?", "entity": "microsoft", "ticker": "MSFT"},
+    {"query": "What is the latest news on Amazon?", "entity": "amazon", "ticker": "AMZN"},
+    {"query": "What is the latest news on Meta?", "entity": "meta", "ticker": "META"},
+    {"query": "What is the latest news on Oracle?", "entity": "oracle", "ticker": "ORCL"},
+
+    # Official company names / aliases
+    {"query": "What is the latest news on Alphabet?", "entity": "alphabet", "ticker": "GOOGL"},
+    {"query": "What is the latest news on Meta Platforms?", "entity": "meta platforms", "ticker": "META"},
+    {"query": "What is the latest news on Berkshire Hathaway?", "entity": "berkshire hathaway", "ticker": None},
+    {"query": "What is the latest news on JPMorgan?", "entity": "jpmorgan", "ticker": "JPM"},
+
+    # Direct ticker queries
+    {"query": "What is the latest news on GOOGL?", "entity": "google", "ticker": "GOOGL"},
+    {"query": "What is the latest news on NVDA?", "entity": "nvidia", "ticker": "NVDA"},
+    {"query": "What is the latest news on AAPL?", "entity": "apple", "ticker": "AAPL"},
+    {"query": "What is the latest news on V?", "entity": "visa", "ticker": "V"},
+
+    # Time-filtered single-entity queries
+    {"query": "What happened to Google this week?", "entity": "google", "ticker": "GOOGL"},
+    {"query": "What happened to Nvidia this week?", "entity": "nvidia", "ticker": "NVDA"},
+    {"query": "What happened to Apple this month?", "entity": "apple", "ticker": "AAPL"},
+
+    # Source-filter flavored queries
+    {"query": "What is the latest CNBC news on Google?", "entity": "google", "ticker": "GOOGL"},
+    {"query": "What is the latest CNBC news on Nvidia?", "entity": "nvidia", "ticker": "NVDA"},
+
+    # Lower-coverage / harder names
+    {"query": "What is the latest news on AMD?", "entity": "amd", "ticker": "AMD"},
+    {"query": "What is the latest news on IBM?", "entity": "ibm", "ticker": "IBM"},
+    {"query": "What is the latest news on Costco?", "entity": "costco", "ticker": "COST"},
+]
+
+def normalize_name(x):
+    if not x:
+        return x
+    return x.replace(" inc", "").replace(" corporation", "").strip()
+
+def run_retrieval_eval(embed_model, driver, ticker_lookup):
+    results = []
+
+    for item in TEST_QUERIES:
+        query = item["query"]
+
+        target = resolve_query_target(query, ticker_lookup, driver)
+
+        chunks = retrieve_target_anchored_chunks(
+            driver=driver,
+            target=target,
+            source_filter=None,
+            time_start=None,
+            time_end=None,
+        )
+
+        market_texts = fetch_market_text_for_target(
+            driver=driver,
+            target=target,
+            time_start=None,
+            time_end=None,
+        )
+
+        result = {
+            "query": query,
+            "expected_entity": item["entity"],
+            "expected_ticker": item["ticker"],
+            "resolved_entity": target.entity_canonical,
+            "resolved_ticker": target.ticker,
+            "entity_ok": normalize_name(target.entity_canonical) == normalize_name(item["entity"]),
+            "ticker_ok": target.ticker == item["ticker"] if item["ticker"] is not None else True,
+            "anchored_chunk_count": len(chunks),
+            "market_count": len(market_texts),
+            "market_ok": (
+                len(market_texts) <= 1 and
+                (
+                    len(market_texts) == 0
+                    or item["ticker"] is None
+                    or target.ticker == item["ticker"]
+                )
+            ),
+        }
+
+        results.append(result)
+
+    return results
 
 # Main loop
 
@@ -690,6 +942,19 @@ def main():
     )
 
     ticker_lookup = load_ticker_company_map(Path("ticker_company_map.csv"))
+
+    # Uncomment to run retrieval evaluation
+
+    eval_results = run_retrieval_eval(embed_model, driver, ticker_lookup)
+    print("\n=== RETRIEVAL EVAL RESULTS ===")
+    for r in eval_results:
+        print(
+            f"Query: {r['query']}\n"
+            f"  expected_entity={r['expected_entity']} | resolved_entity={r['resolved_entity']} | entity_ok={r['entity_ok']}\n"
+            f"  expected_ticker={r['expected_ticker']} | resolved_ticker={r['resolved_ticker']} | ticker_ok={r['ticker_ok']}\n"
+            f"  anchored_chunk_count={r['anchored_chunk_count']} | market_count={r['market_count']} | market_ok={r['market_ok']}\n"
+        )
+    print("=== END RETRIEVAL EVAL ===\n")
 
     print(f"\n--- TG-RAG Chatbot ready ---")
     print(f"Articles from {date_min} to {date_max}")
@@ -731,7 +996,7 @@ def main():
                     f"{sq.get('time_end', '?')}]"
                 )
 
-            retrieved_chunks, market_texts = three_layer_retrieve(
+            retrieved_chunks, market_texts, target = three_layer_retrieve(
                 query=sq["query"],
                 embed_model=embed_model,
                 driver=driver,
@@ -748,19 +1013,22 @@ def main():
             if sq.get("time_start") and sq.get("time_end"):
                 period_label = f"[{sq['time_start']} to {sq['time_end']}] "
 
-            if retrieved_chunks:
-                for x in retrieved_chunks:
-                    if x.get("text"):
-                        url = x.get("url", "NO URL")
-                        header = f"[ARTICLE URL: {url}]\n"
-                        all_contexts.append(f"{period_label}{header}{x['text']}")
-                        if url not in all_urls:
-                            all_urls.append(url)
+            context = build_structured_context(
+                query=sq["query"],
+                target=target,
+                retrieved_chunks=retrieved_chunks,
+                market_texts=market_texts,
+            )
 
-            # Market snippets always included when available
-            if market_texts:
-                for t in market_texts:
-                    all_contexts.append(f"{period_label}{t}")
+            print(context)
+
+            all_contexts.append(period_label + context)
+
+            for x in retrieved_chunks:
+                url = x.get("url")
+                if url and url not in all_urls:
+                    all_urls.append(url)
+
 
         # Step 3: Single generation from merged context
         if not all_contexts:
