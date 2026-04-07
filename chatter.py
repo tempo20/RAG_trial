@@ -44,6 +44,8 @@ GEN_MODEL_NAME = "Qwen/Qwen3-0.6B"
 # Set to None to disable the default and always use unbounded queries.
 DEFAULT_MARKET_LOOKBACK_DAYS: int | None = 7
 
+MIN_STRICT_CHUNKS_BEFORE_EXPANSION = 3
+
 SOURCE_KEYWORDS = {
     "bbc": "BBC",
     "bloomberg": "Bloomberg",
@@ -698,8 +700,43 @@ def three_layer_retrieve(
         scored.sort(key=lambda x: x["score"], reverse=True)
         seeds = scored[:top_k]
 
-        # keep local chunk expansion only
         expanded = {s["chunk_uid"]: s for s in seeds}
+
+        # STEP 7: controlled graph expansion only if strict recall is low
+        if len(seeds) < MIN_STRICT_CHUNKS_BEFORE_EXPANSION:
+            extra_rows = retrieve_controlled_expansion_chunks(
+                driver=driver,
+                target=target,
+                source_filter=source_filter,
+                time_start=time_start,
+                time_end=time_end,
+                min_edge_weight=2,
+                allowed_neighbor_types={"ORG", "PRODUCT", "EVENT", "STOCK"},
+                max_neighbor_entities=5,
+                max_extra_chunks=6,
+            )
+
+            for r in extra_rows:
+                uid = r.get("chunk_uid")
+                if not uid or uid in expanded:
+                    continue
+
+                emb = np.array(r["embedding"], dtype=np.float32)
+                sim = cosine_sim(qvec, emb)
+
+                ts = r.get("published_ts")
+                if ts is None:
+                    recency_weight = 0.85
+                else:
+                    age = max(0, now_ts - int(ts))
+                    recency_weight = float(np.exp(-np.log(2) * age / half_life_seconds))
+
+                # slight penalty so direct anchored evidence still wins
+                score = ((0.80 * sim) + (0.20 * recency_weight)) * 0.90
+                r["score"] = score
+                expanded[uid] = r
+
+        # local same-article chunk expansion remains okay
         with driver.session() as session:
             for s in seeds:
                 neighbors = session.run(
@@ -741,7 +778,6 @@ def three_layer_retrieve(
             reverse=True,
         )
 
-        # STEP 3: only fetch market data for the resolved target ticker
         market_texts = fetch_market_text_for_target(
             driver=driver,
             target=target,
