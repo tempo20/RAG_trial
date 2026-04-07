@@ -375,6 +375,44 @@ QUERY_TYPE_MULTI = "multi_entity_company"
 QUERY_TYPE_GENERAL = "general"
 
 COMPARE_WORDS = re.compile(r"\b(compare|vs\.?|versus|against)\b", re.IGNORECASE)
+QUERY_INTENT_GENERAL = "general_company_news"
+QUERY_INTENT_COMPETITION = "competition"
+QUERY_INTENT_MNA = "mna"
+QUERY_INTENT_PARTNERSHIP = "partnership"
+QUERY_INTENT_INVESTMENT = "investment"
+QUERY_INTENT_PRODUCT = "product"
+QUERY_INTENT_EARNINGS = "earnings"
+QUERY_INTENT_SUPPLY = "supply_chain"
+
+INTENT_PATTERNS = {
+    QUERY_INTENT_COMPETITION: re.compile(
+        r"\b(compete|competitor|competition|rival|rivals)\b", re.IGNORECASE
+    ),
+    QUERY_INTENT_MNA: re.compile(
+        r"\b(acquire|acquired|acquisition|buy|bought|purchase|purchased|merger|merge)\b",
+        re.IGNORECASE,
+    ),
+    QUERY_INTENT_PARTNERSHIP: re.compile(
+        r"\b(partner|partnership|collaborat|collaboration|teamed up|joined forces)\b",
+        re.IGNORECASE,
+    ),
+    QUERY_INTENT_INVESTMENT: re.compile(
+        r"\b(invest|investment|stake|backed|funding|fundraise|raised)\b",
+        re.IGNORECASE,
+    ),
+    QUERY_INTENT_PRODUCT: re.compile(
+        r"\b(product|launch|launched|release|released|unveil|unveiled|device|chip|model|platform)\b",
+        re.IGNORECASE,
+    ),
+    QUERY_INTENT_EARNINGS: re.compile(
+        r"\b(earnings|revenue|profit|guidance|forecast|results|reported|quarter|q1|q2|q3|q4)\b",
+        re.IGNORECASE,
+    ),
+    QUERY_INTENT_SUPPLY: re.compile(
+        r"\b(supply|supplier|supplied|providing|manufactur|foundry|shipment|deliver)\b",
+        re.IGNORECASE,
+    ),
+}
 
 @dataclass
 class QueryTarget:
@@ -392,6 +430,84 @@ def classify_query_type(query: str) -> str:
         return QUERY_TYPE_MULTI
     return QUERY_TYPE_SINGLE
 
+def classify_query_intent(query: str) -> str:
+    for intent, pattern in INTENT_PATTERNS.items():
+        if pattern.search(query):
+            return intent
+    return QUERY_INTENT_GENERAL
+
+SEMANTIC_POLICY_BY_INTENT = {
+    QUERY_INTENT_GENERAL: {
+        "allowed_relations": {
+            "ACQUIRED",
+            "PARTNERED_WITH",
+            "INVESTED_IN",
+            "LAUNCHED",
+            "SUPPLIED",
+            "REPORTED",
+        },
+        "allowed_neighbor_types": {"ORG", "PRODUCT", "EVENT", "STOCK"},
+        "min_relation_confidence": 0.50,
+        "max_neighbor_entities": 5,
+        "max_extra_chunks": 4,
+    },
+    QUERY_INTENT_COMPETITION: {
+        "allowed_relations": {"COMPETES_WITH"},
+        "allowed_neighbor_types": {"ORG", "PRODUCT", "STOCK"},
+        "min_relation_confidence": 0.50,
+        "max_neighbor_entities": 6,
+        "max_extra_chunks": 5,
+    },
+    QUERY_INTENT_MNA: {
+        "allowed_relations": {"ACQUIRED"},
+        "allowed_neighbor_types": {"ORG", "STOCK", "EVENT"},
+        "min_relation_confidence": 0.60,
+        "max_neighbor_entities": 4,
+        "max_extra_chunks": 4,
+    },
+    QUERY_INTENT_PARTNERSHIP: {
+        "allowed_relations": {"PARTNERED_WITH"},
+        "allowed_neighbor_types": {"ORG", "PRODUCT", "EVENT", "STOCK"},
+        "min_relation_confidence": 0.55,
+        "max_neighbor_entities": 4,
+        "max_extra_chunks": 4,
+    },
+    QUERY_INTENT_INVESTMENT: {
+        "allowed_relations": {"INVESTED_IN"},
+        "allowed_neighbor_types": {"ORG", "STOCK", "EVENT"},
+        "min_relation_confidence": 0.60,
+        "max_neighbor_entities": 4,
+        "max_extra_chunks": 4,
+    },
+    QUERY_INTENT_PRODUCT: {
+        "allowed_relations": {"LAUNCHED", "SUPPLIED"},
+        "allowed_neighbor_types": {"PRODUCT", "ORG", "EVENT"},
+        "min_relation_confidence": 0.55,
+        "max_neighbor_entities": 5,
+        "max_extra_chunks": 5,
+    },
+    QUERY_INTENT_EARNINGS: {
+        "allowed_relations": {"REPORTED"},
+        "allowed_neighbor_types": {"EVENT", "ORG", "STOCK"},
+        "min_relation_confidence": 0.60,
+        "max_neighbor_entities": 4,
+        "max_extra_chunks": 4,
+    },
+    QUERY_INTENT_SUPPLY: {
+        "allowed_relations": {"SUPPLIED"},
+        "allowed_neighbor_types": {"ORG", "PRODUCT", "EVENT"},
+        "min_relation_confidence": 0.60,
+        "max_neighbor_entities": 4,
+        "max_extra_chunks": 4,
+    },
+}
+
+def get_semantic_policy_for_query(query: str) -> dict:
+    intent = classify_query_intent(query)
+    return {
+        "intent": intent,
+        **SEMANTIC_POLICY_BY_INTENT.get(intent, SEMANTIC_POLICY_BY_INTENT[QUERY_INTENT_GENERAL]),
+    }
 
 def normalize_query_for_matching(query: str) -> str:
     q = canonicalize(query)
@@ -751,6 +867,7 @@ def three_layer_retrieve(
 ):
     # STEP 1: resolve one target from the query
     target = resolve_query_target(query, ticker_lookup, driver)
+    semantic_policy = get_semantic_policy_for_query(query)
 
     # Strict path for single-company queries
     if target.query_type == QUERY_TYPE_SINGLE and target.entity_canonical:
@@ -800,19 +917,11 @@ def three_layer_retrieve(
                 source_filter=source_filter,
                 time_start=time_start,
                 time_end=time_end,
-                allowed_relations={
-                    "ACQUIRED",
-                    "PARTNERED_WITH",
-                    "INVESTED_IN",
-                    "LAUNCHED",
-                    "SUPPLIED",
-                    "REPORTED",
-                    "COMPETES_WITH",
-                },
-                allowed_neighbor_types={"ORG", "PRODUCT", "EVENT", "STOCK"},
-                min_relation_confidence=0.50,
-                max_neighbor_entities=5,
-                max_extra_chunks=4,
+                allowed_relations=semantic_policy["allowed_relations"],
+                allowed_neighbor_types=semantic_policy["allowed_neighbor_types"],
+                min_relation_confidence=semantic_policy["min_relation_confidence"],
+                max_neighbor_entities=semantic_policy["max_neighbor_entities"],
+                max_extra_chunks=semantic_policy["max_extra_chunks"],
             )
 
             for r in semantic_rows:
@@ -956,11 +1065,13 @@ def build_structured_context(
     market_texts: list[str],
 ) -> str:
     lines = []
+    semantic_policy = get_semantic_policy_for_query(query)
 
     lines.append(f"TARGET ENTITY: {target.display_name or 'unknown'}")
     lines.append(f"TARGET CANONICAL: {target.entity_canonical or 'unknown'}")
     lines.append(f"TARGET TICKER: {target.ticker or 'unknown'}")
     lines.append(f"TARGET CONFIDENCE: {target.confidence:.2f}")
+    lines.append(f"QUERY INTENT: {semantic_policy['intent']}")
     lines.append("")
 
     lines.append("PRIMARY NEWS EVIDENCE:")
