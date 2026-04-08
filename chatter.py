@@ -1053,9 +1053,15 @@ SYSTEM_PROMPT_TEMPLATE = (
     "You are a finance assistant. Answer the user's question using only the "
     "provided context (news chunks and, when available, market data snippets). "
     "The articles in your database span from {date_min} to {date_max}. "
+    "Use only the target entity and target ticker shown in the context. "
+    "Do not use market data for any other company. "
+    "Prioritize directly anchored news evidence over general background. "
     "When market data is present in the context, describe the price trend "
     "(direction, percentage change, high/low range) and connect it to relevant "
-    "news developments. If there is not enough evidence, say so clearly. "
+    "news developments. "
+    "If the context is ambiguous, off-target, or insufficient, say so clearly. "
+    "Do not output <think> tags, hidden reasoning, or chain-of-thought. "
+    "Return only a concise final answer."
 )
 
 def build_structured_context(
@@ -1120,18 +1126,30 @@ def generate_answer(query: str, context: str, pipe, system_prompt: str) -> str:
             "content": (
                 f"Context:\n{context}\n\n"
                 f"Question: {query}\n\n"
-                "Instructions:\n"
-                "1. Use only the target entity and target ticker shown in the context.\n"
-                "2. Do not use market data for any other company.\n"
-                "3. If the context is ambiguous or insufficient, say so clearly.\n"
-                "4. Prioritize directly anchored news evidence over general background.\n"
-                "5. If market data is included, only connect it to the named target.\n"
             ),
         },
     ]
-    out = pipe(messages, max_new_tokens=1024, do_sample=False)
-    raw = out[0]["generated_text"][-1]["content"]
-    return strip_think_tags(raw)
+
+    out = pipe(messages, max_new_tokens=512, do_sample=False)
+    generated = out[0]["generated_text"]
+
+    # Handle chat-template output
+    if isinstance(generated, list):
+        raw = generated[-1].get("content", "")
+    else:
+        raw = str(generated)
+
+    cleaned = strip_think_tags(raw).strip()
+
+    # Fallback: if think-tag stripping removed everything, keep raw text
+    if not cleaned:
+        cleaned = raw.strip()
+
+    # Final fallback so you never print a blank answer
+    if not cleaned:
+        cleaned = "I could not generate a grounded answer from the retrieved context."
+
+    return cleaned
 
 
 TEST_QUERIES = [
@@ -1253,18 +1271,17 @@ def main():
 
     ticker_lookup = load_ticker_company_map(Path("ticker_company_map.csv"))
 
-    # Uncomment to run retrieval evaluation
-
-    eval_results = run_retrieval_eval(embed_model, driver, ticker_lookup)
-    print("\n=== RETRIEVAL EVAL RESULTS ===")
-    for r in eval_results:
-        print(
-            f"Query: {r['query']}\n"
-            f"  expected_entity={r['expected_entity']} | resolved_entity={r['resolved_entity']} | entity_ok={r['entity_ok']}\n"
-            f"  expected_ticker={r['expected_ticker']} | resolved_ticker={r['resolved_ticker']} | ticker_ok={r['ticker_ok']}\n"
-            f"  anchored_chunk_count={r['anchored_chunk_count']} | market_count={r['market_count']} | market_ok={r['market_ok']}\n"
-        )
-    print("=== END RETRIEVAL EVAL ===\n")
+    # # Uncomment to run retrieval evaluation
+    # eval_results = run_retrieval_eval(embed_model, driver, ticker_lookup)
+    # print("\n=== RETRIEVAL EVAL RESULTS ===")
+    # for r in eval_results:
+    #     print(
+    #         f"Query: {r['query']}\n"
+    #         f"  expected_entity={r['expected_entity']} | resolved_entity={r['resolved_entity']} | entity_ok={r['entity_ok']}\n"
+    #         f"  expected_ticker={r['expected_ticker']} | resolved_ticker={r['resolved_ticker']} | ticker_ok={r['ticker_ok']}\n"
+    #         f"  anchored_chunk_count={r['anchored_chunk_count']} | market_count={r['market_count']} | market_ok={r['market_ok']}\n"
+    #     )
+    # print("=== END RETRIEVAL EVAL ===\n")
 
     print(f"\n--- TG-RAG Chatbot ready ---")
     print(f"Articles from {date_min} to {date_max}")

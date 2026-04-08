@@ -1,926 +1,837 @@
 """
-Temporal-Graph RAG Setup
+tgrag_setup.py — T-GRAG Knowledge Graph Construction
 
-Reads cnbc_articles.json, chunks the articles, embeds them,
-extracts entities (via GLiNER), and populates
-the Neo4j temporal graph.
+Implements the Temporal Knowledge Graph Generator from the T-GRAG paper:
+  "T-GRAG: A Dynamic GraphRAG Framework for Resolving Temporal Conflicts
+   and Redundancy in Knowledge Retrieval" (MM '25)
 
-Usage:
-    python tgrag_setup.py                    # incremental update
-    python tgrag_setup.py --reset            # wipe graph and rebuild
-    python tgrag_setup.py --skip-entities    # skip NER extraction
-    python tgrag_setup.py --cooccur-mode article
+Pipeline (mirrors Algorithm 1, Step 1):
+  1. Load scraped articles from JSON
+  2. Filter duplicates (content hash) and already-ingested articles
+  3. Assign each article a Period (temporal bucket)
+  4. Split articles into Chunks (fixed text blocks d^{t_i}_j)
+  5. For each Chunk, extract:
+       - KnowledgeNode per entity found  (e^{T_i}_i, one node per entity × period)
+       - Knowledge units per entity      (k^{t_i}, atomic facts)
+       - Typed RELATED_TO edges between entity KnowledgeNodes in same period
+  6. Embed KnowledgeNodes (coarse, R_node) and Knowledge units (fine, R_knowledge)
+     and Chunks (source text extractor)
+  7. Write everything to Neo4j
+  8. Link SAME_ENTITY_AS chains across periods
+
+Key design decisions vs. original implementation:
+  - REMOVED: Entity/Instrument/MarketBar nodes (hist_to_db.py is retired)
+  - REMOVED: :ALIASES_TICKER, :FOR_INSTRUMENT, :MENTIONS_INSTRUMENT edges
+  - REMOVED: CO_OCCURS_CHUNK / CO_OCCURS_ARTICLE edges (replaced by typed RELATED_TO)
+  - NEW: KnowledgeNode is the temporal entity snapshot — one per (entity, period)
+  - NEW: Knowledge nodes are atomic facts extracted per chunk per entity
+  - NEW: period_key indexed on Chunk, KnowledgeNode for fast R_time subgraph pull
+  - NEW: SAME_ENTITY_AS chain links the same entity across periods (temporal evolution)
 """
 
-import argparse
+from __future__ import annotations
+
 import gc
+import hashlib
 import json
 import os
-import csv
 import re
-from collections import defaultdict
-from itertools import combinations
+import uuid
+from datetime import datetime, timezone
 from pathlib import Path
-from urllib.parse import urlparse
-from datetime import timezone
+from typing import Any
 
+import torch
 from dotenv import load_dotenv
+from neo4j import GraphDatabase
+from sentence_transformers import SentenceTransformer
+
+from graph_schema import (
+    NEO4J_URI, NEO4J_USER, NEO4J_PASSWORD,
+    PERIOD_GRANULARITY,
+    period_key_for, knowledge_node_uid,
+    ensure_schema, wipe_tgrag_graph,
+    UPSERT_PERIOD, UPSERT_ARTICLE, UPSERT_CHUNK, UPSERT_CHUNK_EMBEDDING,
+    UPSERT_KNOWLEDGE_NODE, UPSERT_KNOWLEDGE_NODE_EMBEDDING,
+    UPSERT_KNOWLEDGE, UPSERT_KNOWLEDGE_EMBEDDING,
+    UPSERT_CHUNK_TO_KN_EDGE, UPSERT_RELATION, LINK_SAME_ENTITY,
+)
+
 load_dotenv()
 
-import tiktoken
-from dateutil import parser as dtparser
-from sentence_transformers import SentenceTransformer
-from langchain_text_splitters import RecursiveCharacterTextSplitter
-from neo4j import GraphDatabase
+# Config
 
-EMBED_MODEL_NAME = "BAAI/bge-m3"
-EXTRACTION_MODEL_NAME = "urchade/gliner_medium-v2.1"
-COOCCUR_DEFAULT_MODE = "chunk"
-NER_THRESHOLD = 0.35
-DATA_PATH = Path("cnbc_articles.json")
+ARTICLES_JSON = Path(os.getenv("ARTICLES_JSON", "cnbc_articles.json"))
+TICKER_MAP_PATH = Path(os.getenv("TICKER_MAP_PATH", "ticker_company_map.csv"))
 
-NEO4J_URI = os.getenv("NEO4J_URI", "bolt://localhost:7687")
-NEO4J_USER = os.getenv("NEO4J_USER", "neo4j")
-NEO4J_PASSWORD = os.getenv("NEO4J_PASSWORD", "password")
+# Chunking
+CHUNK_TOKEN_TARGET = int(os.getenv("CHUNK_TOKEN_TARGET", "400"))   # ~400 tokens per chunk
+CHUNK_OVERLAP_TOKENS = int(os.getenv("CHUNK_OVERLAP_TOKENS", "50"))
 
-enc = tiktoken.get_encoding("cl100k_base")
+# Embedding model — must match PERIOD_GRANULARITY vector index dim
+EMBED_MODEL_NAME = os.getenv("EMBED_MODEL_NAME", "dunzhang/stella_en_1.5B_v5")
+EMBED_BATCH_SIZE = int(os.getenv("EMBED_BATCH_SIZE", "32"))
+
+# NER / extraction model
+NER_MODEL_NAME = os.getenv("NER_MODEL_NAME", "dslim/bert-large-NER")
+
+# Minimum article quality gate
+MIN_ARTICLE_WORDS = int(os.getenv("MIN_ARTICLE_WORDS", "80"))
+
+# Neo4j write batch size
+NEO4J_BATCH_SIZE = int(os.getenv("NEO4J_BATCH_SIZE", "200"))
 
 
-def token_len(text: str) -> int:
-    return len(enc.encode(text))
+# Helpers
 
-
-def safe_parse_datetime(value: str):
-    if not value:
+def _parse_published(raw: str | None) -> datetime | None:
+    if not raw:
         return None
-    try:
-        dt = dtparser.parse(value)
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        return dt.astimezone(timezone.utc)
-    except Exception:
-        return None
-
-
-def canonicalize(name: str) -> str:
-    """Normalize an entity name (for dedup + exact mapping).
-
-    Rule: lowercase, trim, strip punctuation, collapse repeated spaces.
-    """
-    if name is None:
-        return ""
-    s = str(name).strip().lower()
-    # Strip punctuation but keep alphanumerics/underscore and spaces.
-    s = re.sub(r"[^\w\s]+", " ", s)
-    return re.sub(r"\s+", " ", s).strip()
-
-
-def load_ticker_company_map(csv_path: Path) -> dict[str, str]:
-    """Load ticker mapping for exact normalized company/alias -> ticker.
-
-    Expected CSV columns:
-      - ticker (e.g. NVDA)
-      - company_name (e.g. NVIDIA)
-      - aliases (optional; separated by ';' or ','; can be empty)
-    """
-    if not csv_path.is_file():
-        raise FileNotFoundError(f"Ticker map CSV not found: {csv_path.resolve()}")
-
-    lookup: dict[str, str] = {}
-    with csv_path.open("r", encoding="utf-8") as f:
-        reader = csv.DictReader(f)
-        required = {"ticker", "company_name"}
-        missing = required - set(reader.fieldnames or [])
-        if missing:
-            raise ValueError(
-                f"Ticker map CSV missing required columns: {sorted(missing)}. "
-                f"Found columns: {reader.fieldnames}"
-            )
-
-        for row in reader:
-            ticker = (row.get("ticker") or "").strip().upper()
-            company_name = (row.get("company_name") or "").strip()
-            aliases_raw = row.get("aliases") or ""
-
-            if not ticker or not company_name:
-                continue
-
-            keys: list[str] = [company_name]
-            # aliases can be separated by ';' or ','; normalize each token.
-            aliases_parts = re.split(r"\s*[;,]\s*", aliases_raw.strip())
-            keys.extend([p for p in aliases_parts if p])
-
-            for k in keys:
-                nk = canonicalize(k)
-                if not nk:
-                    continue
-                if nk in lookup and lookup[nk] != ticker:
-                    # Deterministic behavior: keep first, warn.
-                    # (Ambiguous mapping is worse than missing it for your exact-match approach.)
-                    print(f"[ticker-map] WARNING: {nk!r} maps to multiple tickers ({lookup[nk]} vs {ticker}); keeping {lookup[nk]}")
-                    continue
-                lookup[nk] = ticker
-
-    return lookup
-
-
-# NER extraction
-GLINER_LABELS = [
-    "person",
-    "organization",
-    "company",
-    "stock ticker",
-    "stock index",
-    "etf",
-    "commodity",
-    "currency",
-    "cryptocurrency",
-    "location",
-    "country",
-    "city",
-    "event",
-    "product",
-    "sector",
-    "industry",
-    "law",
-    "government agency",
-    "economic indicator",
-    "technology",
-    "concept",
-]
-
-def in_text(canonical: str, text: str) -> bool:
-    pattern = r'\b' + re.escape(canonical) + r'\b'
-    return bool(re.search(pattern, text))
-
-def _normalize_label(label: str) -> str:
-    label = (label or "").strip().lower()
-    return re.sub(r"[\s\-]+", "_", label)
-
-
-def _map_raw_label_to_type(raw_label: str) -> str:
-    lbl = _normalize_label(raw_label)
-
-    person_tokens = {
-        "person", "individual", "executive", "analyst", "investor",
-        "founder", "politician", "official",
-    }
-    org_tokens = {
-        "org", "organization", "company", "corporation", "bank",
-        "institution", "agency", "government_agency", "brand",
-    }
-    stock_tokens = {
-        "stock", "stock_ticker", "ticker", "symbol", "equity",
-        "index", "stock_index", "etf", "fund", "bond", "commodity",
-        "currency", "cryptocurrency", "crypto", "token",
-    }
-    event_tokens = {
-        "event", "earnings", "ipo", "merger", "acquisition",
-        "lawsuit", "conference", "meeting", "election", "launch",
-    }
-    product_tokens = {
-        "product", "device", "service", "platform",
-        "chip", "model", "software", "app", "vehicle",
-    }
-    location_tokens = {
-        "location", "loc", "city", "country", "region",
-        "state", "continent", "address",
-    }
-
-    if any(tok in lbl for tok in person_tokens):
-        return "PERSON"
-    if any(tok in lbl for tok in org_tokens):
-        return "ORG"
-    if any(tok in lbl for tok in stock_tokens):
-        return "STOCK"
-    if any(tok in lbl for tok in product_tokens):
-        return "PRODUCT"
-    if any(tok in lbl for tok in event_tokens):
-        return "EVENT"
-    if any(tok in lbl for tok in location_tokens):
-        return "LOCATION"
-    return "CONCEPT"
-
-
-def load_extraction_model():
-    try:
-        from gliner import GLiNER
-    except ImportError as exc:
-        raise RuntimeError(
-            "GLiNER is not installed. Install it with: pip install gliner"
-        ) from exc
-
-    print(f"Loading extraction model ({EXTRACTION_MODEL_NAME})...")
-    try:
-        return GLiNER.from_pretrained(EXTRACTION_MODEL_NAME, local_files_only=True)
-    except TypeError:
-        return GLiNER.from_pretrained(EXTRACTION_MODEL_NAME)
-    except Exception:
-        return GLiNER.from_pretrained(EXTRACTION_MODEL_NAME)
-
-
-def extract_entities(article_text: str, pipe) -> dict:
-    text = article_text[:8000]
-    try:
-        preds = pipe.predict_entities(
-            text, labels=GLINER_LABELS, threshold=NER_THRESHOLD
-        )
-    except TypeError:
+    for fmt in [
+        "%Y-%m-%dT%H:%M:%S%z",
+        "%Y-%m-%dT%H:%M:%SZ",
+        "%Y-%m-%dT%H:%M:%S",
+        "%a, %d %b %Y %H:%M:%S %z",
+        "%a, %d %b %Y %H:%M:%S GMT",
+        "%Y-%m-%d",
+    ]:
         try:
-            preds = pipe.predict_entities(text, GLINER_LABELS, NER_THRESHOLD)
-        except TypeError:
-            preds = pipe.predict_entities(text, GLINER_LABELS)
-
-    entities = []
-    for pred in preds:
-        if not isinstance(pred, dict):
+            return datetime.strptime(raw.strip(), fmt)
+        except ValueError:
             continue
-        name = (pred.get("text") or "").strip()
-        if not name:
-            continue
-        raw_label = str(pred.get("label") or "concept").strip()
-        ent_type = _map_raw_label_to_type(raw_label)
-        score = float(pred.get("score", 0.0) or 0.0)
-        entities.append(
-            {
-                "name": name,
-                "type": ent_type,
-                "raw_label": raw_label,
-                "score": score,
-            }
-        )
-
-    return {"entities": entities, "relationships": []}
+    return None
 
 
-MIN_CANONICAL_LEN = 4
-ALLOWED_REL_TYPES = {"ORG", "PERSON", "STOCK", "EVENT", "PRODUCT"}
-NOISE_PATTERN = re.compile(r'^\$?[\d,\.]+[bm]?$', re.IGNORECASE)
-ALLOWED_SEMANTIC_EDGE_TYPES = {
-    "ACQUIRED",
-    "PARTNERED_WITH",
-    "INVESTED_IN",
-    "LAUNCHED",
-    "SUPPLIED",
-    "REPORTED",
-    "COMPETES_WITH",
-}
-
-SEMANTIC_EXTRACTOR_NAME = "rule_based_relation_v1"
-SEMANTIC_MAX_GAP = 120
-
-DIRECTED_RELATION_PATTERNS = {
-    "ACQUIRED": [
-        r"(?:acquired|bought|purchased|to acquire|buying)",
-    ],
-    "INVESTED_IN": [
-        r"(?:invested in|backed|took a stake in|stake in)",
-    ],
-    "LAUNCHED": [
-        r"(?:launched|unveiled|introduced|released)",
-    ],
-    "SUPPLIED": [
-        r"(?:supplied|will supply|to supply|providing|provides)",
-    ],
-    "REPORTED": [
-        r"(?:reported|posted|announced)",
-    ],
-}
-
-UNDIRECTED_RELATION_PATTERNS = {
-    "PARTNERED_WITH": [
-        r"(?:partnered with|partnership with|teamed up with|collaborated with|joined forces with)",
-    ],
-    "COMPETES_WITH": [
-        r"(?:competes with|competing with|rival to|rivals|competition with)",
-    ],
-}
-
-def _in_text(canonical: str, text: str) -> bool:
-    return bool(re.search(r'\b' + re.escape(canonical) + r'\b', text))
+def _content_hash(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
 
 
-def _build_cooccurrence_relationships(
-    entities: list[dict],
-    chunk_texts: list[str],
-    mode: str,
+def _article_id(url: str, published: datetime | None) -> str:
+    """Stable ID: hash of URL + date (not time, to survive re-scrapes)."""
+    date_str = published.strftime("%Y-%m-%d") if published else "nodate"
+    raw = f"{url}::{date_str}"
+    return hashlib.md5(raw.encode()).hexdigest()
+
+
+# Loading
+
+def load_articles(json_path: Path = ARTICLES_JSON) -> list[dict]:
+    with open(json_path, encoding="utf-8") as f:
+        payload = json.load(f)
+    return payload.get("articles", [])
+
+
+def filter_articles(
+    articles: list[dict],
+    skip_ids: set[str],
+    min_words: int = MIN_ARTICLE_WORDS,
 ) -> list[dict]:
-    rel_type = "CO_OCCURS_ARTICLE" if mode == "article" else "CO_OCCURS_CHUNK"
+    """
+    Apply quality gates and skip already-ingested articles.
+    Returns enriched article dicts with: article_id, published_dt,
+    period_key, content_hash.
+    """
+    seen_hashes: set[str] = set()
+    out = []
 
-    canonicals = sorted({
-        e["canonical_name"]
-        for e in entities
-        if e.get("canonical_name")
-        and len(e["canonical_name"]) >= MIN_CANONICAL_LEN
-        and e.get("type") in ALLOWED_REL_TYPES
-        and not NOISE_PATTERN.match(e["canonical_name"])
-    })
-
-    if len(canonicals) < 2:
-        return []
-
-    pairs: set[tuple[str, str]] = set()
-    if mode == "article":
-        for src, tgt in combinations(canonicals, 2):
-            pairs.add((src, tgt))
-    else:
-        for text in chunk_texts:
-            chunk_norm = canonicalize(text)
-            mentioned = sorted([c for c in canonicals if _in_text(c, chunk_norm)])
-            if len(mentioned) < 2:
-                continue
-            for src, tgt in combinations(mentioned, 2):
-                pairs.add((src, tgt))
-
-    relationships = []
-    for src, tgt in sorted(pairs):
-        relationships.append(
-            {
-                "source": src,
-                "target": tgt,
-                "source_canonical": src,
-                "target_canonical": tgt,
-                "type": rel_type,
-            }
-        )
-    return relationships
-
-def _chunk_uid(chunk: dict) -> str:
-    return f"{chunk['article_id']}_chunk_{chunk['chunk_id']}"
-
-
-def _entity_is_semantic_candidate(ent: dict) -> bool:
-    cname = ent.get("canonical_name")
-    if not cname:
-        return False
-    if len(cname) < MIN_CANONICAL_LEN:
-        return False
-    if NOISE_PATTERN.match(cname):
-        return False
-    return ent.get("type") in {"ORG", "STOCK", "PRODUCT", "EVENT"}
-
-
-def _mentioned_entities_in_chunk(entities: list[dict], chunk_text: str) -> list[dict]:
-    chunk_norm = canonicalize(chunk_text)
-    mentioned = []
-    for ent in entities:
-        if not _entity_is_semantic_candidate(ent):
-            continue
-        cname = ent.get("canonical_name")
-        if cname and _in_text(cname, chunk_norm):
-            mentioned.append(ent)
-    return mentioned
-
-
-def _relation_match(text_norm: str, left: str, pattern: str, right: str) -> bool:
-    return bool(
-        re.search(
-            rf"\b{re.escape(left)}\b.{{0,{SEMANTIC_MAX_GAP}}}{pattern}.{{0,{SEMANTIC_MAX_GAP}}}\b{re.escape(right)}\b",
-            text_norm,
-        )
-    )
-
-
-def _extract_semantic_relationships(
-    article_chunks: list[dict],
-    entities: list[dict],
-) -> list[dict]:
-    relationships: list[dict] = []
-    seen: set[tuple[str, str, str, str]] = set()
-
-    for chunk in article_chunks:
-        chunk_text = chunk["text"]
-        chunk_norm = canonicalize(chunk_text)
-        chunk_uid = _chunk_uid(chunk)
-
-        mentioned_entities = _mentioned_entities_in_chunk(entities, chunk_text)
-        mentioned = sorted({e["canonical_name"] for e in mentioned_entities})
-
-        if len(mentioned) < 2:
+    for art in articles:
+        # Status gate
+        if art.get("status") not in ("ok", None):
             continue
 
-        # Directed relations
-        for src in mentioned:
-            for tgt in mentioned:
-                if src == tgt:
-                    continue
+        text = (art.get("text") or "").strip()
+        if not text:
+            continue
 
-                for rel_type, patterns in DIRECTED_RELATION_PATTERNS.items():
-                    for pattern in patterns:
-                        if _relation_match(chunk_norm, src, pattern, tgt):
-                            key = (rel_type, src, tgt, chunk_uid)
-                            if key in seen:
-                                continue
-                            seen.add(key)
-                            relationships.append(
-                                {
-                                    "source_canonical": src,
-                                    "target_canonical": tgt,
-                                    "type": rel_type,
-                                    "confidence": 0.90,
-                                    "source_chunk_uid": chunk_uid,
-                                    "extractor": SEMANTIC_EXTRACTOR_NAME,
-                                }
-                            )
+        # Minimum length gate
+        if len(text.split()) < min_words:
+            continue
 
-        # Undirected relations
-        for src, tgt in combinations(mentioned, 2):
-            for rel_type, patterns in UNDIRECTED_RELATION_PATTERNS.items():
-                matched = False
-                for pattern in patterns:
-                    if (
-                        _relation_match(chunk_norm, src, pattern, tgt)
-                        or _relation_match(chunk_norm, tgt, pattern, src)
-                    ):
-                        matched = True
-                        break
+        # Content-hash deduplication (catches same article at different URLs)
+        chash = _content_hash(text)
+        if chash in seen_hashes:
+            continue
+        seen_hashes.add(chash)
 
-                if matched:
-                    left, right = sorted([src, tgt])
-                    key = (rel_type, left, right, chunk_uid)
-                    if key in seen:
-                        continue
-                    seen.add(key)
-                    relationships.append(
-                        {
-                            "source_canonical": left,
-                            "target_canonical": right,
-                            "type": rel_type,
-                            "confidence": 0.85,
-                            "source_chunk_uid": chunk_uid,
-                            "extractor": SEMANTIC_EXTRACTOR_NAME,
-                        }
-                    )
+        published_dt = _parse_published(art.get("published"))
+        # Fall back to scrape time if no published date
+        if published_dt is None:
+            scraped = art.get("scraped_at") or art.get("scraped_at_utc")
+            published_dt = _parse_published(scraped)
+        if published_dt is None:
+            published_dt = datetime.now(timezone.utc)
 
-    return relationships
+        article_id = _article_id(art.get("url", ""), published_dt)
 
+        if article_id in skip_ids:
+            continue
 
-def extract_all_entities(
-    chunks: list[dict],
-    pipe,
-    cooccur_mode: str = COOCCUR_DEFAULT_MODE,
-    ticker_lookup: dict[str, str] | None = None,
-) -> dict[str, dict]:
-    """Group chunks by article, extract entities per article."""
-    cooccur_mode = (cooccur_mode or COOCCUR_DEFAULT_MODE).lower()
-    if cooccur_mode not in {"chunk", "article"}:
-        raise ValueError("cooccur_mode must be 'chunk' or 'article'")
+        period_key = period_key_for(published_dt, PERIOD_GRANULARITY)
 
-    article_chunks: dict[str, list[dict]] = defaultdict(list)
-    for c in chunks:
-        aid = c["article_id"]
-        article_chunks[aid].append(c)
+        out.append({
+            **art,
+            "article_id":   article_id,
+            "published_dt": published_dt,
+            "period_key":   period_key,
+            "content_hash": chash,
+            "text":         text,
+        })
 
-    entity_data: dict[str, dict] = {}
-    total = len(article_chunks)
-    print(f"Using co-occurrence mode: {cooccur_mode}")
+    return out
 
-    for idx, (aid, chunks_for_article) in enumerate(article_chunks.items(), 1):
-        print(f"  Extracting entities [{idx}/{total}] {aid[:60]}...")
-        texts = [c["text"] for c in chunks_for_article]
-        text = "\n".join(texts)
-        result = extract_entities(text, pipe)
-
-        deduped: dict[str, dict] = {}
-        for ent in result["entities"]:
-            cname = canonicalize(ent["name"])
-            if not cname:
-                continue
-            candidate = {
-                "name": ent["name"],
-                "type": ent.get("type", "CONCEPT"),
-                "raw_label": ent.get("raw_label", "concept"),
-                "canonical_name": cname,
-                "_score": float(ent.get("score", 0.0) or 0.0),
-            }
-            if ticker_lookup and cname in ticker_lookup:
-                candidate["mapped_ticker"] = ticker_lookup[cname]
-            prev = deduped.get(cname)
-            if prev is None or candidate["_score"] > prev["_score"]:
-                deduped[cname] = candidate
-
-        entities = []
-        for e in deduped.values():
-            e.pop("_score", None)
-            entities.append(e)
-
-        cooccurrence_relationships = _build_cooccurrence_relationships(
-            entities,
-            texts,
-            cooccur_mode,
-        )
-
-        semantic_relationships = _extract_semantic_relationships(
-            chunks_for_article,
-            entities,
-        )
-
-        entity_data[aid] = {
-            "entities": entities,
-            "relationships": cooccurrence_relationships + semantic_relationships,
-        }
-
-    ent_count = sum(len(d["entities"]) for d in entity_data.values())
-    rel_count = sum(len(d["relationships"]) for d in entity_data.values())
-    print(
-        f"Extracted {ent_count} entities and {rel_count} relationships "
-        f"from {total} articles"
-    )
-    return entity_data
-
-
-# Existing-article check 
 
 def get_existing_article_ids(driver) -> set[str]:
     with driver.session() as session:
-        rows = session.run(
-            "MATCH (a:Article) RETURN a.article_id AS aid"
-        ).data()
-    return {r["aid"] for r in rows}
+        result = session.run("MATCH (a:Article) RETURN a.article_id AS id")
+        return {r["id"] for r in result}
 
 
-# Load and chunk 
+# Chunking
 
-def load_and_chunk(skip_ids: set[str] | None = None) -> list[dict]:
-    splitter = RecursiveCharacterTextSplitter(
-        chunk_size=512,
-        chunk_overlap=50,
-        length_function=token_len,
-        separators=["\n\n", "\n", ". ", " ", ""],
+def _approx_tokens(text: str) -> int:
+    """Rough token count: ~0.75 words per token (good enough for chunking)."""
+    return int(len(text.split()) / 0.75)
+
+
+def chunk_text(
+    text: str,
+    target_tokens: int = CHUNK_TOKEN_TARGET,
+    overlap_tokens: int = CHUNK_OVERLAP_TOKENS,
+) -> list[str]:
+    """
+    Split text into overlapping chunks of approximately target_tokens each.
+    Splits on sentence boundaries where possible.
+    """
+    # Split into sentences (simple regex; replace with spaCy sentencizer if needed)
+    sentences = re.split(r'(?<=[.!?])\s+', text.strip())
+    chunks: list[str] = []
+    current: list[str] = []
+    current_tokens = 0
+
+    for sent in sentences:
+        sent_tokens = _approx_tokens(sent)
+
+        if current_tokens + sent_tokens > target_tokens and current:
+            chunks.append(" ".join(current))
+            # Overlap: keep last N tokens worth of sentences
+            overlap: list[str] = []
+            overlap_count = 0
+            for s in reversed(current):
+                t = _approx_tokens(s)
+                if overlap_count + t > overlap_tokens:
+                    break
+                overlap.insert(0, s)
+                overlap_count += t
+            current = overlap
+            current_tokens = overlap_count
+
+        current.append(sent)
+        current_tokens += sent_tokens
+
+    if current:
+        chunks.append(" ".join(current))
+
+    return [c for c in chunks if c.strip()]
+
+
+def build_chunks(articles: list[dict]) -> list[dict]:
+    """
+    For each article, produce a list of chunk dicts ready for Neo4j.
+    Each chunk carries article_id, period_key, published_date for denormalized
+    fast lookups (avoids traversal through Article during R_time filtering).
+    """
+    all_chunks = []
+    for art in articles:
+        text_blocks = chunk_text(art["text"])
+        for i, block in enumerate(text_blocks):
+            chunk_uid = f"{art['article_id']}::chunk::{i}"
+            all_chunks.append({
+                "chunk_uid":      chunk_uid,
+                "text":           block,
+                "chunk_index":    i,
+                "article_id":     art["article_id"],
+                "published_date": art["published_dt"].strftime("%Y-%m-%d"),
+                "period_key":     art["period_key"],
+                "token_count":    _approx_tokens(block),
+                # Populated later by embed_chunks()
+                "embedding":      None,
+            })
+    return all_chunks
+
+
+# Entity Extraction
+
+def load_extraction_model(model_name: str = NER_MODEL_NAME):
+    """Load a token-classification NER pipeline."""
+    from transformers import pipeline as hf_pipeline
+    device = 0 if torch.cuda.is_available() else -1
+    print(f"[NER] Loading {model_name} on {'GPU' if device == 0 else 'CPU'}")
+    return hf_pipeline(
+        "ner",
+        model=model_name,
+        aggregation_strategy="simple",
+        device=device,
     )
 
-    data = json.loads(DATA_PATH.read_text(encoding="utf-8"))
-    articles = data["articles"]
 
-    skip_ids = skip_ids or set()
-    chunks: list[dict] = []
-    skipped = 0
+def load_ticker_company_map(path: Path = TICKER_MAP_PATH) -> dict[str, str]:
+    """
+    Load ticker -> canonical company name map.
+    CSV must have columns: ticker, company_name
+    Returns {company_name_lower: ticker}
+    """
+    if not path.is_file():
+        return {}
+    import csv
+    mapping = {}
+    with open(path, newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            ticker = (row.get("ticker") or "").strip().upper()
+            name = (row.get("company_name") or "").strip()
+            if ticker and name:
+                mapping[name.lower()] = ticker
+    return mapping
 
-    for i, a in enumerate(articles):
-        text = (a.get("text") or "").strip()
-        if a.get("status") != "ok" or not text:
+
+def _canonicalize(name: str) -> str:
+    """Normalize entity name for KnowledgeNode identity."""
+    return re.sub(r'\s+', ' ', name.strip().lower())
+
+
+def _map_ticker(canonical: str, ticker_lookup: dict[str, str]) -> str | None:
+    """Exact then prefix match against ticker company map."""
+    direct = ticker_lookup.get(canonical)
+    if direct:
+        return direct
+    # Try longest prefix match
+    for company, ticker in ticker_lookup.items():
+        if canonical.startswith(company) or company.startswith(canonical):
+            return ticker
+    return None
+
+
+# Entity types we care about — filters NER output to relevant classes
+RELEVANT_ENTITY_TYPES = frozenset({
+    "ORG", "PER", "GPE", "LOC", "PRODUCT", "EVENT",
+    # BERT-NER uses B-/I- prefixes which aggregation_strategy handles,
+    # but some models emit bare type strings:
+    "B-ORG", "I-ORG", "B-PER", "I-PER",
+})
+
+
+def extract_entities_from_chunks(
+    chunks: list[dict],
+    pipe,
+    ticker_lookup: dict[str, str],
+) -> list[dict]:
+    """
+    Run NER over chunk texts. Returns a list of entity mention dicts:
+    {
+        chunk_uid, canonical_name, entity_type, raw_name,
+        ticker (or None), period_key
+    }
+
+    Deduplication: same canonical_name × chunk_uid → one mention.
+    """
+    texts = [c["text"] for c in chunks]
+    mentions = []
+    seen: set[tuple[str, str]] = set()  # (chunk_uid, canonical_name)
+
+    # Process in batches
+    batch_size = 16
+    for batch_start in range(0, len(chunks), batch_size):
+        batch_chunks = chunks[batch_start: batch_start + batch_size]
+        batch_texts = [c["text"] for c in batch_chunks]
+
+        try:
+            batch_results = pipe(batch_texts)
+        except Exception as e:
+            print(f"[NER] Batch {batch_start} failed: {e}")
+            batch_results = [[] for _ in batch_chunks]
+
+        for chunk, ner_result in zip(batch_chunks, batch_results):
+            for ent in ner_result:
+                etype = ent.get("entity_group") or ent.get("entity", "")
+                # Strip B-/I- prefixes if model didn't aggregate
+                etype = re.sub(r'^[BI]-', '', etype)
+                if etype not in RELEVANT_ENTITY_TYPES:
+                    continue
+
+                raw_name = ent.get("word", "").strip()
+                if not raw_name or len(raw_name) < 2:
+                    continue
+
+                canonical = _canonicalize(raw_name)
+                key = (chunk["chunk_uid"], canonical)
+                if key in seen:
+                    continue
+                seen.add(key)
+
+                mentions.append({
+                    "chunk_uid":      chunk["chunk_uid"],
+                    "canonical_name": canonical,
+                    "raw_name":       raw_name,
+                    "entity_type":    etype,
+                    "ticker":         _map_ticker(canonical, ticker_lookup),
+                    "period_key":     chunk["period_key"],
+                    "article_id":     chunk["article_id"],
+                })
+
+    return mentions
+
+
+def build_knowledge_nodes(
+    mentions: list[dict],
+) -> dict[str, dict]:
+    """
+    Aggregate mentions into KnowledgeNode specs.
+    One KnowledgeNode per (canonical_name × period_key).
+
+    Returns {kn_uid: kn_dict}
+    """
+    nodes: dict[str, dict] = {}
+    for m in mentions:
+        kn_uid = knowledge_node_uid(m["canonical_name"], m["period_key"])
+        if kn_uid not in nodes:
+            nodes[kn_uid] = {
+                "kn_uid":         kn_uid,
+                "canonical_name": m["canonical_name"],
+                "entity_type":    m["entity_type"],
+                "period_key":     m["period_key"],
+                "ticker":         m["ticker"],
+                # description is the aggregated knowledge text — built below
+                "description":    "",
+                "source_chunks":  [],  # chunk_uids that mention this entity in this period
+                "embedding":      None,
+            }
+        kn = nodes[kn_uid]
+        # Accumulate which chunks mention this KN (for SOURCED_FROM edges)
+        if m["chunk_uid"] not in kn["source_chunks"]:
+            kn["source_chunks"].append(m["chunk_uid"])
+        # First occurrence wins for entity_type if already set
+        if not kn["entity_type"] and m["entity_type"]:
+            kn["entity_type"] = m["entity_type"]
+
+    return nodes
+
+
+def build_knowledge_units(
+    chunks: list[dict],
+    mentions: list[dict],
+    knowledge_nodes: dict[str, dict],
+) -> list[dict]:
+    """
+    Extract atomic Knowledge units (k^{t_i}) from chunks for each entity
+    mentioned in that chunk.
+
+    Strategy: for each (chunk, entity) pair, produce one Knowledge unit
+    whose text is the chunk's most entity-relevant sentence(s).
+    This approximates T-GRAG's fine-grained knowledge granularity
+    without requiring a full LLM extraction pass.
+    """
+    chunk_by_uid = {c["chunk_uid"]: c for c in chunks}
+    knowledge_units: list[dict] = []
+    seen_k: set[str] = set()
+
+    for m in mentions:
+        chunk = chunk_by_uid.get(m["chunk_uid"])
+        if not chunk:
             continue
 
-        url_path = urlparse(a.get("url", "")).path.strip("/")
-        article_id = url_path.replace("/", "_") if url_path else f"article_{i}"
-
-        if article_id in skip_ids:
-            skipped += 1
+        kn_uid = knowledge_node_uid(m["canonical_name"], m["period_key"])
+        if kn_uid not in knowledge_nodes:
             continue
 
-        published_dt = safe_parse_datetime(a.get("published"))
+        # Extract the sentence(s) in the chunk that mention the entity
+        relevant_text = _extract_relevant_sentences(
+            chunk["text"], m["raw_name"], m["canonical_name"]
+        )
+        if not relevant_text:
+            relevant_text = chunk["text"][:500]  # fallback: first 500 chars
 
-        for chunk_id, chunk in enumerate(splitter.split_text(text)):
-            chunks.append(
-                {
-                    "article_id": article_id,
-                    "chunk_id": chunk_id,
-                    "text": chunk,
-                    "tokens": token_len(chunk),
-                    "url": a.get("url"),
-                    "title": a.get("title"),
-                    "published": a.get("published"),
-                    "source": a.get("source"),
-                    "published_ts": (
-                        int(published_dt.timestamp()) if published_dt else None
-                    ),
-                }
-            )
+        knowledge_uid = hashlib.md5(
+            f"{kn_uid}::{m['chunk_uid']}".encode()
+        ).hexdigest()[:16]
 
-    print(
-        f"Prepared {len(chunks)} new chunks "
-        f"({skipped} existing articles skipped)"
+        if knowledge_uid in seen_k:
+            continue
+        seen_k.add(knowledge_uid)
+
+        knowledge_units.append({
+            "knowledge_uid": knowledge_uid,
+            "text":          relevant_text,
+            "kn_uid":        kn_uid,
+            "chunk_uid":     m["chunk_uid"],
+            "period_key":    m["period_key"],
+            "fact_type":     m["entity_type"],
+            "embedding":     None,
+        })
+
+        # Also accumulate into KnowledgeNode description (for R_node coarse embedding)
+        kn = knowledge_nodes[kn_uid]
+        if relevant_text not in kn["description"]:
+            kn["description"] = (kn["description"] + " " + relevant_text).strip()
+
+    return knowledge_units
+
+
+def _extract_relevant_sentences(
+    text: str, raw_name: str, canonical_name: str
+) -> str:
+    """
+    Return sentences from text that mention the entity by name.
+    Matches case-insensitively on either the raw or canonical form.
+    """
+    sentences = re.split(r'(?<=[.!?])\s+', text)
+    patterns = [re.escape(raw_name), re.escape(canonical_name)]
+    pattern = re.compile("|".join(patterns), re.IGNORECASE)
+    matched = [s for s in sentences if pattern.search(s)]
+    return " ".join(matched[:3])  # cap at 3 sentences to keep knowledge atomic
+
+
+def build_relations(
+    mentions: list[dict],
+    knowledge_nodes: dict[str, dict],
+) -> list[dict]:
+    """
+    Build typed RELATED_TO edges between KnowledgeNodes co-occurring in the
+    same chunk.
+
+    Unlike the old CO_OCCURS_ARTICLE approach, edges are:
+    - Scoped to the same chunk (lower noise, ~chunk-local co-occurrence)
+    - Scoped to the same period_key (no cross-period edge pollution)
+    - typed as "CO_OCCURS" (extensible: LLM relation extraction can add
+      typed relations like "REPORTS_ON", "SUBSIDIARY_OF" later)
+    """
+    # Build chunk -> list of kn_uids index
+    chunk_to_kns: dict[str, list[str]] = {}
+    for m in mentions:
+        kn_uid = knowledge_node_uid(m["canonical_name"], m["period_key"])
+        if kn_uid not in knowledge_nodes:
+            continue
+        chunk_to_kns.setdefault(m["chunk_uid"], [])
+        if kn_uid not in chunk_to_kns[m["chunk_uid"]]:
+            chunk_to_kns[m["chunk_uid"]].append(kn_uid)
+
+    relations = []
+    seen_edges: set[tuple[str, str]] = set()
+
+    for chunk_uid, kn_uids in chunk_to_kns.items():
+        # Get period from first KN (all KNs from same chunk share same period)
+        period_key = knowledge_nodes[kn_uids[0]]["period_key"] if kn_uids else None
+        if not period_key:
+            continue
+
+        # Only build edges if <= 10 entities in chunk (>10 = low-signal dense article)
+        if len(kn_uids) > 10:
+            continue
+
+        for i, src in enumerate(kn_uids):
+            for tgt in kn_uids[i + 1:]:
+                # Canonical edge: always smaller uid -> larger uid
+                edge = (min(src, tgt), max(src, tgt))
+                if edge in seen_edges:
+                    continue
+                seen_edges.add(edge)
+                relations.append({
+                    "src_uid":    src,
+                    "tgt_uid":    tgt,
+                    "rel_type":   "CO_OCCURS",
+                    "period_key": period_key,
+                    "description": f"Co-occur in chunk {chunk_uid}",
+                })
+
+    return relations
+
+
+# Embedding
+
+_embed_model: SentenceTransformer | None = None
+
+
+def get_embed_model() -> SentenceTransformer:
+    global _embed_model
+    if _embed_model is None:
+        print(f"[embed] Loading {EMBED_MODEL_NAME}")
+        _embed_model = SentenceTransformer(EMBED_MODEL_NAME)
+    return _embed_model
+
+
+def embed_texts(texts: list[str], batch_size: int = EMBED_BATCH_SIZE) -> list[list[float]]:
+    model = get_embed_model()
+    embeddings = model.encode(
+        texts,
+        batch_size=batch_size,
+        show_progress_bar=True,
+        convert_to_numpy=True,
+        normalize_embeddings=True,   # cosine sim = dot product after normalization
     )
-    return chunks
+    return [e.tolist() for e in embeddings]
 
-
-# Embedding 
 
 def embed_chunks(chunks: list[dict]) -> list[dict]:
-    if not chunks:
-        print("No new chunks to embed")
-        return chunks
-
-    print("Loading embedding model...")
-    model = SentenceTransformer(EMBED_MODEL_NAME)
+    print(f"[embed] Embedding {len(chunks)} chunks ...")
     texts = [c["text"] for c in chunks]
-    vectors = model.encode(texts, normalize_embeddings=True)
-
-    for i, vec in enumerate(vectors):
-        chunks[i]["embedding"] = vec.tolist()
-
-    print("Embeddings ready")
+    embeddings = embed_texts(texts)
+    for c, emb in zip(chunks, embeddings):
+        c["embedding"] = emb
     return chunks
 
 
-# Populate Neo4j 
+def embed_knowledge_nodes(knowledge_nodes: dict[str, dict]) -> dict[str, dict]:
+    nodes = list(knowledge_nodes.values())
+    print(f"[embed] Embedding {len(nodes)} KnowledgeNodes ...")
+    # Embed on description (aggregated knowledge text)
+    texts = [
+        (n["description"] or n["canonical_name"])
+        for n in nodes
+    ]
+    embeddings = embed_texts(texts)
+    for node, emb in zip(nodes, embeddings):
+        node["embedding"] = emb
+    return knowledge_nodes
+
+
+def embed_knowledge_units(knowledge_units: list[dict]) -> list[dict]:
+    print(f"[embed] Embedding {len(knowledge_units)} Knowledge units ...")
+    texts = [k["text"] for k in knowledge_units]
+    embeddings = embed_texts(texts)
+    for k, emb in zip(knowledge_units, embeddings):
+        k["embedding"] = emb
+    return knowledge_units
+
+
+# Neo4j writing
+
+def _batched(lst: list, n: int):
+    for i in range(0, len(lst), n):
+        yield lst[i: i + n]
+
 
 def populate_neo4j(
+    articles: list[dict],
     chunks: list[dict],
+    knowledge_nodes: dict[str, dict],
+    knowledge_units: list[dict],
+    relations: list[dict],
+    mentions: list[dict],
     reset: bool = False,
-    entity_data: dict[str, dict] | None = None,
+    embedding_dim: int = 768,
 ) -> None:
-    print("Connecting to Neo4j...")
     driver = GraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASSWORD))
     driver.verify_connectivity()
 
     with driver.session() as session:
         if reset:
-            print("Resetting graph...")
-            session.run("MATCH (n) DETACH DELETE n")
+            print("[neo4j] Wiping existing graph ...")
+            wipe_tgrag_graph(session)
 
-        session.run(
-            """
-            CREATE CONSTRAINT article_id_unique IF NOT EXISTS
-            FOR (a:Article) REQUIRE a.article_id IS UNIQUE
-            """
-        )
-        session.run(
-            """
-            CREATE CONSTRAINT chunk_id_unique IF NOT EXISTS
-            FOR (c:Chunk) REQUIRE c.chunk_uid IS UNIQUE
-            """
-        )
-        session.run(
-            """
-            CREATE CONSTRAINT entity_canonical_unique IF NOT EXISTS
-            FOR (e:Entity) REQUIRE e.canonical_name IS UNIQUE
-            """
-        )
+        ensure_schema(session, embedding_dim=embedding_dim)
 
-        if not chunks:
-            print("No new chunks to load")
-            driver.close()
-            return
+        # Periods 
+        period_keys = sorted({a["period_key"] for a in articles})
+        print(f"[neo4j] Upserting {len(period_keys)} Period nodes ...")
+        for pk in period_keys:
+            session.run(UPSERT_PERIOD, {
+                "key":         pk,
+                "granularity": PERIOD_GRANULARITY,
+                "label":       pk,
+            })
 
-        new_article_ids = list({c["article_id"] for c in chunks})
+        # Articles 
+        print(f"[neo4j] Upserting {len(articles)} Article nodes ...")
+        for art in articles:
+            session.run(UPSERT_ARTICLE, {
+                "article_id":    art["article_id"],
+                "url":           art.get("url", ""),
+                "title":         art.get("title", ""),
+                "source":        art.get("source", ""),
+                "published_date": art["published_dt"].strftime("%Y-%m-%d"),
+                "scraped_at":    datetime.now(timezone.utc).isoformat(),
+                "period_key":    art["period_key"],
+                "content_hash":  art["content_hash"],
+            })
 
-        # Upsert chunks 
-        print(f"Upserting {len(chunks)} chunks from {len(new_article_ids)} new articles...")
-        for c in chunks:
-            chunk_uid = f"{c['article_id']}_chunk_{c['chunk_id']}"
-            session.run(
-                """
-                MERGE (a:Article {article_id: $article_id})
-                SET a.title     = $title,
-                    a.url       = $url,
-                    a.published = $published,
-                    a.source    = $source,
-                    a.published_ts = $published_ts
+        # Chunks 
+        print(f"[neo4j] Upserting {len(chunks)} Chunk nodes ...")
+        for batch in _batched(chunks, NEO4J_BATCH_SIZE):
+            for c in batch:
+                session.run(UPSERT_CHUNK, {
+                    "chunk_uid":      c["chunk_uid"],
+                    "text":           c["text"],
+                    "chunk_index":    c["chunk_index"],
+                    "article_id":     c["article_id"],
+                    "published_date": c["published_date"],
+                    "period_key":     c["period_key"],
+                    "token_count":    c["token_count"],
+                })
 
-                MERGE (ch:Chunk {chunk_uid: $chunk_uid})
-                SET ch.article_id   = $article_id,
-                    ch.chunk_id     = $chunk_id,
-                    ch.text         = $text,
-                    ch.tokens       = $tokens,
-                    ch.embedding    = $embedding,
-                    ch.source       = $source,
-                    ch.published_ts = $published_ts
+        print(f"[neo4j] Writing Chunk embeddings ...")
+        for batch in _batched(chunks, NEO4J_BATCH_SIZE):
+            for c in batch:
+                if c.get("embedding"):
+                    session.run(UPSERT_CHUNK_EMBEDDING, {
+                        "chunk_uid": c["chunk_uid"],
+                        "embedding": c["embedding"],
+                    })
 
-                MERGE (a)-[:HAS_CHUNK]->(ch)
-                """,
-                {
-                    "article_id": c["article_id"],
-                    "title": c["title"],
-                    "url": c["url"],
-                    "published": c["published"],
-                    "source": c["source"],
-                    "published_ts": c["published_ts"],
+        # KnowledgeNodes 
+        kn_list = list(knowledge_nodes.values())
+        print(f"[neo4j] Upserting {len(kn_list)} KnowledgeNode nodes ...")
+        for batch in _batched(kn_list, NEO4J_BATCH_SIZE):
+            for kn in batch:
+                session.run(UPSERT_KNOWLEDGE_NODE, {
+                    "kn_uid":         kn["kn_uid"],
+                    "canonical_name": kn["canonical_name"],
+                    "entity_type":    kn["entity_type"],
+                    "period_key":     kn["period_key"],
+                    "description":    kn["description"],
+                })
+
+        print(f"[neo4j] Writing KnowledgeNode embeddings ...")
+        for batch in _batched(kn_list, NEO4J_BATCH_SIZE):
+            for kn in batch:
+                if kn.get("embedding"):
+                    session.run(UPSERT_KNOWLEDGE_NODE_EMBEDDING, {
+                        "kn_uid":    kn["kn_uid"],
+                        "embedding": kn["embedding"],
+                    })
+
+        # Chunk -> KnowledgeNode edges (SOURCED_FROM) 
+        print(f"[neo4j] Writing Chunk->KnowledgeNode edges ...")
+        for kn in kn_list:
+            for chunk_uid in kn.get("source_chunks", []):
+                session.run(UPSERT_CHUNK_TO_KN_EDGE, {
                     "chunk_uid": chunk_uid,
-                    "chunk_id": c["chunk_id"],
-                    "text": c["text"],
-                    "tokens": c["tokens"],
-                    "embedding": c["embedding"],
-                },
-            )
+                    "kn_uid":    kn["kn_uid"],
+                })
 
-        # NEXT_CHUNK edges
-        print("Adding NEXT_CHUNK edges for new articles...")
-        session.run(
-            """
-            MATCH (c:Chunk)
-            WHERE c.article_id IN $new_ids
-            WITH c ORDER BY c.article_id, c.chunk_id
-            WITH c.article_id AS aid, collect(c) AS cs
-            UNWIND range(0, size(cs) - 2) AS i
-            WITH cs[i] AS c1, cs[i + 1] AS c2
-            MERGE (c1)-[:NEXT_CHUNK]->(c2)
-            """,
-            {"new_ids": new_article_ids},
-        )
+        # Knowledge units 
+        print(f"[neo4j] Upserting {len(knowledge_units)} Knowledge nodes ...")
+        for batch in _batched(knowledge_units, NEO4J_BATCH_SIZE):
+            for k in batch:
+                session.run(UPSERT_KNOWLEDGE, {
+                    "knowledge_uid": k["knowledge_uid"],
+                    "text":          k["text"],
+                    "kn_uid":        k["kn_uid"],
+                    "chunk_uid":     k["chunk_uid"],
+                    "period_key":    k["period_key"],
+                    "fact_type":     k["fact_type"],
+                })
 
-        # NEAR_IN_TIME edges
-        print("Adding NEAR_IN_TIME edges for new articles...")
-        session.run(
-            """
-            MATCH (a1:Article), (a2:Article)
-            WHERE a1.article_id IN $new_ids
-              AND a1.article_id <> a2.article_id
-              AND a1.published_ts IS NOT NULL
-              AND a2.published_ts IS NOT NULL
-              AND abs(a1.published_ts - a2.published_ts) <= 86400
-            MERGE (a1)-[:NEAR_IN_TIME]->(a2)
-            """,
-            {"new_ids": new_article_ids},
-        )
+        print(f"[neo4j] Writing Knowledge embeddings ...")
+        for batch in _batched(knowledge_units, NEO4J_BATCH_SIZE):
+            for k in batch:
+                if k.get("embedding"):
+                    session.run(UPSERT_KNOWLEDGE_EMBEDDING, {
+                        "knowledge_uid": k["knowledge_uid"],
+                        "embedding":     k["embedding"],
+                    })
 
-        if entity_data:
-            print("Creating Entity nodes, MENTIONS edges, co-occurrence edges, and semantic edges...")
-            for aid in new_article_ids:
-                art_ents = entity_data.get(aid)
-                if not art_ents:
-                    continue
+        # Relations 
+        print(f"[neo4j] Upserting {len(relations)} RELATED_TO edges ...")
+        for batch in _batched(relations, NEO4J_BATCH_SIZE):
+            for r in batch:
+                session.run(UPSERT_RELATION, {
+                    "src_uid":     r["src_uid"],
+                    "tgt_uid":     r["tgt_uid"],
+                    "rel_type":    r["rel_type"],
+                    "period_key":  r["period_key"],
+                    "description": r["description"],
+                    
+                })
 
-                for ent in art_ents.get("entities", []):
-                    session.run(
-                        """
-                        MERGE (e:Entity {canonical_name: $canonical_name})
-                        ON CREATE SET e.name = $name,
-                                      e.type = $type,
-                                      e.raw_label = $raw_label,
-                                      e.mapped_ticker = $mapped_ticker
-                        ON MATCH SET e.name = $name,
-                                     e.type = $type,
-                                     e.mapped_ticker = CASE WHEN $mapped_ticker IS NULL THEN e.mapped_ticker ELSE $mapped_ticker END
-                        """,
-                        {
-                            "canonical_name": ent["canonical_name"],
-                            "name": ent["name"],
-                            "type": ent.get("type", "CONCEPT"),
-                            "raw_label": ent.get("raw_label", "concept"),
-                            "mapped_ticker": ent.get("mapped_ticker"),
-                        },
-                    )
-
-                article_chunks = [c for c in chunks if c["article_id"] == aid]
-                for c in article_chunks:
-                    chunk_uid = f"{c['article_id']}_chunk_{c['chunk_id']}"
-                    chunk_norm = canonicalize(c["text"])
-                    for ent in art_ents.get("entities", []):
-                        cname = ent["canonical_name"]
-                        if cname and _in_text(cname, chunk_norm):
-                            session.run(
-                                """
-                                MATCH (ch:Chunk {chunk_uid: $chunk_uid})
-                                MATCH (e:Entity {canonical_name: $cname})
-                                MERGE (ch)-[:MENTIONS]->(e)
-                                """,
-                                {
-                                    "chunk_uid": chunk_uid,
-                                    "cname": ent["canonical_name"],
-                                },
-                            )
-
-                for rel in art_ents.get("relationships", []):
-                    rel_type = rel.get("type")
-                    src = rel.get("source_canonical")
-                    tgt = rel.get("target_canonical")
-
-                    if not src or not tgt or src == tgt:
-                        continue
-
-                    if rel_type == "CO_OCCURS_CHUNK":
-                        src_c, tgt_c = sorted([src, tgt])
-                        session.run(
-                            """
-                            MATCH (e1:Entity {canonical_name: $src})
-                            MATCH (e2:Entity {canonical_name: $tgt})
-                            MERGE (e1)-[r:CO_OCCURS_CHUNK]-(e2)
-                            ON CREATE SET r.weight = 1
-                            ON MATCH SET r.weight = r.weight + 1
-                            """,
-                            {
-                                "src": src_c,
-                                "tgt": tgt_c,
-                            },
-                        )
-
-                    elif rel_type == "CO_OCCURS_ARTICLE":
-                        src_c, tgt_c = sorted([src, tgt])
-                        session.run(
-                            """
-                            MATCH (e1:Entity {canonical_name: $src})
-                            MATCH (e2:Entity {canonical_name: $tgt})
-                            MERGE (e1)-[r:CO_OCCURS_ARTICLE]-(e2)
-                            ON CREATE SET r.weight = 1
-                            ON MATCH SET r.weight = r.weight + 1
-                            """,
-                            {
-                                "src": src_c,
-                                "tgt": tgt_c,
-                            },
-                        )
-
-                    elif rel_type in ALLOWED_SEMANTIC_EDGE_TYPES:
-                        cypher = f"""
-                        MATCH (e1:Entity {{canonical_name: $src}})
-                        MATCH (e2:Entity {{canonical_name: $tgt}})
-                        MERGE (e1)-[r:{rel_type}]->(e2)
-                        ON CREATE SET
-                            r.confidence = $confidence,
-                            r.source_chunk_uid = $source_chunk_uid,
-                            r.extractor = $extractor
-                        ON MATCH SET
-                            r.confidence = CASE
-                                WHEN $confidence > coalesce(r.confidence, 0.0) THEN $confidence
-                                ELSE r.confidence
-                            END,
-                            r.source_chunk_uid = CASE
-                                WHEN $confidence > coalesce(r.confidence, 0.0) THEN $source_chunk_uid
-                                ELSE r.source_chunk_uid
-                            END,
-                            r.extractor = CASE
-                                WHEN $confidence > coalesce(r.confidence, 0.0) THEN $extractor
-                                ELSE r.extractor
-                            END
-                        """
-                        session.run(
-                            cypher,
-                            {
-                                "src": src,
-                                "tgt": tgt,
-                                "confidence": float(rel.get("confidence", 0.0) or 0.0),
-                                "source_chunk_uid": rel.get("source_chunk_uid"),
-                                "extractor": rel.get("extractor", SEMANTIC_EXTRACTOR_NAME),
-                            },
-                        )
-            ent_nodes = session.run(
-                "MATCH (e:Entity) RETURN count(e) AS cnt"
-            ).single()["cnt"]
-            print(f"Graph now has {ent_nodes} Entity nodes")
+        # SAME_ENTITY_AS cross-period chains 
+        print("[neo4j] Linking SAME_ENTITY_AS chains across periods ...")
+        result = session.run(LINK_SAME_ENTITY).single()
+        linked = result["linked"] if result else 0
+        print(f"  Linked {linked} cross-period entity pairs")
 
     driver.close()
-    print("Neo4j temporal graph updated successfully")
+    print("[neo4j] Write complete.")
 
 
-def main():
-    parser = argparse.ArgumentParser(description="TG-RAG setup")
-    parser.add_argument(
-        "--reset",
-        action="store_true",
-        help="Wipe the entire graph and rebuild from scratch",
-    )
-    parser.add_argument(
-        "--skip-entities",
-        action="store_true",
-        help="Skip NER-based entity extraction (faster setup)",
-    )
-    parser.add_argument(
-        "--cooccur-mode",
-        choices=["chunk", "article"],
-        default=COOCCUR_DEFAULT_MODE,
-        help=(
-            "How to build co-occurrence edges: "
-            "'chunk' -> :CO_OCCURS_CHUNK (default, lower noise) or "
-            "'article' -> :CO_OCCURS_ARTICLE (denser recall)"
-        ),
-    )
-    parser.add_argument(
-        "--ticker-map",
-        type=Path,
-        default=Path("ticker_company_map.csv"),
-        help="CSV mapping of company_name/aliases to stock ticker (exact match).",
-    )
-    args = parser.parse_args()
+# ---------------------------------------------------------------------------
+# Top-level orchestration
+# ---------------------------------------------------------------------------
 
-    skip_ids: set[str] = set()
-    if not args.reset:
-        print("Checking existing articles in Neo4j...")
-        driver = GraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASSWORD))
-        driver.verify_connectivity()
-        skip_ids = get_existing_article_ids(driver)
-        driver.close()
-        print(f"Found {len(skip_ids)} articles already in graph")
+def run_setup(
+    reset: bool = False,
+    skip_entities: bool = False,
+) -> None:
+    """
+    Full T-GRAG setup pipeline. Called by update.py.
+    """
+    # 1. Load and filter articles
+    print("[setup] Loading articles ...")
+    raw_articles = load_articles()
 
-    chunks = load_and_chunk(skip_ids=skip_ids)
+    driver = GraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASSWORD))
+    driver.verify_connectivity()
+    skip_ids: set[str] = set() if reset else get_existing_article_ids(driver)
+    driver.close()
 
-    # NER extraction (freed before embedding)
-    entity_data = None
-    if not args.skip_entities and chunks:
+    articles = filter_articles(raw_articles, skip_ids)
+    print(f"[setup] {len(articles)} new articles after filtering (skipped {len(skip_ids)} existing)")
+
+    if not articles:
+        print("[setup] No new articles to process. Done.")
+        return
+
+    # 2. Chunk
+    print("[setup] Chunking articles ...")
+    chunks = build_chunks(articles)
+    print(f"[setup] Produced {len(chunks)} chunks")
+
+    # 3. Entity extraction
+    knowledge_nodes: dict[str, dict] = {}
+    knowledge_units: list[dict] = []
+    relations: list[dict] = []
+    mentions: list[dict] = []
+
+    if not skip_entities:
         pipe = load_extraction_model()
+        ticker_lookup = load_ticker_company_map()
 
-        # Deterministic exact mapping (no fuzzy matching) from company/alias -> ticker.
-        # If the file is missing, we fail loudly to avoid building an unlinked graph.
-        ticker_lookup = load_ticker_company_map(args.ticker_map)
+        print("[setup] Extracting entities ...")
+        mentions = extract_entities_from_chunks(chunks, pipe, ticker_lookup)
+        print(f"[setup] {len(mentions)} entity mentions extracted")
 
-        entity_data = extract_all_entities(
-            chunks,
-            pipe,
-            cooccur_mode=args.cooccur_mode,
-            ticker_lookup=ticker_lookup,
-        )
+        knowledge_nodes = build_knowledge_nodes(mentions)
+        print(f"[setup] {len(knowledge_nodes)} KnowledgeNodes (entity × period)")
+
+        knowledge_units = build_knowledge_units(chunks, mentions, knowledge_nodes)
+        print(f"[setup] {len(knowledge_units)} Knowledge units")
+
+        relations = build_relations(mentions, knowledge_nodes)
+        print(f"[setup] {len(relations)} RELATED_TO edges")
+
         del pipe
         gc.collect()
-        try:
-            import torch
+        if torch.cuda.is_available():
             torch.cuda.empty_cache()
-        except Exception:
-            pass
 
+    # 4. Embed
     chunks = embed_chunks(chunks)
-    populate_neo4j(chunks, reset=args.reset, entity_data=entity_data)
-    print("\nSetup complete. You can now run:  python chatter.py")
+    if knowledge_nodes:
+        knowledge_nodes = embed_knowledge_nodes(knowledge_nodes)
+    if knowledge_units:
+        knowledge_units = embed_knowledge_units(knowledge_units)
 
+    # Infer embedding dim from first chunk
+    embedding_dim = len(chunks[0]["embedding"]) if chunks and chunks[0].get("embedding") else 768
 
-if __name__ == "__main__":
-    main()
+    # 5. Write to Neo4j
+    populate_neo4j(
+        articles=articles,
+        chunks=chunks,
+        knowledge_nodes=knowledge_nodes,
+        knowledge_units=knowledge_units,
+        relations=relations,
+        mentions=mentions,
+        reset=reset,
+        embedding_dim=embedding_dim,
+    )
+
+    print("[setup] Pipeline complete.")
