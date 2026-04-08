@@ -284,6 +284,7 @@ UPSERT_KNOWLEDGE_NODE = """
 MERGE (kn:KnowledgeNode {kn_uid: $kn_uid})
 ON CREATE SET
     kn.canonical_name = $canonical_name,
+    kn.display_name   = $display_name,
     kn.entity_type    = $entity_type,
     kn.period_key     = $period_key,
     kn.description    = $description

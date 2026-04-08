@@ -1,25 +1,41 @@
 """
-Temporal-Graph RAG Chatbot
+chatter.py — T-GRAG Chatbot (schema-aligned rewrite)
 
-Connects to an already-populated Neo4j graph (built by tgrag_setup.py)
-and runs interactive retrieval + generation in a terminal loop.
+Retrieval layers follow the actual Neo4j graph built by tgrag_setup.py:
 
-Features:
-  - Temporal Query Decomposition (TQD): splits multi-temporal queries
-  - Three-layer retrieval: temporal filter -> entity match -> semantic ranking
-  - Sub-answer aggregation for comparative / multi-period questions
-  - Default 7-day look-back for market data when no time window is given
+  Nodes : Article, Chunk, KnowledgeNode, Knowledge, Period
+  Edges : HAS_CHUNK, IN_PERIOD, SOURCED_FROM, HAS_KNOWLEDGE,
+          SOURCED_FROM_CHUNK, RELATED_TO, SAME_ENTITY_AS
+
+Three-layer retrieval (per sub-query):
+  1. R_time      — filter Chunks by period_key derived from temporal expression
+  2. R_node      — find KnowledgeNodes matching the resolved entity (by canonical_name),
+                   then walk SOURCED_FROM back to Chunks
+  3. R_knowledge — vector search over Knowledge embeddings, back-link to Chunks via
+                   SOURCED_FROM_CHUNK, re-rank with recency decay
+
+Entity resolution:
+  - Ticker queries  → canonical_name IS the ticker (e.g. "AAPL")
+  - Company aliases → resolved via alias_to_ticker map, canonical = ticker
+  - Person / country → canonical_name is normalized string
+  All three cases are stored as KnowledgeNode.canonical_name in the DB.
 
 Usage:
     python chatter.py
 """
 
+from __future__ import annotations
+
 import json
+import importlib
 import os
 import re
 import time
 import warnings
+from dataclasses import dataclass, field
 from datetime import datetime, timezone, timedelta
+from pathlib import Path
+from typing import Any, Optional
 
 from dotenv import load_dotenv
 load_dotenv()
@@ -29,22 +45,31 @@ warnings.filterwarnings("ignore", category=FutureWarning)
 
 import dateparser
 import numpy as np
-from sentence_transformers import SentenceTransformer
 from neo4j import GraphDatabase
-from transformers import pipeline
-from dataclasses import dataclass
-from typing import Optional
+from sentence_transformers import SentenceTransformer
 
-from tgrag_setup import EMBED_MODEL_NAME, NEO4J_URI, NEO4J_USER, NEO4J_PASSWORD, load_ticker_company_map, canonicalize
-from pathlib import Path
-ticker_lookup = load_ticker_company_map(Path("ticker_company_map.csv"))
-GEN_MODEL_NAME = "Qwen/Qwen3-0.6B"
+from graph_schema import (
+    NEO4J_URI, NEO4J_USER, NEO4J_PASSWORD,
+    PERIOD_GRANULARITY, period_key_for,
+)
+from tgrag_setup import (
+    EMBED_MODEL_NAME,
+    _canonicalize,
+    load_ticker_company_map,
+)
 
-# Default look-back window for market bars when the user gives no time filter.
-# Set to None to disable the default and always use unbounded queries.
-DEFAULT_MARKET_LOOKBACK_DAYS: int | None = 7
+# ---------------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------------
 
-MIN_STRICT_CHUNKS_BEFORE_EXPANSION = 3
+GEN_MODEL_NAME = os.getenv("GEN_MODEL_NAME")
+ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
+TICKER_MAP_PATH = Path(os.getenv("TICKER_MAP_PATH", "ticker_company_map.csv"))
+
+TOP_K = int(os.getenv("TOP_K", "4"))
+EXPANDED_K = int(os.getenv("EXPANDED_K", "8"))
+RECENCY_HALF_LIFE_DAYS = float(os.getenv("RECENCY_HALF_LIFE_DAYS", "5"))
+GEN_MAX_TOKENS = int(os.getenv("GEN_MAX_TOKENS", "1024"))
 
 SOURCE_KEYWORDS = {
     "bbc": "BBC",
@@ -52,25 +77,16 @@ SOURCE_KEYWORDS = {
     "cnbc": "CNBC",
     "marketwatch": "MarketWatch",
     "nasdaq": "Nasdaq",
-    "stockbiz": "Stockbiz",
-    "marketbeat": "MarketBeat",
     "cbs": "CBS MoneyWatch",
 }
 
+# ---------------------------------------------------------------------------
+# Utilities
+# ---------------------------------------------------------------------------
 
 def cosine_sim(a: np.ndarray, b: np.ndarray) -> float:
     denom = np.linalg.norm(a) * np.linalg.norm(b)
-    if denom == 0:
-        return 0.0
-    return float(np.dot(a, b) / denom)
-
-
-def extract_source_filter(query: str) -> str | None:
-    q = query.lower()
-    for keyword, label in SOURCE_KEYWORDS.items():
-        if keyword in q:
-            return label
-    return None
+    return float(np.dot(a, b) / denom) if denom else 0.0
 
 
 def strip_think_tags(text: str) -> str:
@@ -79,30 +95,41 @@ def strip_think_tags(text: str) -> str:
     return text.strip()
 
 
+def anthropic_text(response) -> str:
+    parts = []
+    for block in getattr(response, "content", []) or []:
+        text = getattr(block, "text", None)
+        if text:
+            parts.append(text)
+    return "".join(parts).strip()
+
+
+def extract_source_filter(query: str) -> str | None:
+    q = query.lower()
+    for kw, label in SOURCE_KEYWORDS.items():
+        if kw in q:
+            return label
+    return None
+
+
+# ---------------------------------------------------------------------------
 # Temporal Query Decomposition
+# ---------------------------------------------------------------------------
 
 TIME_WORDS = re.compile(
     r"\b(yesterday|last\s+week|this\s+week|last\s+month|this\s+month|"
-    r"today|ago|before\s+\w+day|after\s+\w+day|since|until|between|"
+    r"today|ago|since|until|between|"
     r"(?:january|february|march|april|may|june|july|august|"
     r"september|october|november|december)\s+\d{1,2}(?:st|nd|rd|th)?(?:,)?\s+\d{4}|"
     r"(?:january|february|march|april|may|june|july|august|"
     r"september|october|november|december)\s+\d{4}|"
-    r"\d{4}[-/]\d{2}[-/]\d{2}|"
-    r"\d{1,2}[-/]\d{1,2}[-/]\d{2,4}|"
+    r"\d{4}[-/]\d{2}[-/]\d{2}|\d{1,2}[-/]\d{1,2}[-/]\d{2,4}|"
     r"\d{4}[-/]\d{2}|\d{1,2}/\d{1,2})\b",
     re.IGNORECASE,
 )
 
-MULTI_TIME_WORDS = re.compile(
-    r"\b(compare|vs\.?|versus|differ)",
-    re.IGNORECASE,
-)
-
-FROM_TO_PATTERN = re.compile(
-    r"from\s+(.+?)\s+to\s+(.+?)[\?\.\!,]?\s*$",
-    re.IGNORECASE,
-)
+MULTI_TIME_WORDS = re.compile(r"\b(compare|vs\.?|versus|differ)\b", re.IGNORECASE)
+FROM_TO_PATTERN = re.compile(r"from\s+(.+?)\s+to\s+(.+?)[\?\.\!,]?\s*$", re.IGNORECASE)
 
 DECOMPOSE_PROMPT = """\
 Analyze this question and decompose it into separate sub-queries for each time period.
@@ -118,27 +145,7 @@ Output ONLY valid JSON (no markdown):
 Question: {query}"""
 
 
-def resolve_date(date_str: str | None) -> int | None:
-    """Convert a date string to unix timestamp via dateparser."""
-    if not date_str or date_str.lower() == "null":
-        return None
-    dt = dateparser.parse(
-        date_str, settings={"RETURN_AS_TIMEZONE_AWARE": True}
-    )
-    if dt:
-        return int(dt.timestamp())
-    return None
-
-
-def ts_to_datestr(ts: int | None) -> str | None:
-    """Convert unix timestamp seconds to YYYY-MM-DD (UTC)."""
-    if ts is None:
-        return None
-    return datetime.fromtimestamp(ts, tz=timezone.utc).date().isoformat()
-
-
 def _resolve_time_phrase(phrase: str) -> tuple[str | None, str | None]:
-    """Resolve a single time phrase to (start_date, end_date) strings."""
     now = datetime.now(timezone.utc)
     p = phrase.strip().lower()
 
@@ -149,15 +156,10 @@ def _resolve_time_phrase(phrase: str) -> tuple[str | None, str | None]:
     if "last week" in p:
         s = dateparser.parse("7 days ago", settings={"RETURN_AS_TIMEZONE_AWARE": True})
         e = dateparser.parse("1 day ago", settings={"RETURN_AS_TIMEZONE_AWARE": True})
-        return (
-            s.strftime("%Y-%m-%d") if s else None,
-            e.strftime("%Y-%m-%d") if e else None,
-        )
+        return (s.strftime("%Y-%m-%d") if s else None, e.strftime("%Y-%m-%d") if e else None)
     if "this week" in p:
         days_back = now.weekday()
-        s = dateparser.parse(
-            f"{days_back} days ago", settings={"RETURN_AS_TIMEZONE_AWARE": True}
-        )
+        s = dateparser.parse(f"{days_back} days ago", settings={"RETURN_AS_TIMEZONE_AWARE": True})
         return s.strftime("%Y-%m-%d") if s else None, now.strftime("%Y-%m-%d")
     if "last month" in p:
         s = dateparser.parse("1 month ago", settings={"RETURN_AS_TIMEZONE_AWARE": True})
@@ -176,1114 +178,779 @@ def _resolve_time_phrase(phrase: str) -> tuple[str | None, str | None]:
 
 
 def _extract_single_time_range(query: str) -> dict:
-    """Use dateparser directly to resolve time expressions without LLM."""
-    time_matches = TIME_WORDS.findall(query)
-    if not time_matches:
+    matches = TIME_WORDS.findall(query)
+    if not matches:
         return {"query": query, "time_start": None, "time_end": None}
-
-    def _match_score(m: str) -> tuple[int, int]:
-        year_bonus = 1 if re.search(r"\d{4}", m) else 0
-        return (year_bonus, len(m))
-
-    best = max(time_matches, key=_match_score)
+    best = max(matches, key=lambda m: (1 if re.search(r"\d{4}", m) else 0, len(m)))
     start, end = _resolve_time_phrase(best)
     return {"query": query, "time_start": start, "time_end": end}
 
 
-def decompose_query(query: str, pipe) -> list[dict]:
-    """Resolve temporal references. Uses regex whenever possible, LLM only as last resort."""
-    has_time = TIME_WORDS.search(query)
-
-    if not has_time:
+def decompose_query(query: str, gen_client: Any) -> list[dict]:
+    if not TIME_WORDS.search(query):
         return [{"query": query, "time_start": None, "time_end": None}]
 
-    # Handle "from X to Y" pattern with regex (no LLM needed)
     ft = FROM_TO_PATTERN.search(query)
     if ft:
-        period_a, period_b = ft.group(1).strip(), ft.group(2).strip()
-        a_start, a_end = _resolve_time_phrase(period_a)
-        b_start, b_end = _resolve_time_phrase(period_b)
+        a_start, a_end = _resolve_time_phrase(ft.group(1).strip())
+        b_start, b_end = _resolve_time_phrase(ft.group(2).strip())
         if a_start or b_start:
             return [
                 {"query": query, "time_start": a_start, "time_end": a_end},
                 {"query": query, "time_start": b_start, "time_end": b_end},
             ]
 
-    # Common multi-period phrasing without requiring "vs/compare".
-    if re.search(r"\blast\s+week\b", query, flags=re.IGNORECASE) and re.search(
-        r"\bthis\s+week\b", query, flags=re.IGNORECASE
-    ):
-        last_start, last_end = _resolve_time_phrase("last week")
-        this_start, this_end = _resolve_time_phrase("this week")
-        if last_start or this_start:
+    if re.search(r"\blast\s+week\b", query, re.IGNORECASE) and \
+       re.search(r"\bthis\s+week\b", query, re.IGNORECASE):
+        ls, le = _resolve_time_phrase("last week")
+        ts, te = _resolve_time_phrase("this week")
+        if ls or ts:
             return [
-                {"query": query, "time_start": last_start, "time_end": last_end},
-                {"query": query, "time_start": this_start, "time_end": this_end},
-            ]
-    if re.search(r"\blast\s+month\b", query, flags=re.IGNORECASE) and re.search(
-        r"\bthis\s+month\b", query, flags=re.IGNORECASE
-    ):
-        last_start, last_end = _resolve_time_phrase("last month")
-        this_start, this_end = _resolve_time_phrase("this month")
-        if last_start or this_start:
-            return [
-                {"query": query, "time_start": last_start, "time_end": last_end},
-                {"query": query, "time_start": this_start, "time_end": this_end},
+                {"query": query, "time_start": ls, "time_end": le},
+                {"query": query, "time_start": ts, "time_end": te},
             ]
 
-    has_multi = MULTI_TIME_WORDS.search(query)
-    if not has_multi:
+    if re.search(r"\blast\s+month\b", query, re.IGNORECASE) and \
+       re.search(r"\bthis\s+month\b", query, re.IGNORECASE):
+        ls, le = _resolve_time_phrase("last month")
+        ts, te = _resolve_time_phrase("this month")
+        if ls or ts:
+            return [
+                {"query": query, "time_start": ls, "time_end": le},
+                {"query": query, "time_start": ts, "time_end": te},
+            ]
+
+    if not MULTI_TIME_WORDS.search(query):
         return [_extract_single_time_range(query)]
 
-    # True multi-period query (compare/vs) -- use LLM to decompose
+    # True multi-period — fall back to LLM decomposition
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     prompt = DECOMPOSE_PROMPT.format(today=today, query=query)
-    messages = [{"role": "user", "content": prompt}]
-    out = pipe(messages, max_new_tokens=1024, do_sample=False)
-    raw = out[0]["generated_text"][-1]["content"]
-    raw = strip_think_tags(raw)
-
+    out = gen_client.messages.create(
+        model=GEN_MODEL_NAME,
+        max_tokens=GEN_MAX_TOKENS,
+        temperature=0,
+        messages=[{"role": "user", "content": prompt}],
+    )
+    raw = strip_think_tags(anthropic_text(out))
     match = re.search(r"\{.*\}", raw, flags=re.DOTALL)
     if match:
         try:
             data = json.loads(match.group())
-            sub_queries = data.get("sub_queries", [])
-            if isinstance(sub_queries, list):
-                valid = []
-                for sq in sub_queries:
-                    if isinstance(sq, dict) and "query" in sq:
-                        valid.append({
-                            "query": sq["query"],
-                            "time_start": sq.get("time_start"),
-                            "time_end": sq.get("time_end"),
-                        })
-                if valid:
-                    return valid
+            valid = [
+                {"query": sq["query"], "time_start": sq.get("time_start"), "time_end": sq.get("time_end")}
+                for sq in data.get("sub_queries", [])
+                if isinstance(sq, dict) and "query" in sq
+            ]
+            if valid:
+                return valid
         except (json.JSONDecodeError, TypeError):
             pass
 
     return [_extract_single_time_range(query)]
 
 
-# Three-Layer Retrieval
-
-def _fmt_num(x) -> str:
-    if x is None:
-        return "NA"
+def _date_to_period_keys(date_str: str | None) -> list[str]:
+    """Convert a date string to one or more period keys for graph filtering."""
+    if not date_str:
+        return []
     try:
-        return f"{float(x):.2f}"
-    except Exception:
-        return str(x)
+        dt = datetime.strptime(date_str, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+        return [period_key_for(dt, PERIOD_GRANULARITY)]
+    except ValueError:
+        return []
 
 
-def _fetch_market_bars(
-    session,
-    ticker: str,
-    dstart: str | None,
-    dend: str | None,
-    limit: int = 7,
-) -> list[dict]:
-    """
-    Fetch OHLC bars for a ticker in [dstart, dend].
-    Falls back to the nearest previous trading day if an exact day has no bar.
-    """
-    is_exact_day = dstart is not None and dend is not None and dstart == dend
-
-    bars = session.run(
-        """
-        MATCH (i:Instrument {ticker: $ticker})<-[:FOR_INSTRUMENT]-(b:MarketBar)
-        WHERE ($dstart IS NULL OR b.bar_date >= date($dstart))
-          AND ($dend   IS NULL OR b.bar_date <= date($dend))
-        RETURN b.bar_date AS bar_date,
-               b.open     AS open,
-               b.high     AS high,
-               b.low      AS low,
-               b.close    AS close
-        ORDER BY b.bar_date DESC
-        LIMIT $limit
-        """,
-        {"ticker": ticker, "dstart": dstart, "dend": dend, "limit": limit},
-    ).data()
-
-    # Weekend / holiday fallback for exact-day queries
-    if not bars and is_exact_day:
-        bars = session.run(
-            """
-            MATCH (i:Instrument {ticker: $ticker})<-[:FOR_INSTRUMENT]-(b:MarketBar)
-            WHERE b.bar_date < date($dstart)
-            RETURN b.bar_date AS bar_date,
-                   b.open     AS open,
-                   b.high     AS high,
-                   b.low      AS low,
-                   b.close    AS close
-            ORDER BY b.bar_date DESC
-            LIMIT 1
-            """,
-            {"ticker": ticker, "dstart": dstart},
-        ).data()
-
-    return bars
+def _date_range_to_period_keys(start: str | None, end: str | None) -> list[str]:
+    """Expand a date range into all period keys it spans."""
+    if not start and not end:
+        return []
+    keys = set()
+    try:
+        s = datetime.strptime(start or end, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+        e = datetime.strptime(end or start, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+        current = s
+        while current <= e:
+            keys.add(period_key_for(current, PERIOD_GRANULARITY))
+            # Advance by roughly one period
+            if PERIOD_GRANULARITY == "week":
+                current += timedelta(weeks=1)
+            elif PERIOD_GRANULARITY == "month":
+                # Move to next month
+                if current.month == 12:
+                    current = current.replace(year=current.year + 1, month=1)
+                else:
+                    current = current.replace(month=current.month + 1)
+            else:  # quarter
+                current += timedelta(days=92)
+    except ValueError:
+        pass
+    return sorted(keys)
 
 
-def _build_market_summary(ticker: str, bars: list[dict], dstart: str | None) -> str:
-    """Turn a list of bar dicts into a human-readable market summary string."""
-    bars_sorted = sorted(bars, key=lambda r: r["bar_date"])
-    start_close = bars_sorted[0].get("close")
-    end_close = bars_sorted[-1].get("close")
-    start_bd = bars_sorted[0]["bar_date"]
-    end_bd = bars_sorted[-1]["bar_date"]
-    start_bd_s = start_bd.isoformat() if hasattr(start_bd, "isoformat") else str(start_bd)
-    end_bd_s = end_bd.isoformat() if hasattr(end_bd, "isoformat") else str(end_bd)
-    is_exact_day = dstart is not None and start_bd_s != dstart
-
-    pct_change = None
-    if start_close is not None and end_close is not None:
-        try:
-            pct_change = (float(end_close) - float(start_close)) / float(start_close) * 100.0
-        except Exception:
-            pass
-
-    lows  = [b.get("low")  for b in bars_sorted if b.get("low")  is not None]
-    highs = [b.get("high") for b in bars_sorted if b.get("high") is not None]
-    min_low  = min(float(x) for x in lows)  if lows  else None
-    max_high = max(float(x) for x in highs) if highs else None
-
-    summary = (
-        f"[MARKET DATA] {ticker} — {start_bd_s} to {end_bd_s} | "
-        f"start close={_fmt_num(start_close)}, end close={_fmt_num(end_close)}"
-    )
-    if is_exact_day:
-        summary += " (nearest previous trading day used)"
-    if pct_change is not None:
-        direction = "▲" if pct_change >= 0 else "▼"
-        summary += f" | period change={direction}{abs(pct_change):.2f}%"
-    if min_low is not None:
-        summary += f" | range low={_fmt_num(min_low)}, high={_fmt_num(max_high)}"
-
-    line_items = []
-    for b in bars:
-        bd_s = b["bar_date"].isoformat() if hasattr(b["bar_date"], "isoformat") else str(b["bar_date"])
-        line_items.append(
-            f"  {bd_s}: O={_fmt_num(b.get('open'))} H={_fmt_num(b.get('high'))} "
-            f"L={_fmt_num(b.get('low'))} C={_fmt_num(b.get('close'))}"
-        )
-
-    return summary + "\n" + "\n".join(line_items)
-
-QUERY_TYPE_SINGLE = "single_entity_company"
-QUERY_TYPE_MULTI = "multi_entity_company"
-QUERY_TYPE_GENERAL = "general"
+# ---------------------------------------------------------------------------
+# Entity Resolution
+# ---------------------------------------------------------------------------
 
 COMPARE_WORDS = re.compile(r"\b(compare|vs\.?|versus|against)\b", re.IGNORECASE)
-QUERY_INTENT_GENERAL = "general_company_news"
-QUERY_INTENT_COMPETITION = "competition"
-QUERY_INTENT_MNA = "mna"
-QUERY_INTENT_PARTNERSHIP = "partnership"
-QUERY_INTENT_INVESTMENT = "investment"
-QUERY_INTENT_PRODUCT = "product"
-QUERY_INTENT_EARNINGS = "earnings"
-QUERY_INTENT_SUPPLY = "supply_chain"
 
-INTENT_PATTERNS = {
-    QUERY_INTENT_COMPETITION: re.compile(
-        r"\b(compete|competitor|competition|rival|rivals)\b", re.IGNORECASE
-    ),
-    QUERY_INTENT_MNA: re.compile(
-        r"\b(acquire|acquired|acquisition|buy|bought|purchase|purchased|merger|merge)\b",
-        re.IGNORECASE,
-    ),
-    QUERY_INTENT_PARTNERSHIP: re.compile(
-        r"\b(partner|partnership|collaborat|collaboration|teamed up|joined forces)\b",
-        re.IGNORECASE,
-    ),
-    QUERY_INTENT_INVESTMENT: re.compile(
-        r"\b(invest|investment|stake|backed|funding|fundraise|raised)\b",
-        re.IGNORECASE,
-    ),
-    QUERY_INTENT_PRODUCT: re.compile(
-        r"\b(product|launch|launched|release|released|unveil|unveiled|device|chip|model|platform)\b",
-        re.IGNORECASE,
-    ),
-    QUERY_INTENT_EARNINGS: re.compile(
-        r"\b(earnings|revenue|profit|guidance|forecast|results|reported|quarter|q1|q2|q3|q4)\b",
-        re.IGNORECASE,
-    ),
-    QUERY_INTENT_SUPPLY: re.compile(
-        r"\b(supply|supplier|supplied|providing|manufactur|foundry|shipment|deliver)\b",
-        re.IGNORECASE,
-    ),
-}
+QUERY_TYPE_SINGLE = "single_entity"
+QUERY_TYPE_GENERAL = "general"
+
 
 @dataclass
 class QueryTarget:
     query_type: str
-    entity_canonical: Optional[str]
-    display_name: Optional[str]
-    ticker: Optional[str]
+    canonical_name: Optional[str]   # what's stored in KnowledgeNode.canonical_name
+    display_name: Optional[str]     # human-readable, for context header
+    ticker: Optional[str]           # non-None only for ORG entities
+    entity_type: Optional[str]      # ORG / PER / LOC
     confidence: float
-    ambiguous: bool
-    candidates: list[tuple[str, str, str]]
+    candidates: list[tuple[str, str]] = field(default_factory=list)  # (canonical, display)
 
 
-def classify_query_type(query: str) -> str:
-    if COMPARE_WORDS.search(query):
-        return QUERY_TYPE_MULTI
-    return QUERY_TYPE_SINGLE
-
-def classify_query_intent(query: str) -> str:
-    for intent, pattern in INTENT_PATTERNS.items():
-        if pattern.search(query):
-            return intent
-    return QUERY_INTENT_GENERAL
-
-SEMANTIC_POLICY_BY_INTENT = {
-    QUERY_INTENT_GENERAL: {
-        "allowed_relations": {
-            "ACQUIRED",
-            "PARTNERED_WITH",
-            "INVESTED_IN",
-            "LAUNCHED",
-            "SUPPLIED",
-            "REPORTED",
-        },
-        "allowed_neighbor_types": {"ORG", "PRODUCT", "EVENT", "STOCK"},
-        "min_relation_confidence": 0.50,
-        "max_neighbor_entities": 5,
-        "max_extra_chunks": 4,
-    },
-    QUERY_INTENT_COMPETITION: {
-        "allowed_relations": {"COMPETES_WITH"},
-        "allowed_neighbor_types": {"ORG", "PRODUCT", "STOCK"},
-        "min_relation_confidence": 0.50,
-        "max_neighbor_entities": 6,
-        "max_extra_chunks": 5,
-    },
-    QUERY_INTENT_MNA: {
-        "allowed_relations": {"ACQUIRED"},
-        "allowed_neighbor_types": {"ORG", "STOCK", "EVENT"},
-        "min_relation_confidence": 0.60,
-        "max_neighbor_entities": 4,
-        "max_extra_chunks": 4,
-    },
-    QUERY_INTENT_PARTNERSHIP: {
-        "allowed_relations": {"PARTNERED_WITH"},
-        "allowed_neighbor_types": {"ORG", "PRODUCT", "EVENT", "STOCK"},
-        "min_relation_confidence": 0.55,
-        "max_neighbor_entities": 4,
-        "max_extra_chunks": 4,
-    },
-    QUERY_INTENT_INVESTMENT: {
-        "allowed_relations": {"INVESTED_IN"},
-        "allowed_neighbor_types": {"ORG", "STOCK", "EVENT"},
-        "min_relation_confidence": 0.60,
-        "max_neighbor_entities": 4,
-        "max_extra_chunks": 4,
-    },
-    QUERY_INTENT_PRODUCT: {
-        "allowed_relations": {"LAUNCHED", "SUPPLIED"},
-        "allowed_neighbor_types": {"PRODUCT", "ORG", "EVENT"},
-        "min_relation_confidence": 0.55,
-        "max_neighbor_entities": 5,
-        "max_extra_chunks": 5,
-    },
-    QUERY_INTENT_EARNINGS: {
-        "allowed_relations": {"REPORTED"},
-        "allowed_neighbor_types": {"EVENT", "ORG", "STOCK"},
-        "min_relation_confidence": 0.60,
-        "max_neighbor_entities": 4,
-        "max_extra_chunks": 4,
-    },
-    QUERY_INTENT_SUPPLY: {
-        "allowed_relations": {"SUPPLIED"},
-        "allowed_neighbor_types": {"ORG", "PRODUCT", "EVENT"},
-        "min_relation_confidence": 0.60,
-        "max_neighbor_entities": 4,
-        "max_extra_chunks": 4,
-    },
-}
-
-def get_semantic_policy_for_query(query: str) -> dict:
-    intent = classify_query_intent(query)
-    return {
-        "intent": intent,
-        **SEMANTIC_POLICY_BY_INTENT.get(intent, SEMANTIC_POLICY_BY_INTENT[QUERY_INTENT_GENERAL]),
-    }
-
-def normalize_query_for_matching(query: str) -> str:
-    q = canonicalize(query)
+def _normalize_for_matching(query: str) -> str:
+    """Strip query boilerplate before entity matching."""
+    q = _canonicalize(query)
     stop_phrases = [
-        "latest news on", "latest news about", "news on", "news about",
         "what is the latest news on", "what is the latest news about",
-        "what happened to", "tell me about", "latest on"
+        "latest news on", "latest news about", "news on", "news about",
+        "what happened to", "tell me about", "latest on",
+        "what do you know about", "give me an update on",
     ]
     for phrase in stop_phrases:
-        q = q.replace(canonicalize(phrase), " ")
-    q = re.sub(r"\s+", " ", q).strip()
-    return q
+        q = q.replace(_canonicalize(phrase), " ")
+    return re.sub(r"\s+", " ", q).strip()
 
 
-def get_entity_name_map(driver) -> dict[str, str]:
-    with driver.session() as session:
-        rows = session.run(
-            "MATCH (e:Entity) RETURN e.canonical_name AS cname, e.name AS name"
-        ).data()
-    out = {}
-    for r in rows:
-        cname = r.get("cname")
-        if cname:
-            out[cname] = r.get("name") or cname
-    return out
+def resolve_query_target(
+    query: str,
+    alias_to_ticker: dict[str, str],
+    ticker_to_canonical: dict[str, str],
+    driver,
+) -> QueryTarget:
+    """
+    Resolve the primary entity in a query to a QueryTarget.
 
+    Priority:
+      Tier 1 — explicit uppercase ticker token in query (e.g. "AAPL", "NVDA")
+      Tier 2 — exact alias match in alias_to_ticker
+      Tier 3 — longest alias phrase found inside normalized query
+      Tier 4 — KnowledgeNode canonical_name match in DB (catches PER/LOC)
+      Tier 5 — general (no entity resolved)
+    """
+    q_norm = _normalize_for_matching(query)
 
-def resolve_query_target(query: str, ticker_lookup: dict[str, str], driver) -> QueryTarget:
-    query_type = classify_query_type(query)
-    q_norm = normalize_query_for_matching(query)
-    entity_name_map = get_entity_name_map(driver)
-
-    # Tier 1: explicit ticker in query
-    explicit_tickers = sorted({t.upper() for t in re.findall(r"\b[A-Z]{1,5}\b", query)})
-    if explicit_tickers:
-        with driver.session() as session:
-            rows = session.run(
-                """
-                MATCH (i:Instrument)
-                WHERE i.ticker IN $tickers
-                RETURN i.ticker AS ticker
-                """,
-                {"tickers": explicit_tickers},
-            ).data()
-        valid = [r["ticker"] for r in rows if r.get("ticker")]
-        if valid:
-            ticker = valid[0]
-            canonicals = [c for c, tk in ticker_lookup.items() if tk == ticker]
-            canonical = max(canonicals, key=len) if canonicals else None
-            display = entity_name_map.get(canonical, canonical or ticker)
+    # Tier 1: explicit ticker tokens (1-5 uppercase letters)
+    ticker_candidates = re.findall(r"\b([A-Z]{1,5})\b", query)
+    for tok in ticker_candidates:
+        if tok in ticker_to_canonical:
+            display = ticker_to_canonical[tok]
             return QueryTarget(
-                query_type=query_type,
-                entity_canonical=canonical,
+                query_type=QUERY_TYPE_SINGLE,
+                canonical_name=tok,        # canonical_name IS the ticker for ORG
                 display_name=display,
-                ticker=ticker,
+                ticker=tok,
+                entity_type="ORG",
                 confidence=0.99,
-                ambiguous=False,
-                candidates=[(canonical or "", display or "", ticker)],
+                candidates=[(tok, display)],
             )
 
-    # Tier 2: exact alias/company match
-    exact_hits = []
-    for canonical, ticker in ticker_lookup.items():
-        if canonical == q_norm:
-            exact_hits.append((canonical, entity_name_map.get(canonical, canonical), ticker))
-    if len(exact_hits) == 1:
-        c, d, t = exact_hits[0]
-        return QueryTarget(query_type, c, d, t, 0.98, False, [(c, d, t)])
-
-    # Tier 3: exact canonical phrase in query
-    phrase_hits = []
-    for canonical, ticker in ticker_lookup.items():
-        if re.search(r"\b" + re.escape(canonical) + r"\b", q_norm):
-            phrase_hits.append((canonical, entity_name_map.get(canonical, canonical), ticker))
-
-    if phrase_hits:
-        phrase_hits.sort(key=lambda x: len(x[0]), reverse=True)
-        best = phrase_hits[0]
-        ambiguous = len({t for _, _, t in phrase_hits}) > 1
-        return QueryTarget(
-            query_type=query_type,
-            entity_canonical=best[0],
-            display_name=best[1],
-            ticker=best[2],
-            confidence=0.95,
-            ambiguous=ambiguous,
-            candidates=phrase_hits[:5],
-        )
-
-    # Tier 4: exact entity canonical in DB
-    if q_norm in entity_name_map:
+    # Tier 2: exact alias match
+    if q_norm in alias_to_ticker:
+        ticker = alias_to_ticker[q_norm]
+        display = ticker_to_canonical.get(ticker, q_norm)
         return QueryTarget(
             query_type=QUERY_TYPE_SINGLE,
-            entity_canonical=q_norm,
-            display_name=entity_name_map[q_norm],
-            ticker=ticker_lookup.get(q_norm),
-            confidence=0.85,
-            ambiguous=False,
-            candidates=[(q_norm, entity_name_map[q_norm], ticker_lookup.get(q_norm, ""))],
+            canonical_name=ticker,
+            display_name=display,
+            ticker=ticker,
+            entity_type="ORG",
+            confidence=0.98,
+            candidates=[(ticker, display)],
         )
 
+    # Tier 3: longest alias phrase found inside normalized query
+    phrase_hits: list[tuple[str, str, str]] = []  # (alias, ticker, display)
+    for alias, ticker in alias_to_ticker.items():
+        if re.search(r"\b" + re.escape(alias) + r"\b", q_norm):
+            display = ticker_to_canonical.get(ticker, alias)
+            phrase_hits.append((alias, ticker, display))
+
+    if phrase_hits:
+        # Longest alias wins (most specific)
+        phrase_hits.sort(key=lambda x: len(x[0]), reverse=True)
+        alias, ticker, display = phrase_hits[0]
+        return QueryTarget(
+            query_type=QUERY_TYPE_SINGLE,
+            canonical_name=ticker,
+            display_name=display,
+            ticker=ticker,
+            entity_type="ORG",
+            confidence=0.95,
+            candidates=[(ticker, display)],
+        )
+
+    # Tier 4: check if any KnowledgeNode canonical_name (PER/LOC) matches the query
+    with driver.session() as session:
+        rows = session.run(
+            """
+            MATCH (kn:KnowledgeNode)
+            WHERE kn.canonical_name = $q_norm
+               OR kn.display_name = $q_norm
+            RETURN kn.canonical_name AS canonical_name,
+                   kn.display_name   AS display_name,
+                   kn.entity_type    AS entity_type
+            LIMIT 1
+            """,
+            {"q_norm": q_norm},
+        ).data()
+
+    if rows:
+        r = rows[0]
+        return QueryTarget(
+            query_type=QUERY_TYPE_SINGLE,
+            canonical_name=r["canonical_name"],
+            display_name=r.get("display_name") or r["canonical_name"],
+            ticker=None,
+            entity_type=r.get("entity_type"),
+            confidence=0.85,
+            candidates=[(r["canonical_name"], r.get("display_name") or r["canonical_name"])],
+        )
+
+    # Tier 5: no entity resolved
     return QueryTarget(
         query_type=QUERY_TYPE_GENERAL,
-        entity_canonical=None,
+        canonical_name=None,
         display_name=None,
         ticker=None,
+        entity_type=None,
         confidence=0.0,
-        ambiguous=False,
-        candidates=[],
     )
 
-def retrieve_target_anchored_chunks(
+
+# ---------------------------------------------------------------------------
+# Retrieval — Layer 1+2: entity-anchored chunk fetch
+# ---------------------------------------------------------------------------
+
+def retrieve_entity_chunks(
     driver,
     target: QueryTarget,
+    period_keys: list[str] | None = None,
+    date_start: str | None = None,
+    date_end: str | None = None,
     source_filter: str | None = None,
-    time_start: int | None = None,
-    time_end: int | None = None,
 ) -> list[dict]:
-    if not target.entity_canonical and not target.ticker:
+    """
+    R_time + R_node combined:
+      - Find all KnowledgeNodes for this entity (canonical_name match)
+      - Optionally filter to specific period_keys (R_time)
+      - Walk SOURCED_FROM back to Chunks
+      - Apply date range and source filters on Chunks
+    """
+    if not target.canonical_name:
         return []
 
-    params = {
-        "target_entity": target.entity_canonical,
-        "target_ticker": target.ticker,
-        "source_filter": source_filter,
-    }
+    period_filter = "AND kn.period_key IN $period_keys" if period_keys else ""
+    date_start_filter = "AND c.published_date >= date($date_start)" if date_start else ""
+    date_end_filter = "AND c.published_date <= date($date_end)" if date_end else ""
+    source_filter_clause = "AND a.source = $source_filter" if source_filter else ""
 
-    time_clause = ""
-    if time_start is not None:
-        time_clause += " AND c.published_ts >= $ts_start"
-        params["ts_start"] = time_start
-    if time_end is not None:
-        time_clause += " AND c.published_ts <= $ts_end"
-        params["ts_end"] = time_end
-
-    query = f"""
-    MATCH (c:Chunk)<-[:HAS_CHUNK]-(a:Article)
-    WHERE ($source_filter IS NULL OR c.source = $source_filter)
-      {time_clause}
-      AND (
-        ($target_entity IS NOT NULL AND EXISTS {{
-            MATCH (c)-[:MENTIONS]->(:Entity {{canonical_name: $target_entity}})
-        }})
-        OR
-        ($target_ticker IS NOT NULL AND EXISTS {{
-            MATCH (c)-[:MENTIONS_INSTRUMENT]->(:Instrument {{ticker: $target_ticker}})
-        }})
-      )
+    cypher = f"""
+    MATCH (kn:KnowledgeNode {{canonical_name: $canonical_name}})
+    {period_filter}
+    MATCH (c:Chunk)-[:SOURCED_FROM]->(kn)
+    MATCH (a:Article {{article_id: c.article_id}})
+    WHERE 1=1
+      {date_start_filter}
+      {date_end_filter}
+      {source_filter_clause}
     RETURN DISTINCT
-        c.chunk_uid    AS chunk_uid,
-        c.text         AS text,
-        c.embedding    AS embedding,
-        c.published_ts AS published_ts,
-        c.source       AS source,
-        a.title        AS title,
-        a.url          AS url,
-        c.article_id   AS article_id,
-        c.chunk_id     AS chunk_id
+        c.chunk_uid      AS chunk_uid,
+        c.text           AS text,
+        c.embedding      AS embedding,
+        c.published_date AS published_date,
+        c.period_key     AS period_key,
+        a.title          AS title,
+        a.url            AS url,
+        a.source         AS source,
+        a.article_id     AS article_id
     """
-    with driver.session() as session:
-        return session.run(query, params).data()
+    params: dict = {"canonical_name": target.canonical_name}
+    if period_keys:
+        params["period_keys"] = period_keys
+    if date_start:
+        params["date_start"] = date_start
+    if date_end:
+        params["date_end"] = date_end
+    if source_filter:
+        params["source_filter"] = source_filter
 
-def retrieve_semantic_expansion_chunks(
+    with driver.session() as session:
+        return session.run(cypher, params).data()
+
+
+# ---------------------------------------------------------------------------
+# Retrieval — Layer 3: Knowledge-unit vector search → back to Chunks
+# ---------------------------------------------------------------------------
+
+def retrieve_knowledge_chunks(
     driver,
+    embed_model: SentenceTransformer,
+    query: str,
     target: QueryTarget,
+    period_keys: list[str] | None = None,
+    date_start: str | None = None,
+    date_end: str | None = None,
     source_filter: str | None = None,
-    time_start: int | None = None,
-    time_end: int | None = None,
-    allowed_relations: set[str] | None = None,
-    allowed_neighbor_types: set[str] | None = None,
-    min_relation_confidence: float = 0.0,
-    max_neighbor_entities: int = 5,
-    max_extra_chunks: int = 6,
+    top_k: int = 6,
 ) -> list[dict]:
-    if not target.entity_canonical:
+    """
+    R_knowledge:
+      - Vector search over Knowledge.embedding for this entity's knowledge units
+      - Back-link via SOURCED_FROM_CHUNK to get source Chunks
+      - Return chunk dicts enriched with knowledge match score
+    """
+    if not target.canonical_name:
         return []
 
-    if allowed_relations is None:
-        allowed_relations = {
-            "ACQUIRED",
-            "PARTNERED_WITH",
-            "INVESTED_IN",
-            "LAUNCHED",
-            "SUPPLIED",
-            "REPORTED",
-            "COMPETES_WITH",
-        }
+    qvec = embed_model.encode([query], normalize_embeddings=True)[0].tolist()
 
-    if allowed_neighbor_types is None:
-        allowed_neighbor_types = {"ORG", "PRODUCT", "EVENT", "STOCK"}
+    period_filter = "AND kn.period_key IN $period_keys" if period_keys else ""
+    date_start_filter = "AND c.published_date >= date($date_start)" if date_start else ""
+    date_end_filter = "AND c.published_date <= date($date_end)" if date_end else ""
+    source_filter_clause = "AND a.source = $source_filter" if source_filter else ""
 
-    params = {
-        "target_entity": target.entity_canonical,
-        "source_filter": source_filter,
-        "allowed_relations": list(allowed_relations),
-        "allowed_neighbor_types": list(allowed_neighbor_types),
-        "min_relation_confidence": float(min_relation_confidence),
-        "max_neighbor_entities": max_neighbor_entities,
-        "max_extra_chunks": max_extra_chunks,
-    }
-
-    time_clause = ""
-    if time_start is not None:
-        time_clause += " AND c.published_ts >= $ts_start"
-        params["ts_start"] = time_start
-    if time_end is not None:
-        time_clause += " AND c.published_ts <= $ts_end"
-        params["ts_end"] = time_end
-
-    query = f"""
-    MATCH (:Entity {{canonical_name: $target_entity}})-[r]-(n:Entity)
-    WHERE type(r) IN $allowed_relations
-        AND n.type IN $allowed_neighbor_types
-        AND n.canonical_name <> $target_entity
-        AND coalesce(r.confidence, 0.0) >= $min_relation_confidence
-        AND r.source_chunk_uid IS NOT NULL
-    WITH
-        n,
-        type(r) AS relation_type,
-        coalesce(r.confidence, 0.0) AS relation_confidence,
-        r.source_chunk_uid AS relation_source_chunk_uid,
-        r.extractor AS relation_extractor
-    ORDER BY relation_confidence DESC, n.canonical_name
-    LIMIT $max_neighbor_entities
-
-    MATCH (c:Chunk)
-    WHERE c.chunk_uid = relation_source_chunk_uid
-    MATCH (c)<-[:HAS_CHUNK]-(a:Article)
-    WHERE ($source_filter IS NULL OR c.source = $source_filter)
-    {time_clause}
+    cypher = f"""
+    MATCH (kn:KnowledgeNode {{canonical_name: $canonical_name}})
+    {period_filter}
+    CALL db.index.vector.queryNodes('vector_knowledge', $top_k, $qvec)
+    YIELD node AS k, score
+    WHERE (kn)-[:HAS_KNOWLEDGE]->(k)
+    MATCH (k)-[:SOURCED_FROM_CHUNK]->(c:Chunk)
+    MATCH (a:Article {{article_id: c.article_id}})
+    WHERE 1=1
+      {date_start_filter}
+      {date_end_filter}
+      {source_filter_clause}
     RETURN DISTINCT
-        c.chunk_uid                AS chunk_uid,
-        c.text                     AS text,
-        c.embedding                AS embedding,
-        c.published_ts             AS published_ts,
-        c.source                   AS source,
-        a.title                    AS title,
-        a.url                      AS url,
-        c.article_id               AS article_id,
-        c.chunk_id                 AS chunk_id,
-        relation_type              AS relation_type,
-        relation_confidence        AS relation_confidence,
-        relation_source_chunk_uid  AS relation_source_chunk_uid,
-        relation_extractor         AS relation_extractor
-    LIMIT $max_extra_chunks
+        c.chunk_uid      AS chunk_uid,
+        c.text           AS text,
+        c.embedding      AS embedding,
+        c.published_date AS published_date,
+        c.period_key     AS period_key,
+        a.title          AS title,
+        a.url            AS url,
+        a.source         AS source,
+        a.article_id     AS article_id,
+        max(score)       AS knowledge_score
+    ORDER BY knowledge_score DESC
+    LIMIT $top_k
     """
-    with driver.session() as session:
-        return session.run(query, params).data()
+    params: dict = {
+        "canonical_name": target.canonical_name,
+        "qvec": qvec,
+        "top_k": top_k,
+    }
+    if period_keys:
+        params["period_keys"] = period_keys
+    if date_start:
+        params["date_start"] = date_start
+    if date_end:
+        params["date_end"] = date_end
+    if source_filter:
+        params["source_filter"] = source_filter
 
-def retrieve_controlled_expansion_chunks(
+    with driver.session() as session:
+        return session.run(cypher, params).data()
+
+
+# ---------------------------------------------------------------------------
+# Retrieval — CO_OCCURS neighbor expansion
+# ---------------------------------------------------------------------------
+
+def retrieve_cooccurrence_chunks(
     driver,
     target: QueryTarget,
+    period_keys: list[str] | None = None,
+    date_start: str | None = None,
+    date_end: str | None = None,
     source_filter: str | None = None,
-    time_start: int | None = None,
-    time_end: int | None = None,
-    min_edge_weight: int = 2,
-    allowed_neighbor_types: set[str] | None = None,
-    max_neighbor_entities: int = 5,
-    max_extra_chunks: int = 6,
+    max_neighbors: int = 3,
+    max_chunks: int = 4,
 ) -> list[dict]:
-    if not target.entity_canonical:
-        return []
-
-    if allowed_neighbor_types is None:
-        allowed_neighbor_types = {"ORG", "PRODUCT", "EVENT", "STOCK"}
-
-    params = {
-        "target_entity": target.entity_canonical,
-        "target_ticker": target.ticker,
-        "source_filter": source_filter,
-        "min_edge_weight": min_edge_weight,
-        "allowed_neighbor_types": list(allowed_neighbor_types),
-        "max_neighbor_entities": max_neighbor_entities,
-        "max_extra_chunks": max_extra_chunks,
-    }
-
-    time_clause = ""
-    if time_start is not None:
-        time_clause += " AND c.published_ts >= $ts_start"
-        params["ts_start"] = time_start
-    if time_end is not None:
-        time_clause += " AND c.published_ts <= $ts_end"
-        params["ts_end"] = time_end
-
-    query = f"""
-    MATCH (:Entity {{canonical_name: $target_entity}})-[r:CO_OCCURS_CHUNK]-(n:Entity)
-    WHERE coalesce(r.weight, 0) >= $min_edge_weight
-        AND n.type IN $allowed_neighbor_types
-        AND n.canonical_name <> $target_entity
-    WITH n, r.weight AS edge_weight
-    ORDER BY edge_weight DESC, n.canonical_name
-    LIMIT $max_neighbor_entities
-
-    MATCH (c:Chunk)-[:MENTIONS]->(n)
-    MATCH (c)<-[:HAS_CHUNK]-(a:Article)
-    WHERE ($source_filter IS NULL OR c.source = $source_filter)
-        {time_clause}
-      AND NOT EXISTS {{
-          MATCH (c)-[:MENTIONS]->(:Entity {{canonical_name: $target_entity}})
-      }}
-      AND (
-          $target_ticker IS NULL OR
-          NOT EXISTS {{
-              MATCH (c)-[:MENTIONS_INSTRUMENT]->(:Instrument {{ticker: $target_ticker}})
-          }}
-      )
-    RETURN DISTINCT
-        c.chunk_uid    AS chunk_uid,
-        c.text         AS text,
-        c.embedding    AS embedding,
-        c.published_ts AS published_ts,
-        c.source       AS source,
-        a.title        AS title,
-        a.url          AS url,
-        c.article_id   AS article_id,
-        c.chunk_id     AS chunk_id,
-        edge_weight    AS edge_weight
-    LIMIT $max_extra_chunks
     """
-    with driver.session() as session:
-        return session.run(query, params).data()
-
-def fetch_market_text_for_target(
-    driver,
-    target: QueryTarget,
-    time_start: int | None = None,
-    time_end: int | None = None,
-) -> list[str]:
-    if not target.ticker:
+    Walk RELATED_TO (CO_OCCURS) edges from the target KnowledgeNode to
+    neighboring entities, then fetch their Chunks as expansion context.
+    Only uses same-period neighbors.
+    """
+    if not target.canonical_name:
         return []
 
-    now = datetime.now(timezone.utc)
-    if time_start is None and time_end is None and DEFAULT_MARKET_LOOKBACK_DAYS:
-        market_dstart = (now - timedelta(days=DEFAULT_MARKET_LOOKBACK_DAYS)).strftime("%Y-%m-%d")
-        market_dend = now.strftime("%Y-%m-%d")
-    else:
-        market_dstart = ts_to_datestr(time_start)
-        market_dend = ts_to_datestr(time_end)
+    period_filter = "AND kn.period_key IN $period_keys" if period_keys else ""
+    date_start_filter = "AND c.published_date >= date($date_start)" if date_start else ""
+    date_end_filter = "AND c.published_date <= date($date_end)" if date_end else ""
+    source_filter_clause = "AND a.source = $source_filter" if source_filter else ""
+
+    cypher = f"""
+    MATCH (kn:KnowledgeNode {{canonical_name: $canonical_name}})
+    {period_filter}
+    MATCH (kn)-[r:RELATED_TO]-(neighbor:KnowledgeNode)
+    WHERE neighbor.canonical_name <> $canonical_name
+      AND r.period_key = kn.period_key
+    WITH neighbor
+    ORDER BY neighbor.canonical_name
+    LIMIT $max_neighbors
+
+    MATCH (c:Chunk)-[:SOURCED_FROM]->(neighbor)
+    MATCH (a:Article {{article_id: c.article_id}})
+    WHERE 1=1
+      {date_start_filter}
+      {date_end_filter}
+      {source_filter_clause}
+    RETURN DISTINCT
+        c.chunk_uid      AS chunk_uid,
+        c.text           AS text,
+        c.embedding      AS embedding,
+        c.published_date AS published_date,
+        c.period_key     AS period_key,
+        a.title          AS title,
+        a.url            AS url,
+        a.source         AS source,
+        a.article_id     AS article_id,
+        neighbor.display_name AS neighbor_display
+    LIMIT $max_chunks
+    """
+    params: dict = {
+        "canonical_name": target.canonical_name,
+        "max_neighbors": max_neighbors,
+        "max_chunks": max_chunks,
+    }
+    if period_keys:
+        params["period_keys"] = period_keys
+    if date_start:
+        params["date_start"] = date_start
+    if date_end:
+        params["date_end"] = date_end
+    if source_filter:
+        params["source_filter"] = source_filter
 
     with driver.session() as session:
-        bars = _fetch_market_bars(session, target.ticker, market_dstart, market_dend, limit=7)
-        if not bars:
-            return []
-        return [_build_market_summary(target.ticker, bars, market_dstart)]
+        return session.run(cypher, params).data()
 
-def three_layer_retrieve(
+
+# ---------------------------------------------------------------------------
+# Semantic fallback — pure vector search over Chunks
+# ---------------------------------------------------------------------------
+
+def retrieve_semantic_chunks(
+    driver,
+    embed_model: SentenceTransformer,
+    query: str,
+    period_keys: list[str] | None = None,
+    date_start: str | None = None,
+    date_end: str | None = None,
+    source_filter: str | None = None,
+    top_k: int = 6,
+) -> list[dict]:
+    """
+    Fallback for general queries with no resolved entity.
+    Pure vector search over Chunk.embedding via the vector_chunk index.
+    """
+    qvec = embed_model.encode([query], normalize_embeddings=True)[0].tolist()
+
+    period_filter = "AND c.period_key IN $period_keys" if period_keys else ""
+    date_start_filter = "AND c.published_date >= date($date_start)" if date_start else ""
+    date_end_filter = "AND c.published_date <= date($date_end)" if date_end else ""
+    source_filter_clause = "AND a.source = $source_filter" if source_filter else ""
+
+    cypher = f"""
+    CALL db.index.vector.queryNodes('vector_chunk', $top_k, $qvec)
+    YIELD node AS c, score
+    MATCH (a:Article {{article_id: c.article_id}})
+    WHERE 1=1
+      {period_filter}
+      {date_start_filter}
+      {date_end_filter}
+      {source_filter_clause}
+    RETURN
+        c.chunk_uid      AS chunk_uid,
+        c.text           AS text,
+        c.embedding      AS embedding,
+        c.published_date AS published_date,
+        c.period_key     AS period_key,
+        a.title          AS title,
+        a.url            AS url,
+        a.source         AS source,
+        a.article_id     AS article_id,
+        score            AS semantic_score
+    ORDER BY score DESC
+    LIMIT $top_k
+    """
+    params: dict = {"qvec": qvec, "top_k": top_k}
+    if period_keys:
+        params["period_keys"] = period_keys
+    if date_start:
+        params["date_start"] = date_start
+    if date_end:
+        params["date_end"] = date_end
+    if source_filter:
+        params["source_filter"] = source_filter
+
+    with driver.session() as session:
+        return session.run(cypher, params).data()
+
+
+# ---------------------------------------------------------------------------
+# Scoring and ranking
+# ---------------------------------------------------------------------------
+
+def _published_date_to_ts(published_date) -> int | None:
+    """Convert Neo4j Date object or ISO string to unix timestamp."""
+    if published_date is None:
+        return None
+    try:
+        if hasattr(published_date, "year"):
+            # Neo4j Date object
+            dt = datetime(published_date.year, published_date.month, published_date.day,
+                          tzinfo=timezone.utc)
+        else:
+            dt = datetime.strptime(str(published_date), "%Y-%m-%d").replace(tzinfo=timezone.utc)
+        return int(dt.timestamp())
+    except Exception:
+        return None
+
+
+def score_and_rank(
+    rows: list[dict],
+    query_vec: np.ndarray,
+    recency_half_life_days: float = RECENCY_HALF_LIFE_DAYS,
+    semantic_weight: float = 0.75,
+    recency_weight: float = 0.25,
+) -> list[dict]:
+    """
+    Score each chunk: weighted combination of cosine similarity and recency decay.
+    Deduplicates by chunk_uid, keeping highest score.
+    """
+    now_ts = int(datetime.now(timezone.utc).timestamp())
+    half_life_s = recency_half_life_days * 86400.0
+
+    seen: dict[str, dict] = {}
+    for r in rows:
+        uid = r.get("chunk_uid")
+        if not uid:
+            continue
+
+        emb = r.get("embedding")
+        if emb is None:
+            sim = float(r.get("semantic_score") or r.get("knowledge_score") or 0.5)
+        else:
+            sim = cosine_sim(query_vec, np.array(emb, dtype=np.float32))
+
+        ts = _published_date_to_ts(r.get("published_date"))
+        if ts is None:
+            decay = 0.8
+        else:
+            age = max(0, now_ts - ts)
+            decay = float(np.exp(-np.log(2) * age / half_life_s))
+
+        score = semantic_weight * sim + recency_weight * decay
+        r = {**r, "score": score}
+
+        if uid not in seen or score > seen[uid]["score"]:
+            seen[uid] = r
+
+    return sorted(seen.values(), key=lambda x: x["score"], reverse=True)
+
+
+# ---------------------------------------------------------------------------
+# Main retrieval orchestrator
+# ---------------------------------------------------------------------------
+
+def retrieve(
     query: str,
     embed_model: SentenceTransformer,
     driver,
-    ticker_lookup: dict,
-    top_k: int = 3,
-    expanded_k: int = 6,
-    recency_half_life_days: float = 7.0,
+    alias_to_ticker: dict[str, str],
+    ticker_to_canonical: dict[str, str],
+    top_k: int = TOP_K,
+    expanded_k: int = EXPANDED_K,
+    recency_half_life_days: float = RECENCY_HALF_LIFE_DAYS,
     source_filter: str | None = None,
-    time_start: int | None = None,
-    time_end: int | None = None,
-):
-    # STEP 1: resolve one target from the query
-    target = resolve_query_target(query, ticker_lookup, driver)
-    semantic_policy = get_semantic_policy_for_query(query)
+    date_start: str | None = None,
+    date_end: str | None = None,
+) -> tuple[list[dict], QueryTarget]:
+    """
+    Full three-layer retrieval for one sub-query.
+    Returns (ranked_chunks, target).
+    """
+    target = resolve_query_target(query, alias_to_ticker, ticker_to_canonical, driver)
+    period_keys = _date_range_to_period_keys(date_start, date_end) or None
 
-    # Strict path for single-company queries
-    if target.query_type == QUERY_TYPE_SINGLE and target.entity_canonical:
-        # STEP 2: only retrieve chunks directly anchored to target entity/ticker
-        anchored_rows = retrieve_target_anchored_chunks(
-            driver=driver,
-            target=target,
+    query_vec = embed_model.encode([query], normalize_embeddings=True)[0]
+
+    if target.canonical_name:
+        # Layer 1+2: entity-anchored chunks
+        entity_rows = retrieve_entity_chunks(
+            driver, target,
+            period_keys=period_keys,
+            date_start=date_start,
+            date_end=date_end,
             source_filter=source_filter,
-            time_start=time_start,
-            time_end=time_end,
         )
 
-        # score only the anchored rows
-        qvec = embed_model.encode([query], normalize_embeddings=True)[0]
-        now_ts = int(datetime.now(timezone.utc).timestamp())
-        half_life_seconds = recency_half_life_days * 86400.0
+        # Layer 3: knowledge-unit vector search → chunks
+        knowledge_rows = retrieve_knowledge_chunks(
+            driver, embed_model, query, target,
+            period_keys=period_keys,
+            date_start=date_start,
+            date_end=date_end,
+            source_filter=source_filter,
+            top_k=expanded_k,
+        )
 
-        scored = []
-        for r in anchored_rows:
-            emb = np.array(r["embedding"], dtype=np.float32)
-            sim = cosine_sim(qvec, emb)
+        all_rows = entity_rows + knowledge_rows
+        ranked = score_and_rank(all_rows, query_vec, recency_half_life_days)
 
-            ts = r.get("published_ts")
-            if ts is None:
-                recency_weight = 0.85
-            else:
-                age = max(0, now_ts - int(ts))
-                recency_weight = float(np.exp(-np.log(2) * age / half_life_seconds))
-
-            score = (0.80 * sim) + (0.20 * recency_weight)
-            r["score"] = score
-            scored.append(r)
-
-        scored.sort(key=lambda x: x["score"], reverse=True)
-        seeds = scored[:top_k]
-
-        expanded = {s["chunk_uid"]: s for s in seeds}
-
-        for s in expanded.values():
-            s["expansion_kind"] = "direct"
-
-        # STEP 7A: semantic expansion first
-        if len(expanded) < MIN_STRICT_CHUNKS_BEFORE_EXPANSION:
-            semantic_rows = retrieve_semantic_expansion_chunks(
-                driver=driver,
-                target=target,
+        # If we got fewer than top_k direct hits, expand via CO_OCCURS neighbors
+        if len(ranked) < top_k:
+            cooccur_rows = retrieve_cooccurrence_chunks(
+                driver, target,
+                period_keys=period_keys,
+                date_start=date_start,
+                date_end=date_end,
                 source_filter=source_filter,
-                time_start=time_start,
-                time_end=time_end,
-                allowed_relations=semantic_policy["allowed_relations"],
-                allowed_neighbor_types=semantic_policy["allowed_neighbor_types"],
-                min_relation_confidence=semantic_policy["min_relation_confidence"],
-                max_neighbor_entities=semantic_policy["max_neighbor_entities"],
-                max_extra_chunks=semantic_policy["max_extra_chunks"],
+                max_neighbors=3,
+                max_chunks=4,
             )
-
-            for r in semantic_rows:
-                uid = r.get("chunk_uid")
-                if not uid or uid in expanded:
-                    continue
-
-                emb = np.array(r["embedding"], dtype=np.float32)
-                sim = cosine_sim(qvec, emb)
-
-                ts = r.get("published_ts")
-                if ts is None:
-                    recency_weight = 0.85
-                else:
-                    age = max(0, now_ts - int(ts))
-                    recency_weight = float(np.exp(-np.log(2) * age / half_life_seconds))
-
-                relation_confidence = float(r.get("relation_confidence", 0.0) or 0.0)
-                relation_bonus = min(max(relation_confidence, 0.0), 1.0) * 0.10
-
-                score = ((0.72 * sim) + (0.13 * recency_weight) + relation_bonus) * 0.80
-                r["score"] = score
-                r["expansion_kind"] = "semantic"
-                expanded[uid] = r
-
-        # STEP 7B: co-occurrence only if still too few chunks
-        if len(expanded) < MIN_STRICT_CHUNKS_BEFORE_EXPANSION:
-            extra_rows = retrieve_controlled_expansion_chunks(
-                driver=driver,
-                target=target,
-                source_filter=source_filter,
-                time_start=time_start,
-                time_end=time_end,
-                min_edge_weight=3,
-                allowed_neighbor_types={"ORG", "PRODUCT", "EVENT", "STOCK"},
-                max_neighbor_entities=3,
-                max_extra_chunks=3,
-            )
-
-            for r in extra_rows:
-                uid = r.get("chunk_uid")
-                if not uid or uid in expanded:
-                    continue
-
-                emb = np.array(r["embedding"], dtype=np.float32)
-                sim = cosine_sim(qvec, emb)
-
-                ts = r.get("published_ts")
-                if ts is None:
-                    recency_weight = 0.85
-                else:
-                    age = max(0, now_ts - int(ts))
-                    recency_weight = float(np.exp(-np.log(2) * age / half_life_seconds))
-
-                edge_weight = float(r.get("edge_weight", 0))
-                edge_bonus = min(edge_weight / 5.0, 1.0) * 0.05
-
-                score = ((0.70 * sim) + (0.15 * recency_weight) + edge_bonus) * 0.60
-                r["score"] = score
+            for r in cooccur_rows:
                 r["expansion_kind"] = "cooccurrence"
-                expanded[uid] = r
+            all_rows += cooccur_rows
+            ranked = score_and_rank(all_rows, query_vec, recency_half_life_days)
 
-        # local same-article chunk expansion remains okay
-        with driver.session() as session:
-            for s in seeds:
-                neighbors = session.run(
-                    """
-                    MATCH (c:Chunk {chunk_uid: $chunk_uid})
-                    OPTIONAL MATCH (c)-[:NEXT_CHUNK]->(n1:Chunk)
-                    OPTIONAL MATCH (c)<-[:NEXT_CHUNK]-(p1:Chunk)
-                    WITH collect(DISTINCT n1) + collect(DISTINCT p1) AS nearby
-                    UNWIND nearby AS n
-                    WITH n
-                    WHERE n IS NOT NULL
-                      AND ($source_filter IS NULL OR n.source = $source_filter)
-                    RETURN collect(n) AS nearby
-                    """,
-                    {
-                        "chunk_uid": s["chunk_uid"],
-                        "source_filter": source_filter,
-                    },
-                ).single()
-
-                if neighbors and neighbors["nearby"]:
-                    for n in neighbors["nearby"]:
-                        uid = n.get("chunk_uid")
-                        if uid and uid not in expanded:
-                            expanded[uid] = {
-                                "chunk_uid": uid,
-                                "text": n.get("text", ""),
-                                "source": n.get("source"),
-                                "title": s["title"],
-                                "url": s["url"],
-                                "article_id": n.get("article_id"),
-                                "chunk_id": n.get("chunk_id"),
-                                "score": s["score"] * 0.95,
-                                "expansion_kind": "adjacent_chunk",
-                            }
-
-        expanded_values = list(expanded.values())
-        
-        expanded_values = [
-            x for x in expanded_values
-            if x.get("expansion_kind") == "direct" or x.get("score", 0.0) >= 0.35
-        ]
-
-        expanded_list = sorted(
-            expanded_values,
-            key=lambda x: x.get("score", 0),
-            reverse=True,
+    else:
+        # General query — pure semantic search
+        sem_rows = retrieve_semantic_chunks(
+            driver, embed_model, query,
+            period_keys=period_keys,
+            date_start=date_start,
+            date_end=date_end,
+            source_filter=source_filter,
+            top_k=expanded_k,
         )
+        ranked = score_and_rank(sem_rows, query_vec, recency_half_life_days)
 
-        market_texts = fetch_market_text_for_target(
-            driver=driver,
-            target=target,
-            time_start=time_start,
-            time_end=time_end,
-        )
-
-        return expanded_list[:expanded_k], market_texts, target
-
-    # fallback path for non-single-entity queries
-    return [], [], target
+    return ranked[:expanded_k], target
 
 
-# Generation
+# ---------------------------------------------------------------------------
+# Context builder
+# ---------------------------------------------------------------------------
 
-SYSTEM_PROMPT_TEMPLATE = (
-    "You are a finance assistant. Answer the user's question using only the "
-    "provided context (news chunks and, when available, market data snippets). "
-    "The articles in your database span from {date_min} to {date_max}. "
-    "Use only the target entity and target ticker shown in the context. "
-    "Do not use market data for any other company. "
-    "Prioritize directly anchored news evidence over general background. "
-    "When market data is present in the context, describe the price trend "
-    "(direction, percentage change, high/low range) and connect it to relevant "
-    "news developments. "
-    "If the context is ambiguous, off-target, or insufficient, say so clearly. "
-    "Do not output <think> tags, hidden reasoning, or chain-of-thought. "
-    "Return only a concise final answer."
-)
-
-def build_structured_context(
+def build_context(
     query: str,
     target: QueryTarget,
-    retrieved_chunks: list[dict],
-    market_texts: list[str],
+    chunks: list[dict],
 ) -> str:
     lines = []
-    semantic_policy = get_semantic_policy_for_query(query)
-
-    lines.append(f"TARGET ENTITY: {target.display_name or 'unknown'}")
-    lines.append(f"TARGET CANONICAL: {target.entity_canonical or 'unknown'}")
-    lines.append(f"TARGET TICKER: {target.ticker or 'unknown'}")
-    lines.append(f"TARGET CONFIDENCE: {target.confidence:.2f}")
-    lines.append(f"QUERY INTENT: {semantic_policy['intent']}")
+    lines.append(f"TARGET ENTITY : {target.display_name or 'unknown'}")
+    lines.append(f"TARGET CANONICAL: {target.canonical_name or 'unknown'}")
+    lines.append(f"TARGET TICKER : {target.ticker or 'N/A'}")
+    lines.append(f"ENTITY TYPE   : {target.entity_type or 'unknown'}")
+    lines.append(f"CONFIDENCE    : {target.confidence:.2f}")
     lines.append("")
 
-    lines.append("PRIMARY NEWS EVIDENCE:")
-    if not retrieved_chunks:
-        lines.append("No directly anchored news chunks found.")
-    else:
-        for ch in retrieved_chunks:
-            url = ch.get("url", "NO URL")
-            title = ch.get("title", "NO TITLE")
-            lines.append(f"[TITLE: {title}]")
-            lines.append(f"[ARTICLE URL: {url}]")
+    if not chunks:
+        lines.append("No relevant chunks found.")
+        return "\n".join(lines)
 
-            expansion_kind = ch.get("expansion_kind", "unknown")
-            lines.append(f"[EVIDENCE TYPE: {expansion_kind}]")
-
-            if ch.get("relation_type"):
-                lines.append(f"[SEMANTIC RELATION: {ch['relation_type']}]")
-            if ch.get("relation_confidence") is not None:
-                try:
-                    lines.append(f"[RELATION CONFIDENCE: {float(ch['relation_confidence']):.2f}]")
-                except Exception:
-                    pass
-            if ch.get("relation_source_chunk_uid"):
-                lines.append(f"[RELATION SOURCE CHUNK: {ch['relation_source_chunk_uid']}]")
-            if ch.get("edge_weight") is not None:
-                lines.append(f"[COOCCUR WEIGHT: {ch['edge_weight']}]")
-
-            lines.append(ch.get("text", ""))
-            lines.append("")
-
-    lines.append("MARKET DATA:")
-    if not market_texts:
-        lines.append("No market data available.")
-    else:
-        for mt in market_texts:
-            lines.append(mt)
-            lines.append("")
+    lines.append("NEWS EVIDENCE:")
+    for ch in chunks:
+        lines.append(f"[SOURCE: {ch.get('source', '?')}]")
+        lines.append(f"[TITLE: {ch.get('title', '?')}]")
+        lines.append(f"[URL: {ch.get('url', '?')}]")
+        lines.append(f"[PERIOD: {ch.get('period_key', '?')}]")
+        if ch.get("expansion_kind"):
+            lines.append(f"[EXPANSION: {ch['expansion_kind']}]")
+        lines.append(ch.get("text", ""))
+        lines.append("")
 
     return "\n".join(lines)
 
-def generate_answer(query: str, context: str, pipe, system_prompt: str) -> str:
-    messages = [
-        {"role": "system", "content": system_prompt},
-        {
-            "role": "user",
-            "content": (
-                f"Context:\n{context}\n\n"
-                f"Question: {query}\n\n"
-            ),
-        },
-    ]
 
-    out = pipe(messages, max_new_tokens=512, do_sample=False)
-    generated = out[0]["generated_text"]
+# ---------------------------------------------------------------------------
+# Generation
+# ---------------------------------------------------------------------------
 
-    # Handle chat-template output
-    if isinstance(generated, list):
-        raw = generated[-1].get("content", "")
-    else:
-        raw = str(generated)
+SYSTEM_PROMPT_TEMPLATE = (
+    "You are a financial news assistant. "
+    "Answer ONLY using the exact facts stated in the provided news chunks below. "
+    "Do NOT add any information not explicitly present in the chunks. "
+    "Do NOT use your own knowledge about companies, valuations, or events. "
+    "If the chunks do not contain enough information to answer, say: "
+    "'The retrieved articles do not contain sufficient information to answer this.' "
+    "Your database covers articles from {date_min} to {date_max}. "
+    "Do not output <think> tags or chain-of-thought reasoning."
+)
 
+
+def generate_answer(query: str, context: str, gen_client: Any, system_prompt: str) -> str:
+    out = gen_client.messages.create(
+        model=GEN_MODEL_NAME,
+        max_tokens=GEN_MAX_TOKENS,
+        temperature=0,
+        system=system_prompt,
+        messages=[
+            {
+                "role": "user",
+                "content": f"Context:\n{context}\n\nQuestion: {query}",
+            }
+        ],
+    )
+    raw = anthropic_text(out)
     cleaned = strip_think_tags(raw).strip()
-
-    # Fallback: if think-tag stripping removed everything, keep raw text
-    if not cleaned:
-        cleaned = raw.strip()
-
-    # Final fallback so you never print a blank answer
-    if not cleaned:
-        cleaned = "I could not generate a grounded answer from the retrieved context."
-
-    return cleaned
+    return cleaned or "I could not generate a grounded answer from the retrieved context."
 
 
-TEST_QUERIES = [
-    # Exact company names
-    {"query": "What is the latest news on Google?", "entity": "google", "ticker": "GOOGL"},
-    {"query": "What is the latest news on Nvidia?", "entity": "nvidia", "ticker": "NVDA"},
-    {"query": "What is the latest news on Apple?", "entity": "apple", "ticker": "AAPL"},
-    {"query": "What is the latest news on Visa?", "entity": "visa", "ticker": "V"},
-    {"query": "What is the latest news on Microsoft?", "entity": "microsoft", "ticker": "MSFT"},
-    {"query": "What is the latest news on Amazon?", "entity": "amazon", "ticker": "AMZN"},
-    {"query": "What is the latest news on Meta?", "entity": "meta", "ticker": "META"},
-    {"query": "What is the latest news on Oracle?", "entity": "oracle", "ticker": "ORCL"},
-
-    # Official company names / aliases
-    {"query": "What is the latest news on Alphabet?", "entity": "alphabet", "ticker": "GOOGL"},
-    {"query": "What is the latest news on Meta Platforms?", "entity": "meta platforms", "ticker": "META"},
-    {"query": "What is the latest news on Berkshire Hathaway?", "entity": "berkshire hathaway", "ticker": None},
-    {"query": "What is the latest news on JPMorgan?", "entity": "jpmorgan", "ticker": "JPM"},
-
-    # Direct ticker queries
-    {"query": "What is the latest news on GOOGL?", "entity": "google", "ticker": "GOOGL"},
-    {"query": "What is the latest news on NVDA?", "entity": "nvidia", "ticker": "NVDA"},
-    {"query": "What is the latest news on AAPL?", "entity": "apple", "ticker": "AAPL"},
-    {"query": "What is the latest news on V?", "entity": "visa", "ticker": "V"},
-
-    # Time-filtered single-entity queries
-    {"query": "What happened to Google this week?", "entity": "google", "ticker": "GOOGL"},
-    {"query": "What happened to Nvidia this week?", "entity": "nvidia", "ticker": "NVDA"},
-    {"query": "What happened to Apple this month?", "entity": "apple", "ticker": "AAPL"},
-
-    # Source-filter flavored queries
-    {"query": "What is the latest CNBC news on Google?", "entity": "google", "ticker": "GOOGL"},
-    {"query": "What is the latest CNBC news on Nvidia?", "entity": "nvidia", "ticker": "NVDA"},
-
-    # Lower-coverage / harder names
-    {"query": "What is the latest news on AMD?", "entity": "amd", "ticker": "AMD"},
-    {"query": "What is the latest news on IBM?", "entity": "ibm", "ticker": "IBM"},
-    {"query": "What is the latest news on Costco?", "entity": "costco", "ticker": "COST"},
-]
-
-def normalize_name(x):
-    if not x:
-        return x
-    return x.replace(" inc", "").replace(" corporation", "").strip()
-
-def run_retrieval_eval(embed_model, driver, ticker_lookup):
-    results = []
-
-    for item in TEST_QUERIES:
-        query = item["query"]
-
-        target = resolve_query_target(query, ticker_lookup, driver)
-
-        chunks = retrieve_target_anchored_chunks(
-            driver=driver,
-            target=target,
-            source_filter=None,
-            time_start=None,
-            time_end=None,
-        )
-
-        market_texts = fetch_market_text_for_target(
-            driver=driver,
-            target=target,
-            time_start=None,
-            time_end=None,
-        )
-
-        result = {
-            "query": query,
-            "expected_entity": item["entity"],
-            "expected_ticker": item["ticker"],
-            "resolved_entity": target.entity_canonical,
-            "resolved_ticker": target.ticker,
-            "entity_ok": normalize_name(target.entity_canonical) == normalize_name(item["entity"]),
-            "ticker_ok": target.ticker == item["ticker"] if item["ticker"] is not None else True,
-            "anchored_chunk_count": len(chunks),
-            "market_count": len(market_texts),
-            "market_ok": (
-                len(market_texts) <= 1 and
-                (
-                    len(market_texts) == 0
-                    or item["ticker"] is None
-                    or target.ticker == item["ticker"]
-                )
-            ),
-        }
-
-        results.append(result)
-
-    return results
-
+# ---------------------------------------------------------------------------
 # Main loop
+# ---------------------------------------------------------------------------
 
 def main():
     print("Loading embedding model...")
     embed_model = SentenceTransformer(EMBED_MODEL_NAME)
 
     print("Loading generation model...")
-    pipe = pipeline("text-generation", model=GEN_MODEL_NAME)
+    if not ANTHROPIC_API_KEY:
+        raise RuntimeError("ANTHROPIC_API_KEY is not set in environment.")
+    try:
+        anthropic_module = importlib.import_module("anthropic")
+    except ImportError as exc:
+        raise RuntimeError("anthropic package is not installed. Run: pip install anthropic") from exc
+    Anthropic = getattr(anthropic_module, "Anthropic")
+    gen_client = Anthropic(api_key=ANTHROPIC_API_KEY)
 
     print("Connecting to Neo4j...")
     driver = GraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASSWORD))
     driver.verify_connectivity()
 
+    print("Loading ticker map...")
+    alias_to_ticker, ticker_to_canonical = load_ticker_company_map(TICKER_MAP_PATH)
+
+    # Get article date range for system prompt
     with driver.session() as session:
-        date_range = session.run(
+        row = session.run(
             """
             MATCH (a:Article)
-            WHERE a.published IS NOT NULL
-            RETURN min(a.published) AS earliest, max(a.published) AS latest
+            RETURN min(a.published_date) AS earliest,
+                   max(a.published_date) AS latest
             """
         ).single()
-    date_min = date_range["earliest"] or "unknown"
-    date_max = date_range["latest"] or "unknown"
-    system_prompt = SYSTEM_PROMPT_TEMPLATE.format(
-        date_min=date_min, date_max=date_max
-    )
+    date_min = str(row["earliest"]) if row and row["earliest"] else "unknown"
+    date_max = str(row["latest"]) if row and row["latest"] else "unknown"
+    system_prompt = SYSTEM_PROMPT_TEMPLATE.format(date_min=date_min, date_max=date_max)
 
-    ticker_lookup = load_ticker_company_map(Path("ticker_company_map.csv"))
-
-    # # Uncomment to run retrieval evaluation
-    # eval_results = run_retrieval_eval(embed_model, driver, ticker_lookup)
-    # print("\n=== RETRIEVAL EVAL RESULTS ===")
-    # for r in eval_results:
-    #     print(
-    #         f"Query: {r['query']}\n"
-    #         f"  expected_entity={r['expected_entity']} | resolved_entity={r['resolved_entity']} | entity_ok={r['entity_ok']}\n"
-    #         f"  expected_ticker={r['expected_ticker']} | resolved_ticker={r['resolved_ticker']} | ticker_ok={r['ticker_ok']}\n"
-    #         f"  anchored_chunk_count={r['anchored_chunk_count']} | market_count={r['market_count']} | market_ok={r['market_ok']}\n"
-    #     )
-    # print("=== END RETRIEVAL EVAL ===\n")
-
-    print(f"\n--- TG-RAG Chatbot ready ---")
+    print(f"\n--- T-GRAG Chatbot ready ---")
     print(f"Articles from {date_min} to {date_max}")
     print("Type your question (or 'quit' to exit).\n")
 
@@ -1304,73 +971,62 @@ def main():
         if source_filter:
             print(f"  [source filter: {source_filter}]")
 
-        # Step 1: Temporal Query Decomposition
-        sub_queries = decompose_query(query, pipe)
+        # Temporal decomposition
+        sub_queries = decompose_query(query, gen_client)
         if len(sub_queries) > 1:
             print(f"  [decomposed into {len(sub_queries)} sub-queries]")
 
-        # Step 2: Three-layer retrieval per sub-query
         all_contexts: list[str] = []
         all_urls: list[str] = []
+
         for sq in sub_queries:
-            ts_start = resolve_date(sq["time_start"])
-            ts_end = resolve_date(sq["time_end"])
+            date_start = sq.get("time_start")
+            date_end = sq.get("time_end")
 
-            if sq["time_start"] or sq["time_end"]:
-                print(
-                    f"  [time filter: "
-                    f"{sq.get('time_start', '?')} -> "
-                    f"{sq.get('time_end', '?')}]"
-                )
+            if date_start or date_end:
+                print(f"  [time filter: {date_start} → {date_end}]")
 
-            retrieved_chunks, market_texts, target = three_layer_retrieve(
+            chunks, target = retrieve(
                 query=sq["query"],
                 embed_model=embed_model,
                 driver=driver,
-                ticker_lookup=ticker_lookup,
-                top_k=4, # prev 3
-                expanded_k=8, #prev 6
-                recency_half_life_days=5,
+                alias_to_ticker=alias_to_ticker,
+                ticker_to_canonical=ticker_to_canonical,
+                top_k=TOP_K,
+                expanded_k=EXPANDED_K,
+                recency_half_life_days=RECENCY_HALF_LIFE_DAYS,
                 source_filter=source_filter,
-                time_start=ts_start,
-                time_end=ts_end,
+                date_start=date_start,
+                date_end=date_end,
             )
 
-            period_label = ""
-            if sq.get("time_start") and sq.get("time_end"):
-                period_label = f"[{sq['time_start']} to {sq['time_end']}] "
+            print(f"  [entity: {target.display_name or 'general'} | "
+                  f"canonical: {target.canonical_name or '—'} | "
+                  f"confidence: {target.confidence:.2f} | "
+                  f"chunks: {len(chunks)}]")
 
-            context = build_structured_context(
-                query=sq["query"],
-                target=target,
-                retrieved_chunks=retrieved_chunks,
-                market_texts=market_texts,
-            )
+            period_label = f"[{date_start} → {date_end}] " if (date_start or date_end) else ""
+            ctx = build_context(sq["query"], target, chunks)
+            all_contexts.append(period_label + ctx)
 
-            print(context)
-
-            all_contexts.append(period_label + context)
-
-            for x in retrieved_chunks:
-                url = x.get("url")
+            for ch in chunks:
+                url = ch.get("url")
                 if url and url not in all_urls:
                     all_urls.append(url)
 
-
-        # Step 3: Single generation from merged context
         if not all_contexts:
             print("Assistant: No relevant chunks found.\n")
             continue
 
-        context = "\n\n".join(all_contexts)
-        sources_block = "Sources used:\n" + "\n".join(f"- {u}" for u in all_urls)
-        print("\n--- CONTEXT BEING SENT TO LLM ---")
-        print(context)
-        print("--- END CONTEXT ---\n")
-        final = generate_answer(query, context, pipe, system_prompt)
+        merged_context = "\n\n---\n\n".join(all_contexts)
+        final = generate_answer(query, merged_context, gen_client, system_prompt)
+
         elapsed = time.perf_counter() - t0
         print(f"\nAssistant: {final}")
-        print(sources_block)
+        if all_urls:
+            print("\nSources:")
+            for url in all_urls:
+                print(f"  - {url}")
         print(f"  [{elapsed:.1f}s]\n")
 
     driver.close()

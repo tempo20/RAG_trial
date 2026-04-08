@@ -274,71 +274,176 @@ def load_extraction_model(model_name: str = NER_MODEL_NAME):
     )
 
 
-def load_ticker_company_map(path: Path = TICKER_MAP_PATH) -> dict[str, str]:
+_LEGAL_SUFFIXES = re.compile(
+    r"""[\s,\.]*\b(
+        incorporated|corporation|international|
+        holdings|technologies|technology|solutions|
+        pharmaceuticals|financial|services|group|
+        limited|enterprises|partners|associates|
+        inc|corp|ltd|llc|llp|plc|co|sa|ag|nv|bv|se
+    )\b[\s\.]*$""",
+    re.IGNORECASE | re.VERBOSE,
+)
+
+def _strip_legal(name: str) -> str:
+    """Iteratively strip trailing legal suffixes until stable."""
+    prev = None
+    current = name.strip().rstrip(".,")
+    while current != prev:
+        prev = current
+        current = _LEGAL_SUFFIXES.sub("", current).strip().rstrip(".,")
+    return current
+
+
+def _canonicalize(name: str) -> str:
     """
-    Load ticker -> canonical company name map.
-    CSV must have columns: ticker, company_name
-    Returns {company_name_lower: ticker}
+    Normalize entity name for KnowledgeNode identity.
+    Lowercases, collapses whitespace, and strips punctuation noise.
+    Does NOT strip legal suffixes — that's done separately so the
+    raw_name is preserved for display.
+    """
+    name = name.strip()
+    name = re.sub(r"[''`]", "", name)          # smart/straight apostrophes
+    name = re.sub(r"[^\w\s&\-]", " ", name)   # keep alphanumeric, &, hyphen
+    name = re.sub(r"\s+", " ", name)
+    return name.strip().lower()
+
+
+def load_ticker_company_map(path: Path = TICKER_MAP_PATH) -> tuple[dict[str, str], dict[str, str]]:
+    """
+    Load ticker_company_map.csv.
+
+    Returns two dicts:
+      alias_to_ticker  : {lowercased_alias_or_name: TICKER}
+                         built from company_name + all aliases column entries
+                         ALSO includes the legal-stripped form of each alias
+      ticker_to_canonical : {TICKER: canonical display name}
+                            the company_name column value
     """
     if not path.is_file():
-        return {}
+        return {}, {}
+
     import csv
-    mapping = {}
+    alias_to_ticker: dict[str, str] = {}
+    ticker_to_canonical: dict[str, str] = {}
+
     with open(path, newline="", encoding="utf-8") as f:
         reader = csv.DictReader(f)
         for row in reader:
             ticker = (row.get("ticker") or "").strip().upper()
             name = (row.get("company_name") or "").strip()
-            if ticker and name:
-                mapping[name.lower()] = ticker
-    return mapping
+            aliases_raw = (row.get("aliases") or "").strip()
+            if not ticker or not name:
+                continue
+
+            ticker_to_canonical[ticker] = name
+
+            # Build the full set of surface forms to map → ticker
+            surface_forms = [name] + [a.strip() for a in aliases_raw.split(";") if a.strip()]
+            for form in surface_forms:
+                key = _canonicalize(form)
+                alias_to_ticker[key] = ticker
+                # Also register the legal-stripped form
+                stripped_key = _canonicalize(_strip_legal(form))
+                if stripped_key and stripped_key != key:
+                    alias_to_ticker[stripped_key] = ticker
+
+    return alias_to_ticker, ticker_to_canonical
 
 
-def _canonicalize(name: str) -> str:
-    """Normalize entity name for KnowledgeNode identity."""
-    return re.sub(r'\s+', ' ', name.strip().lower())
-
-
-def _map_ticker(canonical: str, ticker_lookup: dict[str, str]) -> str | None:
-    """Exact then prefix match against ticker company map."""
-    direct = ticker_lookup.get(canonical)
-    if direct:
-        return direct
-    # Try longest prefix match
-    for company, ticker in ticker_lookup.items():
-        if canonical.startswith(company) or company.startswith(canonical):
+def _resolve_company(
+    canonical: str,
+    alias_to_ticker: dict[str, str],
+) -> str | None:
+    """
+    Try to resolve a canonicalized entity name to a ticker.
+    1. Exact match on canonical form
+    2. Exact match after stripping legal suffixes
+    Returns ticker string or None.
+    """
+    # Pass 1: exact
+    ticker = alias_to_ticker.get(canonical)
+    if ticker:
+        return ticker
+    # Pass 2: strip legal suffixes then exact
+    stripped = _canonicalize(_strip_legal(canonical))
+    if stripped and stripped != canonical:
+        ticker = alias_to_ticker.get(stripped)
+        if ticker:
             return ticker
     return None
 
 
-# Entity types we care about — filters NER output to relevant classes
-RELEVANT_ENTITY_TYPES = frozenset({
-    "ORG", "PER", "GPE", "LOC", "PRODUCT", "EVENT",
-    # BERT-NER uses B-/I- prefixes which aggregation_strategy handles,
-    # but some models emit bare type strings:
-    "B-ORG", "I-ORG", "B-PER", "I-PER",
+# ── Entity type scope ────────────────────────────────────────────────────────
+# bert-large-NER emits: PER, ORG, LOC, MISC
+# We want: companies (ORG), countries (LOC filtered), prominent people (PER filtered).
+# LOC and PER are post-filtered below — we can't do it at this level with BERT alone.
+RELEVANT_ENTITY_TYPES = frozenset({"ORG", "PER", "LOC"})
+
+# Countries — used to filter LOC down to only countries.
+# Sourced from ISO 3166-1 common names. Extend as needed.
+_COUNTRIES: frozenset[str] = frozenset({
+    "afghanistan", "albania", "algeria", "angola", "argentina", "australia",
+    "austria", "bangladesh", "belgium", "bolivia", "brazil", "cambodia",
+    "cameroon", "canada", "chile", "china", "colombia", "congo", "croatia",
+    "cuba", "czech republic", "czechia", "denmark", "ecuador", "egypt",
+    "ethiopia", "finland", "france", "germany", "ghana", "greece", "guatemala",
+    "hungary", "india", "indonesia", "iran", "iraq", "ireland", "israel",
+    "italy", "japan", "jordan", "kazakhstan", "kenya", "kuwait", "laos",
+    "lebanon", "libya", "malaysia", "mexico", "morocco", "mozambique",
+    "myanmar", "nepal", "netherlands", "new zealand", "nigeria", "north korea",
+    "norway", "pakistan", "panama", "peru", "philippines", "poland",
+    "portugal", "qatar", "romania", "russia", "saudi arabia", "senegal",
+    "serbia", "singapore", "somalia", "south africa", "south korea", "spain",
+    "sri lanka", "sudan", "sweden", "switzerland", "syria", "taiwan",
+    "tanzania", "thailand", "tunisia", "turkey", "ukraine", "united arab emirates",
+    "uae", "united kingdom", "uk", "united states", "usa", "us", "america",
+    "uruguay", "uzbekistan", "venezuela", "vietnam", "yemen", "zimbabwe",
+    # Common adjective/demonym forms that NER may emit
+    "american", "chinese", "european", "british", "russian", "japanese",
+    "german", "french", "indian", "korean", "iranian", "israeli",
 })
+
+# Minimum token count for a PER entity to be retained.
+# Filters out single-word names that are rarely prominent figures.
+_MIN_PER_TOKENS = 2
+
+
+def _is_country(canonical: str) -> bool:
+    return canonical in _COUNTRIES
+
+
+def _is_prominent_person(canonical: str) -> bool:
+    """
+    Heuristic: require at least two tokens (first + last name).
+    Single-word PER mentions are almost always noise or pronouns
+    that the NER model mis-tagged.
+    """
+    return len(canonical.split()) >= _MIN_PER_TOKENS
 
 
 def extract_entities_from_chunks(
     chunks: list[dict],
     pipe,
-    ticker_lookup: dict[str, str],
+    alias_to_ticker: dict[str, str],
+    ticker_to_canonical: dict[str, str],
 ) -> list[dict]:
     """
-    Run NER over chunk texts. Returns a list of entity mention dicts:
-    {
-        chunk_uid, canonical_name, entity_type, raw_name,
-        ticker (or None), period_key
-    }
+    Run NER over chunk texts. Returns entity mention dicts.
 
-    Deduplication: same canonical_name × chunk_uid → one mention.
+    Entity filtering:
+      ORG  → must resolve to a known ticker (companies only)
+      PER  → must have >= 2 tokens (prominent figures heuristic)
+      LOC  → must be a known country name
+
+    Canonical identity:
+      - ORG entities: canonical_name = ticker (e.g. "AAPL")
+                      so "Apple", "Apple Inc.", "Apple Inc" all merge
+      - PER/LOC:      canonical_name = lowercased normalized string
     """
-    texts = [c["text"] for c in chunks]
     mentions = []
     seen: set[tuple[str, str]] = set()  # (chunk_uid, canonical_name)
 
-    # Process in batches
     batch_size = 16
     for batch_start in range(0, len(chunks), batch_size):
         batch_chunks = chunks[batch_start: batch_start + batch_size]
@@ -353,8 +458,7 @@ def extract_entities_from_chunks(
         for chunk, ner_result in zip(batch_chunks, batch_results):
             for ent in ner_result:
                 etype = ent.get("entity_group") or ent.get("entity", "")
-                # Strip B-/I- prefixes if model didn't aggregate
-                etype = re.sub(r'^[BI]-', '', etype)
+                etype = re.sub(r"^[BI]-", "", etype)
                 if etype not in RELEVANT_ENTITY_TYPES:
                     continue
 
@@ -362,18 +466,44 @@ def extract_entities_from_chunks(
                 if not raw_name or len(raw_name) < 2:
                     continue
 
-                canonical = _canonicalize(raw_name)
-                key = (chunk["chunk_uid"], canonical)
+                base_canonical = _canonicalize(raw_name)
+
+                # ── Per-type filtering and identity resolution ──────────────
+                if etype == "ORG":
+                    ticker = _resolve_company(base_canonical, alias_to_ticker)
+                    if not ticker:
+                        continue  # not a known company — drop
+                    # Ticker IS the canonical identity: Apple Inc. == Apple == AAPL
+                    canonical_name = ticker
+                    display_name = ticker_to_canonical.get(ticker, raw_name)
+
+                elif etype == "PER":
+                    if not _is_prominent_person(base_canonical):
+                        continue
+                    canonical_name = base_canonical
+                    display_name = raw_name
+
+                elif etype == "LOC":
+                    if not _is_country(base_canonical):
+                        continue
+                    canonical_name = base_canonical
+                    display_name = raw_name
+
+                else:
+                    continue
+
+                key = (chunk["chunk_uid"], canonical_name)
                 if key in seen:
                     continue
                 seen.add(key)
 
                 mentions.append({
                     "chunk_uid":      chunk["chunk_uid"],
-                    "canonical_name": canonical,
+                    "canonical_name": canonical_name,
+                    "display_name":   display_name,
                     "raw_name":       raw_name,
                     "entity_type":    etype,
-                    "ticker":         _map_ticker(canonical, ticker_lookup),
+                    "ticker":         ticker if etype == "ORG" else None,
                     "period_key":     chunk["period_key"],
                     "article_id":     chunk["article_id"],
                 })
@@ -397,6 +527,7 @@ def build_knowledge_nodes(
             nodes[kn_uid] = {
                 "kn_uid":         kn_uid,
                 "canonical_name": m["canonical_name"],
+                "display_name":   m.get("display_name", m["canonical_name"]),
                 "entity_type":    m["entity_type"],
                 "period_key":     m["period_key"],
                 "ticker":         m["ticker"],
@@ -445,8 +576,8 @@ def build_knowledge_units(
 
         # Extract the sentence(s) in the chunk that mention the entity
         relevant_text = _extract_relevant_sentences(
-            chunk["text"], m["raw_name"], m["canonical_name"]
-        )
+    chunk["text"], m["raw_name"], m["canonical_name"], m.get("display_name")
+    )
         if not relevant_text:
             relevant_text = chunk["text"][:500]  # fallback: first 500 chars
 
@@ -477,17 +608,18 @@ def build_knowledge_units(
 
 
 def _extract_relevant_sentences(
-    text: str, raw_name: str, canonical_name: str
+    text: str, raw_name: str, canonical_name: str, display_name: str | None = None
 ) -> str:
-    """
-    Return sentences from text that mention the entity by name.
-    Matches case-insensitively on either the raw or canonical form.
-    """
     sentences = re.split(r'(?<=[.!?])\s+', text)
-    patterns = [re.escape(raw_name), re.escape(canonical_name)]
-    pattern = re.compile("|".join(patterns), re.IGNORECASE)
+    search_terms = [raw_name]
+    if display_name and display_name != raw_name:
+        search_terms.append(display_name)
+    # Only use canonical_name for text search if it looks like actual text, not a ticker
+    if canonical_name and not canonical_name.isupper():
+        search_terms.append(canonical_name)
+    pattern = re.compile("|".join(re.escape(t) for t in search_terms), re.IGNORECASE)
     matched = [s for s in sentences if pattern.search(s)]
-    return " ".join(matched[:3])  # cap at 3 sentences to keep knowledge atomic
+    return " ".join(matched[:3])
 
 
 def build_relations(
@@ -684,6 +816,7 @@ def populate_neo4j(
                 session.run(UPSERT_KNOWLEDGE_NODE, {
                     "kn_uid":         kn["kn_uid"],
                     "canonical_name": kn["canonical_name"],
+                    "display_name":   kn.get("display_name", kn["canonical_name"]),
                     "entity_type":    kn["entity_type"],
                     "period_key":     kn["period_key"],
                     "description":    kn["description"],
@@ -739,7 +872,7 @@ def populate_neo4j(
                     "rel_type":    r["rel_type"],
                     "period_key":  r["period_key"],
                     "description": r["description"],
-                    
+
                 })
 
         # SAME_ENTITY_AS cross-period chains 
@@ -792,10 +925,10 @@ def run_setup(
 
     if not skip_entities:
         pipe = load_extraction_model()
-        ticker_lookup = load_ticker_company_map()
+        alias_to_ticker, ticker_to_canonical = load_ticker_company_map()
 
         print("[setup] Extracting entities ...")
-        mentions = extract_entities_from_chunks(chunks, pipe, ticker_lookup)
+        mentions = extract_entities_from_chunks(chunks, pipe, alias_to_ticker, ticker_to_canonical)
         print(f"[setup] {len(mentions)} entity mentions extracted")
 
         knowledge_nodes = build_knowledge_nodes(mentions)
