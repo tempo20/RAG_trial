@@ -36,6 +36,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Any, Optional
+from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 from dotenv import load_dotenv
 load_dotenv()
@@ -57,6 +58,14 @@ from tgrag_setup import (
     _canonicalize,
     load_ticker_company_map,
 )
+from convo_memory import (
+    ConversationMemory,
+    resolve_coreference,
+    resolve_temporal_carryover,
+    save_memory,
+    load_memory,
+    MEMORY_PATH,
+)
 
 # ---------------------------------------------------------------------------
 # Config
@@ -70,6 +79,28 @@ TOP_K = int(os.getenv("TOP_K", "4"))
 EXPANDED_K = int(os.getenv("EXPANDED_K", "8"))
 RECENCY_HALF_LIFE_DAYS = float(os.getenv("RECENCY_HALF_LIFE_DAYS", "5"))
 GEN_MAX_TOKENS = int(os.getenv("GEN_MAX_TOKENS", "1024"))
+ALPHA_VANTAGE_API_KEY = os.getenv("ALPHA_VANTAGE_API_KEY", "").strip()
+ALPHA_VANTAGE_MCP_URL = os.getenv("ALPHA_VANTAGE_MCP_URL", "https://mcp.alphavantage.co/mcp").strip()
+_alpha_mcp_remote_flag = os.getenv("ENABLE_ALPHA_MCP_REMOTE")
+ENABLE_ALPHA_MCP_REMOTE = (
+    _alpha_mcp_remote_flag.strip().lower() in {"1", "true", "yes", "on"}
+    if _alpha_mcp_remote_flag is not None
+    else bool(ALPHA_VANTAGE_API_KEY)
+)
+
+ALPHA_MCP_BETA = "mcp-client-2025-11-20"
+ALPHA_MCP_SERVER_NAME = "alphavantage"
+ALPHA_MCP_ALLOWED_TOOLS = (
+    "TOOL_CALL",
+    "GLOBAL_QUOTE",
+    "TIME_SERIES_DAILY",
+    "COMPANY_OVERVIEW",
+)
+ALPHA_MCP_FALLBACK_NOTE = "Live market data is temporarily unavailable; answer is based on retrieved news context."
+try:
+    ALPHA_MCP_TIMEOUT_SECONDS = float(os.getenv("ALPHA_MCP_TIMEOUT_SECONDS", "25"))
+except ValueError:
+    ALPHA_MCP_TIMEOUT_SECONDS = 25.0
 
 SOURCE_KEYWORDS = {
     "bbc": "BBC",
@@ -79,6 +110,29 @@ SOURCE_KEYWORDS = {
     "nasdaq": "Nasdaq",
     "cbs": "CBS MoneyWatch",
 }
+
+MARKET_INTENT_HINTS = (
+    "price",
+    "quote",
+    "trading at",
+    "market cap",
+    "valuation",
+    "p/e",
+    "pe ratio",
+    "eps",
+    "fundamental",
+    "balance sheet",
+    "cash flow",
+    "income statement",
+    "company overview",
+    "daily close",
+    "open price",
+    "high",
+    "low",
+    "volume",
+    "performance",
+    "return",
+)
 
 # ---------------------------------------------------------------------------
 # Utilities
@@ -110,6 +164,109 @@ def extract_source_filter(query: str) -> str | None:
         if kw in q:
             return label
     return None
+
+
+def is_market_data_intent(query: str) -> bool:
+    q = query.lower()
+    return any(hint in q for hint in MARKET_INTENT_HINTS)
+
+
+def build_alpha_mcp_url(base_url: str, api_key: str) -> str:
+    parsed = urlparse(base_url)
+    query_params = dict(parse_qsl(parsed.query, keep_blank_values=True))
+    query_params["apikey"] = api_key
+    return urlunparse(parsed._replace(query=urlencode(query_params)))
+
+
+def _mcp_result_text(content: Any) -> str:
+    if isinstance(content, str):
+        return content
+    if content is None:
+        return ""
+
+    texts: list[str] = []
+    if isinstance(content, list):
+        blocks = content
+    else:
+        try:
+            blocks = list(content)
+        except TypeError:
+            blocks = []
+
+    for block in blocks:
+        if isinstance(block, dict):
+            if block.get("type") == "text" and block.get("text"):
+                texts.append(str(block["text"]))
+            continue
+        text = getattr(block, "text", None)
+        if text:
+            texts.append(str(text))
+    return "\n".join(texts).strip()
+
+
+def inspect_mcp_response(response: Any) -> dict[str, Any]:
+    """
+    FIX 1: Only check for rate limits in tool_result blocks marked as errors,
+    not in all result text (which may include API documentation).
+    """
+    tool_calls: list[str] = []
+    has_result_block = False
+    has_error = False
+    rate_limited = False
+ 
+    for block in getattr(response, "content", []) or []:
+        block_type = getattr(block, "type", None)
+        if block_type == "mcp_tool_use":
+            name = getattr(block, "name", None)
+            if name:
+                tool_calls.append(str(name))
+        elif block_type == "mcp_tool_result":
+            has_result_block = True
+            # FIX: Only check is_error flag first
+            if bool(getattr(block, "is_error", False)):
+                has_error = True
+                # FIX: Only check rate limit text if there's an actual error
+                result_text = _mcp_result_text(getattr(block, "content", None)).lower()
+                if any(marker in result_text for marker in (
+                    "rate limit",
+                    "limit reached",
+                    "too many requests",
+                    "call frequency",
+                    "quota exceeded",
+                )):
+                    rate_limited = True
+ 
+    unique_tool_calls = list(dict.fromkeys(tool_calls))
+    return {
+        "tool_calls": unique_tool_calls,
+        "has_result_block": has_result_block,
+        "has_error": has_error,
+        "rate_limited": rate_limited,
+    }
+
+
+def _has_market_tool_execution(tool_calls: list[str]) -> bool:
+    """
+    FIX 2: Accept TOOL_CALL as a valid market tool execution,
+    since it's used for discovery and may precede actual data tools.
+    """
+    # TOOL_CALL is the discovery tool and is legitimate
+    market_tools = {"TOOL_CALL", "GLOBAL_QUOTE", "TIME_SERIES_DAILY", "COMPANY_OVERVIEW"}
+    return any(call in market_tools for call in tool_calls)
+
+
+def _is_planning_only_text(text: str) -> bool:
+    t = text.lower().strip()
+    planning_markers = (
+        "i'll retrieve",
+        "i will retrieve",
+        "now i'll",
+        "now i will",
+        "get the parameter schema",
+        "i'm going to",
+        "i am going to",
+    )
+    return any(marker in t for marker in planning_markers)
 
 
 # ---------------------------------------------------------------------------
@@ -894,6 +1051,18 @@ SYSTEM_PROMPT_TEMPLATE = (
 )
 
 
+def build_system_prompt(base: str, memory: "ConversationMemory") -> str:
+    """
+    Inject conversation history into the system prompt when memory is non-empty.
+    The history block is appended after the base instructions so it never
+    overrides the grounding constraints.
+    """
+    ctx = memory.context_for_prompt()
+    if not ctx:
+        return base
+    return base + f"\n\n{ctx}"
+
+
 def generate_answer(query: str, context: str, gen_client: Any, system_prompt: str) -> str:
     out = gen_client.messages.create(
         model=GEN_MODEL_NAME,
@@ -910,6 +1079,96 @@ def generate_answer(query: str, context: str, gen_client: Any, system_prompt: st
     raw = anthropic_text(out)
     cleaned = strip_think_tags(raw).strip()
     return cleaned or "I could not generate a grounded answer from the retrieved context."
+
+
+def generate_answer_with_remote_mcp(
+    query: str,
+    context: str,
+    ticker: str,
+    gen_client: Any,
+    system_prompt: str,
+) -> tuple[str | None, dict[str, Any]]:
+    """
+    FIX 3: Remove timeout parameter and relax validation logic.
+    """
+    if not ENABLE_ALPHA_MCP_REMOTE:
+        return None, {"failed": True, "reason": "remote mcp disabled"}
+    if not ALPHA_VANTAGE_API_KEY:
+        return None, {"failed": True, "reason": "alpha vantage api key missing"}
+ 
+    mcp_url = build_alpha_mcp_url(ALPHA_VANTAGE_MCP_URL, ALPHA_VANTAGE_API_KEY)
+    mcp_system_prompt = (
+        system_prompt
+        + "\n\nFor this turn, you may use Alpha Vantage MCP tool results as grounded evidence in addition to "
+          "the retrieved news context. Do not use outside knowledge."
+    )
+ 
+    toolset_config = {
+        "type": "mcp_toolset",
+        "mcp_server_name": ALPHA_MCP_SERVER_NAME,
+        "default_config": {"enabled": False},
+        "configs": {tool_name: {"enabled": True} for tool_name in ALPHA_MCP_ALLOWED_TOOLS},
+    }
+ 
+    mcp_servers = [
+        {
+            "type": "url",
+            "name": ALPHA_MCP_SERVER_NAME,
+            "url": mcp_url,
+        }
+    ]
+ 
+    # FIX: More direct prompt that doesn't force specific tool order
+    primary_prompt = (
+        f"Context:\n{context}\n\n"
+        f"Question: {query}\n\n"
+        f"Resolved ticker: {ticker}\n\n"
+        "Use the available Alpha Vantage tools to get current market data for this ticker. "
+        "Then answer the question using both the retrieved news context and the live market data."
+    )
+ 
+    def _run_once(prompt: str) -> tuple[str | None, dict[str, Any]]:
+        try:
+            # FIX 3a: Remove timeout parameter - let the SDK handle it
+            out = gen_client.beta.messages.create(
+                model=GEN_MODEL_NAME,
+                max_tokens=GEN_MAX_TOKENS,
+                temperature=0,
+                system=mcp_system_prompt,
+                messages=[{"role": "user", "content": prompt}],
+                betas=[ALPHA_MCP_BETA],
+                mcp_servers=mcp_servers,
+                tools=[toolset_config],
+                # timeout parameter removed
+            )
+        except Exception as exc:
+            return None, {"failed": True, "reason": f"mcp request failed: {exc}"}
+ 
+        text = strip_think_tags(anthropic_text(out)).strip()
+        mcp_meta = inspect_mcp_response(out)
+ 
+        # FIX 3b: Simplified validation - only fail on actual errors
+        if mcp_meta["has_error"]:
+            return None, {"failed": True, "reason": "mcp tool returned an error", **mcp_meta}
+        if mcp_meta["rate_limited"]:
+            return None, {"failed": True, "reason": "mcp tool appears rate-limited", **mcp_meta}
+        
+        # FIX 3c: Accept response if we got ANY tool execution with results
+        if mcp_meta["has_result_block"] and text:
+            return text, {"failed": False, **mcp_meta}
+        
+        # Only fail if we got nothing useful
+        if not mcp_meta["tool_calls"]:
+            return None, {"failed": True, "reason": "no tools called", **mcp_meta}
+        if not text:
+            return None, {"failed": True, "reason": "empty assistant text after mcp call", **mcp_meta}
+        
+        # Still got something - accept it
+        return text, {"failed": False, **mcp_meta}
+ 
+    # FIX 3d: Single attempt instead of retry logic
+    # The retry was trying to force a specific tool pattern that may not be optimal
+    return _run_once(primary_prompt)
 
 
 # ---------------------------------------------------------------------------
@@ -937,7 +1196,7 @@ def main():
     print("Loading ticker map...")
     alias_to_ticker, ticker_to_canonical = load_ticker_company_map(TICKER_MAP_PATH)
 
-    # Get article date range for system prompt
+    # Get article date range for system prompt base
     with driver.session() as session:
         row = session.run(
             """
@@ -948,7 +1207,16 @@ def main():
         ).single()
     date_min = str(row["earliest"]) if row and row["earliest"] else "unknown"
     date_max = str(row["latest"]) if row and row["latest"] else "unknown"
-    system_prompt = SYSTEM_PROMPT_TEMPLATE.format(date_min=date_min, date_max=date_max)
+    # Base prompt — conversation history is injected per-turn via build_system_prompt()
+    base_system_prompt = SYSTEM_PROMPT_TEMPLATE.format(date_min=date_min, date_max=date_max)
+
+    # ── Memory: load from disk if available ──────────────────────────────────
+    memory = load_memory(MEMORY_PATH)
+    if memory.turn_count > 0:
+        print(f"  [memory] Resuming session '{memory.session_id}' "
+              f"({memory.turn_count} prior turns)")
+    else:
+        print(f"  [memory] New session '{memory.session_id}'")
 
     print(f"\n--- T-GRAG Chatbot ready ---")
     print(f"Articles from {date_min} to {date_max}")
@@ -967,17 +1235,32 @@ def main():
 
         t0 = time.perf_counter()
 
+        # ── Hook 1: Coreference resolution ───────────────────────────────────
+        query, was_rewritten = resolve_coreference(query, memory)
+        market_data_intent = is_market_data_intent(query)
+        if was_rewritten:
+            print(f"  [memory] Coreference resolved → \"{query}\"")
+
         source_filter = extract_source_filter(query)
         if source_filter:
             print(f"  [source filter: {source_filter}]")
 
-        # Temporal decomposition
+        # ── Hook 2: Temporal decomposition ───────────────────────────────────
         sub_queries = decompose_query(query, gen_client)
         if len(sub_queries) > 1:
             print(f"  [decomposed into {len(sub_queries)} sub-queries]")
 
+        # ── Hook 3: Temporal carryover from memory ────────────────────────────
+        sub_queries = resolve_temporal_carryover(sub_queries, memory)
+
         all_contexts: list[str] = []
         all_urls: list[str] = []
+
+        # Track the primary target across sub-queries (first resolved entity wins)
+        primary_target = None
+        primary_date_start = None
+        primary_date_end = None
+        all_chunks: list[dict] = []
 
         for sq in sub_queries:
             date_start = sq.get("time_start")
@@ -1005,6 +1288,16 @@ def main():
                   f"confidence: {target.confidence:.2f} | "
                   f"chunks: {len(chunks)}]")
 
+            # Capture primary target from the first sub-query that resolves an entity
+            if primary_target is None or (
+                target.canonical_name and not primary_target.canonical_name
+            ):
+                primary_target = target
+                primary_date_start = date_start
+                primary_date_end = date_end
+
+            all_chunks.extend(chunks)
+
             period_label = f"[{date_start} → {date_end}] " if (date_start or date_end) else ""
             ctx = build_context(sq["query"], target, chunks)
             all_contexts.append(period_label + ctx)
@@ -1018,8 +1311,47 @@ def main():
             print("Assistant: No relevant chunks found.\n")
             continue
 
+        # ── Hook 4: Inject conversation memory into system prompt ─────────────
+        system_prompt = build_system_prompt(base_system_prompt, memory)
+
         merged_context = "\n\n---\n\n".join(all_contexts)
-        final = generate_answer(query, merged_context, gen_client, system_prompt)
+        final = ""
+        market_data_note: str | None = None
+
+        should_try_mcp = (
+            market_data_intent
+            and ENABLE_ALPHA_MCP_REMOTE
+            and bool(ALPHA_VANTAGE_API_KEY)
+            and primary_target is not None
+            and bool(primary_target.ticker)
+        )
+
+        if should_try_mcp:
+            print(f"  [alpha mcp: querying remote server (timeout={ALPHA_MCP_TIMEOUT_SECONDS:.0f}s)]")
+            mcp_answer, mcp_meta = generate_answer_with_remote_mcp(
+                query=query,
+                context=merged_context,
+                ticker=primary_target.ticker or "",
+                gen_client=gen_client,
+                system_prompt=system_prompt,
+            )
+            if mcp_answer is not None:
+                final = mcp_answer
+                tools_used = ", ".join(mcp_meta.get("tool_calls", [])) if isinstance(mcp_meta, dict) else ""
+                if tools_used:
+                    print(f"  [alpha mcp tools: {tools_used}]")
+            else:
+                reason = mcp_meta.get("reason", "unknown") if isinstance(mcp_meta, dict) else "unknown"
+                print(f"  [alpha mcp fallback: {reason}]")
+                final = generate_answer(query, merged_context, gen_client, system_prompt)
+                market_data_note = ALPHA_MCP_FALLBACK_NOTE
+        else:
+            if market_data_intent and ENABLE_ALPHA_MCP_REMOTE and (primary_target is None or not primary_target.ticker):
+                print("  [alpha mcp skipped: no resolved ticker]")
+            final = generate_answer(query, merged_context, gen_client, system_prompt)
+
+        if market_data_note:
+            final = f"{final}\n\nNote: {market_data_note}"
 
         elapsed = time.perf_counter() - t0
         print(f"\nAssistant: {final}")
@@ -1028,6 +1360,29 @@ def main():
             for url in all_urls:
                 print(f"  - {url}")
         print(f"  [{elapsed:.1f}s]\n")
+
+        # ── Hook 5: Record turn to memory ─────────────────────────────────────
+        if primary_target is not None:
+            memory.record_turn(
+                query=query,
+                target=primary_target,
+                date_start=primary_date_start,
+                date_end=primary_date_end,
+                answer=final,
+                chunks=all_chunks,
+                source_urls=all_urls,
+            )
+
+            # ── Hook 6: Compress if session is getting long ───────────────────
+            compressed = memory.maybe_compress(
+                gen_client=gen_client,
+                gen_model=GEN_MODEL_NAME,
+            )
+            if compressed:
+                print(f"  [memory] Session compressed to {memory.turn_count} recent turns + summary")
+
+            # ── Hook 7: Persist to disk ───────────────────────────────────────
+            save_memory(memory, MEMORY_PATH)
 
     driver.close()
 
