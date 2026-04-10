@@ -1,7 +1,7 @@
 """
 update.py — Scrape + T-GRAG Graph Update (v2)
 
-Uses simple_scraper_v2 with async, trafilatura, and semantic deduplication.
+Uses simple_scraper_v2 with async + trafilatura extraction.
 
 Usage:
     python update.py                  # scrape v2 + incremental graph update
@@ -47,7 +47,7 @@ def main():
             print("Using simple_scraper.py (synchronous, BeautifulSoup)")
             from simple_scraper import main as scrape
         else:
-            print("Using simple_scraper_v2.py (async, trafilatura, semantic dedup)")
+            print("Using simple_scraper_v2.py (async, trafilatura)")
             from simple_scraper_v2 import main as scrape
         
         scrape()

@@ -5,7 +5,7 @@ Key features:
   1. Alpha Vantage NEWS_SENTIMENT link discovery (primary, direct HTTP)
   2. RSS discovery fallback when Alpha is unavailable or quota-limited
   3. Async article scraping with Trafilatura extraction
-  4. Semantic deduplication for traceable near-duplicates
+  4. Deduplication delegated to ingestion pipeline (single authority)
 
 Usage:
     python simple_scraper_v2.py
@@ -28,22 +28,12 @@ except ImportError:  # pragma: no cover - exercised in dependency-light envs
     aiohttp = None
 
 import feedparser
-try:
-    import numpy as np
-except ImportError:  # pragma: no cover - exercised in dependency-light envs
-    np = None
 import requests
 from dotenv import load_dotenv
 try:
     import trafilatura
 except ImportError:  # pragma: no cover - exercised in dependency-light envs
     trafilatura = None
-try:
-    from sklearn.feature_extraction.text import TfidfVectorizer
-    from sklearn.metrics.pairwise import cosine_similarity
-except ImportError:  # pragma: no cover - exercised in dependency-light envs
-    TfidfVectorizer = None
-    cosine_similarity = None
 from tqdm import tqdm
 
 load_dotenv()
@@ -85,7 +75,6 @@ ALPHA_SOURCE_FEED = "alpha://news_sentiment"
 OUTPUT_JSON = os.getenv("OUTPUT_JSON", "cnbc_articles.json")
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "20"))
 CONCURRENT_REQUESTS = int(os.getenv("CONCURRENT_REQUESTS", "10"))
-SEMANTIC_DEDUP_THRESHOLD = float(os.getenv("SEMANTIC_DEDUP_THRESHOLD", "0.85"))
 
 NEWS_PRIMARY_SOURCE = os.getenv("NEWS_PRIMARY_SOURCE", "alpha").strip().lower()
 NEWS_FALLBACK_SOURCE = os.getenv("NEWS_FALLBACK_SOURCE", "rss").strip().lower()
@@ -717,76 +706,6 @@ async def scrape_articles_async(
 
 
 # ---------------------------------------------------------------------------
-# Semantic deduplication
-# ---------------------------------------------------------------------------
-
-def semantic_deduplicate(
-    articles: list[dict[str, Any]],
-    threshold: float = SEMANTIC_DEDUP_THRESHOLD,
-) -> list[dict[str, Any]]:
-    if np is None or TfidfVectorizer is None or cosine_similarity is None:
-        print("[dedup] sklearn/numpy not installed, skipping semantic dedup")
-        return articles
-
-    valid = [a for a in articles if a.get("text") and a.get("status") == "ok"]
-    if len(valid) < 2:
-        return articles
-
-    print(f"[dedup] Running semantic dedup on {len(valid)} valid articles ...")
-
-    vectorizer = TfidfVectorizer(
-        max_features=1000,
-        ngram_range=(3, 5),
-        analyzer="char_wb",
-        min_df=2,
-    )
-
-    try:
-        tfidf_matrix = vectorizer.fit_transform([a["text"] for a in valid])
-    except ValueError:
-        print("[dedup] Not enough text for TF-IDF, skipping semantic dedup")
-        return articles
-
-    similarities = cosine_similarity(tfidf_matrix)
-
-    clusters: defaultdict[int, list[int]] = defaultdict(list)
-    seen: set[int] = set()
-
-    for i in range(len(valid)):
-        if i in seen:
-            continue
-
-        similar_indices = np.where(similarities[i] > threshold)[0]
-        if len(similar_indices) <= 1:
-            continue
-
-        cluster = [valid[j] for j in similar_indices]
-        cluster.sort(key=lambda a: (a.get("published") is None, a.get("published") or ""))
-
-        canonical = cluster[0]
-        for dup in cluster[1:]:
-            dup["status"] = "duplicate_of"
-            dup["duplicate_of_url"] = canonical["url"]
-            seen.add(valid.index(dup))
-
-        clusters[valid.index(canonical)] = [valid.index(d) for d in cluster[1:]]
-
-    if clusters:
-        total_dupes = sum(len(v) for v in clusters.values())
-        print(f"[dedup] Found {len(clusters)} duplicate clusters, {total_dupes} duplicates marked")
-        example_idx = next(iter(clusters))
-        example_canonical = valid[example_idx]
-        print("[dedup] Example cluster:")
-        print(f"  Canonical: {example_canonical['url'][:80]}")
-        for dup_idx in clusters[example_idx][:3]:
-            print(f"    Duplicate: {valid[dup_idx]['url'][:80]}")
-    else:
-        print("[dedup] No semantic duplicates found")
-
-    return articles
-
-
-# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -828,14 +747,7 @@ def main() -> None:
     for status, count in sorted(status_counts.items()):
         print(f"  {status}: {count}")
 
-    print("\nStep 3: Semantic deduplication ...")
-    articles = semantic_deduplicate(articles, threshold=SEMANTIC_DEDUP_THRESHOLD)
-
-    status_counts = defaultdict(int)
-    for article in articles:
-        status_counts[article["status"]] += 1
-
-    print("\nFinal status breakdown (post-dedup):")
+    print("\nFinal scrape status breakdown:")
     for status, count in sorted(status_counts.items()):
         print(f"  {status}: {count}")
 
@@ -848,7 +760,7 @@ def main() -> None:
             "scraper_version": "v2",
             "extraction_method": "trafilatura",
             "async_enabled": True,
-            "semantic_dedup_threshold": SEMANTIC_DEDUP_THRESHOLD,
+            "dedup_authority": "ingestion_pipeline",
             "scrape_duration_seconds": scrape_duration,
             "discovery": discovery_meta,
         },
@@ -859,7 +771,6 @@ def main() -> None:
 
     print(f"\nSaved {len(articles)} articles to {OUTPUT_JSON}")
     print(f"  OK: {status_counts.get('ok', 0)} articles ready for T-GRAG pipeline")
-    print(f"  Duplicates: {status_counts.get('duplicate_of', 0)} (marked, retained for audit)")
     print(f"  Empty text: {status_counts.get('empty_text', 0)}")
     print(f"  Errors: {status_counts.get('error', 0)}")
 

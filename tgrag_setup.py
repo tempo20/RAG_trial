@@ -7,7 +7,7 @@ Implements the Temporal Knowledge Graph Generator from the T-GRAG paper:
 
 Pipeline (mirrors Algorithm 1, Step 1):
   1. Load scraped articles from JSON
-  2. Filter duplicates (content hash) and already-ingested articles
+  2. Filter duplicates (content hash + MinHash near-dup) and already-ingested articles
   3. Assign each article a Period (temporal bucket)
   4. Split articles into Chunks (fixed text blocks d^{t_i}_j)
   5. For each Chunk, extract:
@@ -45,6 +45,11 @@ import torch
 from dotenv import load_dotenv
 from neo4j import GraphDatabase
 from sentence_transformers import SentenceTransformer
+try:
+    from datasketch import MinHash, MinHashLSH
+except ImportError:  # pragma: no cover - exercised in dependency-light envs
+    MinHash = None
+    MinHashLSH = None
 
 from graph_schema import (
     NEO4J_URI, NEO4J_USER, NEO4J_PASSWORD,
@@ -77,6 +82,12 @@ NER_MODEL_NAME = os.getenv("NER_MODEL_NAME", "dslim/bert-large-NER")
 
 # Minimum article quality gate
 MIN_ARTICLE_WORDS = int(os.getenv("MIN_ARTICLE_WORDS", "80"))
+
+# Deduplication (ingestion-authoritative)
+ENABLE_MINHASH_DEDUP = os.getenv("ENABLE_MINHASH_DEDUP", "1").strip().lower() in {"1", "true", "yes", "on"}
+MINHASH_LSH_THRESHOLD = float(os.getenv("MINHASH_LSH_THRESHOLD", "0.86"))
+MINHASH_NUM_PERM = int(os.getenv("MINHASH_NUM_PERM", "128"))
+MINHASH_SHINGLE_SIZE = int(os.getenv("MINHASH_SHINGLE_SIZE", "5"))
 
 # Neo4j write batch size
 NEO4J_BATCH_SIZE = int(os.getenv("NEO4J_BATCH_SIZE", "200"))
@@ -113,6 +124,34 @@ def _article_id(url: str, published: datetime | None) -> str:
     return hashlib.md5(raw.encode()).hexdigest()
 
 
+def _dedup_tokens(text: str) -> list[str]:
+    return re.findall(r"[A-Za-z0-9$_.-]+", text.lower())
+
+
+def _token_shingles(tokens: list[str], shingle_size: int) -> set[str]:
+    if not tokens:
+        return set()
+    shingle_size = max(1, shingle_size)
+    if len(tokens) < shingle_size:
+        return {" ".join(tokens)}
+    return {
+        " ".join(tokens[i:i + shingle_size])
+        for i in range(len(tokens) - shingle_size + 1)
+    }
+
+
+def _build_minhash(text: str, num_perm: int, shingle_size: int):
+    if MinHash is None:
+        return None
+    shingles = _token_shingles(_dedup_tokens(text), shingle_size)
+    if not shingles:
+        return None
+    sig = MinHash(num_perm=max(16, num_perm))
+    for sh in shingles:
+        sig.update(sh.encode("utf-8"))
+    return sig
+
+
 # Loading
 
 def load_articles(json_path: Path = ARTICLES_JSON) -> list[dict]:
@@ -129,10 +168,10 @@ def filter_articles(
     """
     Apply quality gates and skip already-ingested articles.
     Returns enriched article dicts with: article_id, published_dt,
-    period_key, content_hash.
+    period_key, content_hash. Exact dedup + near dedup are both applied here.
     """
     seen_hashes: set[str] = set()
-    out = []
+    candidates = []
 
     for art in articles:
         # Status gate
@@ -168,7 +207,7 @@ def filter_articles(
 
         period_key = period_key_for(published_dt, PERIOD_GRANULARITY)
 
-        out.append({
+        candidates.append({
             **art,
             "article_id":   article_id,
             "published_dt": published_dt,
@@ -176,6 +215,50 @@ def filter_articles(
             "content_hash": chash,
             "text":         text,
         })
+
+    if not candidates:
+        return []
+
+    if not ENABLE_MINHASH_DEDUP:
+        return candidates
+
+    if MinHashLSH is None:
+        print("[dedup] datasketch not installed; MinHash near-dedup disabled")
+        return candidates
+
+    # Deterministic canonical selection: keep oldest-then-URL article in each near-dup cluster.
+    ordered = sorted(
+        candidates,
+        key=lambda a: (a["published_dt"].isoformat(), a.get("url", "")),
+    )
+    lsh = MinHashLSH(
+        threshold=MINHASH_LSH_THRESHOLD,
+        num_perm=max(16, MINHASH_NUM_PERM),
+    )
+
+    out = []
+    dropped_near_dupes = 0
+
+    for i, art in enumerate(ordered):
+        signature = _build_minhash(
+            text=art["text"],
+            num_perm=MINHASH_NUM_PERM,
+            shingle_size=MINHASH_SHINGLE_SIZE,
+        )
+        # If a signature can't be built, keep article (never drop on uncertain dedup state).
+        if signature is None:
+            out.append(art)
+            continue
+
+        if lsh.query(signature):
+            dropped_near_dupes += 1
+            continue
+
+        lsh.insert(f"doc::{i}", signature)
+        out.append(art)
+
+    if dropped_near_dupes:
+        print(f"[dedup] MinHash near-duplicate filter dropped {dropped_near_dupes} articles")
 
     return out
 
