@@ -157,7 +157,7 @@ class ConversationMemory:
         self,
         *,
         query: str,
-        target,                         # QueryTarget — imported at call site
+        target,                         # QueryTarget or None
         date_start: Optional[str],
         date_end: Optional[str],
         answer: str,
@@ -166,17 +166,17 @@ class ConversationMemory:
     ) -> TurnMemory:
         """
         Build a TurnMemory from a completed retrieval+generation cycle and
-        append it to the turn list.
+        append it to the turn list. target may be None for general queries.
         """
         turn = TurnMemory(
             query=query,
             turn_index=self.turn_count,
             timestamp=datetime.now(timezone.utc).isoformat(),
-            canonical_name=target.canonical_name,
-            display_name=target.display_name,
-            ticker=target.ticker,
-            entity_type=target.entity_type,
-            entity_confidence=target.confidence,
+            canonical_name=target.canonical_name if target else None,
+            display_name=target.display_name if target else None,
+            ticker=target.ticker if target else None,
+            entity_type=target.entity_type if target else None,
+            entity_confidence=target.confidence if target else 0.0,
             date_start=date_start,
             date_end=date_end,
             answer_summary=answer[:300],
@@ -210,7 +210,7 @@ class ConversationMemory:
         for t in recent:
             entity_label = t.display_name or "general query"
             period_label = (
-                f"{t.date_start} → {t.date_end}"
+                f"{t.date_start} -> {t.date_end}"
                 if (t.date_start or t.date_end)
                 else "no time filter"
             )
@@ -357,13 +357,15 @@ def resolve_temporal_carryover(
 # ---------------------------------------------------------------------------
 
 def save_memory(memory: ConversationMemory, path: Path = MEMORY_PATH) -> None:
-    """Serialise memory to JSON. Safe to call after every turn."""
     payload = {
         "session_id": memory.session_id,
-        "summary":    memory.summary,
+        "summary": memory.summary,
         "turns": [asdict(t) for t in memory.turns],
     }
-    path.write_text(json.dumps(payload, indent=2, ensure_ascii=False))
+    path.write_text(
+        json.dumps(payload, indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
 
 
 def load_memory(path: Path = MEMORY_PATH) -> ConversationMemory:

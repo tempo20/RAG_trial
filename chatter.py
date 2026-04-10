@@ -1362,27 +1362,26 @@ def main():
         print(f"  [{elapsed:.1f}s]\n")
 
         # ── Hook 5: Record turn to memory ─────────────────────────────────────
-        if primary_target is not None:
-            memory.record_turn(
-                query=query,
-                target=primary_target,
-                date_start=primary_date_start,
-                date_end=primary_date_end,
-                answer=final,
-                chunks=all_chunks,
-                source_urls=all_urls,
-            )
+        memory.record_turn(
+            query=query,
+            target=primary_target,
+            date_start=primary_date_start,
+            date_end=primary_date_end,
+            answer=final,
+            chunks=all_chunks,
+            source_urls=all_urls,
+        )
 
-            # ── Hook 6: Compress if session is getting long ───────────────────
-            compressed = memory.maybe_compress(
-                gen_client=gen_client,
-                gen_model=GEN_MODEL_NAME,
-            )
-            if compressed:
-                print(f"  [memory] Session compressed to {memory.turn_count} recent turns + summary")
+        # ── Hook 6: Compress if session is getting long ───────────────────────
+        compressed = memory.maybe_compress(
+            gen_client=gen_client,
+            gen_model=GEN_MODEL_NAME,
+        )
+        if compressed:
+            print(f"  [memory] Session compressed to {memory.turn_count} recent turns + summary")
 
-            # ── Hook 7: Persist to disk ───────────────────────────────────────
-            save_memory(memory, MEMORY_PATH)
+        # ── Hook 7: Persist to disk ───────────────────────────────────────────
+        save_memory(memory, MEMORY_PATH)
 
     driver.close()
 

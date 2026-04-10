@@ -6,3 +6,4 @@ venv/
 __pycache__/
 *.parquet
 *.csv
+test_simple_scraper_v2.py
