@@ -1,5 +1,5 @@
 """
-tgrag_setup.py — T-GRAG Knowledge Graph Construction
+tgrag_setup.py - T-GRAG Knowledge Graph Construction
 
 Implements the Temporal Knowledge Graph Generator from the T-GRAG paper:
   "T-GRAG: A Dynamic GraphRAG Framework for Resolving Temporal Conflicts
@@ -11,7 +11,7 @@ Pipeline (mirrors Algorithm 1, Step 1):
   3. Assign each article a Period (temporal bucket)
   4. Split articles into Chunks (fixed text blocks d^{t_i}_j)
   5. For each Chunk, extract:
-       - KnowledgeNode per entity found  (e^{T_i}_i, one node per entity × period)
+       - KnowledgeNode per entity found  (e^{T_i}_i, one node per entity - period)
        - Knowledge units per entity      (k^{t_i}, atomic facts)
        - Typed RELATED_TO edges between entity KnowledgeNodes in same period
   6. Embed KnowledgeNodes (coarse, R_node) and Knowledge units (fine, R_knowledge)
@@ -23,7 +23,7 @@ Key design decisions vs. original implementation:
   - REMOVED: Entity/Instrument/MarketBar nodes (hist_to_db.py is retired)
   - REMOVED: :ALIASES_TICKER, :FOR_INSTRUMENT, :MENTIONS_INSTRUMENT edges
   - REMOVED: CO_OCCURS_CHUNK / CO_OCCURS_ARTICLE edges (replaced by typed RELATED_TO)
-  - NEW: KnowledgeNode is the temporal entity snapshot — one per (entity, period)
+  - NEW: KnowledgeNode is the temporal entity snapshot - one per (entity, period)
   - NEW: Knowledge nodes are atomic facts extracted per chunk per entity
   - NEW: period_key indexed on Chunk, KnowledgeNode for fast R_time subgraph pull
   - NEW: SAME_ENTITY_AS chain links the same entity across periods (temporal evolution)
@@ -37,6 +37,7 @@ import json
 import os
 import re
 import uuid
+import csv
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -50,6 +51,10 @@ try:
 except ImportError:  # pragma: no cover - exercised in dependency-light envs
     MinHash = None
     MinHashLSH = None
+try:
+    from rapidfuzz import fuzz
+except ImportError: 
+    fuzz = None
 
 from graph_schema import (
     NEO4J_URI, NEO4J_USER, NEO4J_PASSWORD,
@@ -68,17 +73,21 @@ load_dotenv()
 
 ARTICLES_JSON = Path(os.getenv("ARTICLES_JSON", "cnbc_articles.json"))
 TICKER_MAP_PATH = Path(os.getenv("TICKER_MAP_PATH", "ticker_company_map.csv"))
+FIN_ENTITY_MAP_PATH = Path(os.getenv("FIN_ENTITY_MAP_PATH", "financial_entity_map.csv"))
 
 # Chunking
 CHUNK_TOKEN_TARGET = int(os.getenv("CHUNK_TOKEN_TARGET", "400"))   # ~400 tokens per chunk
 CHUNK_OVERLAP_TOKENS = int(os.getenv("CHUNK_OVERLAP_TOKENS", "50"))
 
-# Embedding model — must match PERIOD_GRANULARITY vector index dim
+# Embedding model - must match PERIOD_GRANULARITY vector index dim
 EMBED_MODEL_NAME = os.getenv("EMBED_MODEL_NAME", "dunzhang/stella_en_1.5B_v5")
 EMBED_BATCH_SIZE = int(os.getenv("EMBED_BATCH_SIZE", "32"))
 
 # NER / extraction model
-NER_MODEL_NAME = os.getenv("NER_MODEL_NAME", "dslim/bert-large-NER")
+NER_MODEL_NAME = os.getenv("NER_MODEL_NAME", "dbmdz/bert-large-cased-finetuned-conll03-english")
+ENABLE_FIN_ENTITY_LINKER = os.getenv("ENABLE_FIN_ENTITY_LINKER", "1").strip().lower() in {"1", "true", "yes", "on"}
+FIN_LINK_FUZZY_THRESHOLD = float(os.getenv("FIN_LINK_FUZZY_THRESHOLD", "92"))
+FIN_LINK_ENABLE_FUZZY = os.getenv("FIN_LINK_ENABLE_FUZZY", "1").strip().lower() in {"1", "true", "yes", "on"}
 
 # Minimum article quality gate
 MIN_ARTICLE_WORDS = int(os.getenv("MIN_ARTICLE_WORDS", "80"))
@@ -382,7 +391,7 @@ def _canonicalize(name: str) -> str:
     """
     Normalize entity name for KnowledgeNode identity.
     Lowercases, collapses whitespace, and strips punctuation noise.
-    Does NOT strip legal suffixes — that's done separately so the
+    Does NOT strip legal suffixes - that's done separately so the
     raw_name is preserved for display.
     """
     name = name.strip()
@@ -421,7 +430,7 @@ def load_ticker_company_map(path: Path = TICKER_MAP_PATH) -> tuple[dict[str, str
 
             ticker_to_canonical[ticker] = name
 
-            # Build the full set of surface forms to map → ticker
+            # Build the full set of surface forms to map - ticker
             surface_forms = [name] + [a.strip() for a in aliases_raw.split(";") if a.strip()]
             for form in surface_forms:
                 key = _canonicalize(form)
@@ -434,36 +443,176 @@ def load_ticker_company_map(path: Path = TICKER_MAP_PATH) -> tuple[dict[str, str
     return alias_to_ticker, ticker_to_canonical
 
 
-def _resolve_company(
-    canonical: str,
-    alias_to_ticker: dict[str, str],
-) -> str | None:
+# -- Entity type scope --------------------------------------------------------
+# dbmdz CoNLL NER emits: PER, ORG, LOC, MISC.
+# ORG/MISC are linker-driven; PER/LOC keep heuristic fallback filters.
+RELEVANT_ENTITY_TYPES = frozenset({"ORG", "PER", "LOC", "MISC"})
+
+# Countries - used to filter LOC down to only countries.
+def _slugify(value: str) -> str:
+    value = _canonicalize(value)
+    value = re.sub(r"[^a-z0-9]+", "-", value)
+    value = re.sub(r"-+", "-", value).strip("-")
+    return value
+
+
+def _prefer_entity_match(existing: dict[str, Any], incoming: dict[str, Any]) -> bool:
+    """Prefer ticker-backed mappings, then longer display names."""
+    existing_ticker = bool(existing.get("ticker"))
+    incoming_ticker = bool(incoming.get("ticker"))
+    if incoming_ticker and not existing_ticker:
+        return True
+    if existing_ticker and not incoming_ticker:
+        return False
+    return len(str(incoming.get("display_name") or "")) > len(str(existing.get("display_name") or ""))
+
+
+def load_financial_entity_map(
+    fin_map_path: Path = FIN_ENTITY_MAP_PATH,
+    ticker_map_path: Path = TICKER_MAP_PATH,
+) -> dict[str, dict[str, Any]]:
     """
-    Try to resolve a canonicalized entity name to a ticker.
-    1. Exact match on canonical form
-    2. Exact match after stripping legal suffixes
-    Returns ticker string or None.
+    Build alias -> financial entity mapping from:
+      1) ticker_company_map.csv (listed companies)
+      2) financial_entity_map.csv (non-ticker institutions + optional ticker overrides)
     """
-    # Pass 1: exact
-    ticker = alias_to_ticker.get(canonical)
-    if ticker:
-        return ticker
-    # Pass 2: strip legal suffixes then exact
-    stripped = _canonicalize(_strip_legal(canonical))
-    if stripped and stripped != canonical:
-        ticker = alias_to_ticker.get(stripped)
-        if ticker:
-            return ticker
-    return None
+    alias_to_entity: dict[str, dict[str, Any]] = {}
+
+    def register_aliases(surface_forms: list[str], entity: dict[str, Any]) -> None:
+        for form in surface_forms:
+            key = _canonicalize(form)
+            if not key:
+                continue
+            existing = alias_to_entity.get(key)
+            if existing and not _prefer_entity_match(existing, entity):
+                continue
+            alias_to_entity[key] = dict(entity)
+
+            stripped = _canonicalize(_strip_legal(form))
+            if stripped and stripped != key:
+                existing = alias_to_entity.get(stripped)
+                if existing and not _prefer_entity_match(existing, entity):
+                    continue
+                alias_to_entity[stripped] = dict(entity)
+
+    alias_to_ticker, ticker_to_canonical = load_ticker_company_map(ticker_map_path)
+    for alias, ticker in alias_to_ticker.items():
+        entity = {
+            "canonical_name": ticker,
+            "display_name": ticker_to_canonical.get(ticker, ticker),
+            "entity_type": "ORG",
+            "ticker": ticker,
+        }
+        register_aliases([alias, ticker], entity)
+
+    if fin_map_path.is_file():
+        with open(fin_map_path, newline="", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                display_name = (row.get("display_name") or "").strip()
+                canonical_id = (row.get("canonical_id") or "").strip()
+                entity_type = (row.get("entity_type") or "ORG").strip().upper() or "ORG"
+                ticker = (row.get("ticker") or "").strip().upper() or None
+                aliases_raw = (row.get("aliases") or "").strip()
+                if not display_name and not canonical_id and not ticker:
+                    continue
+
+                canonical_name = ticker or _slugify(canonical_id or display_name)
+                if not canonical_name:
+                    continue
+
+                entity = {
+                    "canonical_name": canonical_name,
+                    "display_name": display_name or canonical_name,
+                    "entity_type": entity_type,
+                    "ticker": ticker,
+                }
+                surface_forms = [display_name, canonical_id]
+                if ticker:
+                    surface_forms.append(ticker)
+                if aliases_raw:
+                    surface_forms.extend(a.strip() for a in aliases_raw.split(";") if a.strip())
+                register_aliases(surface_forms, entity)
+
+    return alias_to_entity
 
 
-# ── Entity type scope ────────────────────────────────────────────────────────
-# bert-large-NER emits: PER, ORG, LOC, MISC
-# We want: companies (ORG), countries (LOC filtered), prominent people (PER filtered).
-# LOC and PER are post-filtered below — we can't do it at this level with BERT alone.
-RELEVANT_ENTITY_TYPES = frozenset({"ORG", "PER", "LOC"})
+def _fuzzy_link_candidate(
+    mention_canonical: str,
+    alias_to_entity: dict[str, dict[str, Any]],
+    threshold: float,
+    enable_fuzzy: bool = True,  # ADD THIS — caller controls, not global flag
+) -> tuple[str, dict[str, Any], float] | None:
+    if not mention_canonical or not enable_fuzzy or fuzz is None:
+        return None
 
-# Countries — used to filter LOC down to only countries.
+    first_char = mention_canonical[0]
+    candidates: list[tuple[str, dict[str, Any]]] = [
+        (alias, entity)
+        for alias, entity in alias_to_entity.items()
+        if alias and alias[0] == first_char and abs(len(alias) - len(mention_canonical)) <= max(4, len(mention_canonical) // 2)
+    ]
+    if not candidates:
+        return None
+
+    ranked: list[tuple[float, str, dict[str, Any]]] = []
+    for alias, entity in candidates:
+        score = float(fuzz.token_set_ratio(mention_canonical, alias))
+        ranked.append((score, alias, entity))
+    ranked.sort(key=lambda x: x[0], reverse=True)
+
+    best_score, _, best_entity = ranked[0]
+    second_score = ranked[1][0] if len(ranked) > 1 else -1.0
+    if best_score < threshold:
+        return None
+    if second_score >= threshold and (best_score - second_score) < 2.0:
+        return None
+    return ranked[0][1], best_entity, best_score
+
+
+def link_financial_entity(
+    mention_text: str,
+    ner_label: str,
+    alias_to_entity: dict[str, dict[str, Any]],
+    fuzzy_threshold: float = FIN_LINK_FUZZY_THRESHOLD,
+) -> dict[str, Any] | None:
+    """
+    Resolve a mention to a financial entity.
+    Deterministic stages:
+      1. Exact alias match
+      2. Constrained fuzzy match (if enabled and available)
+      3. Label-aware acceptance: fuzzy only for ORG/MISC mentions
+    """
+    mention_canonical = _canonicalize(mention_text)
+    if not mention_canonical:
+        return None
+
+    exact = alias_to_entity.get(mention_canonical)
+    if exact:
+        return {
+            **exact,
+            "link_method": "exact",
+            "link_score": 100.0,
+        }
+
+    if ner_label not in {"ORG", "MISC"}:
+        return None
+
+    fuzzy_match = _fuzzy_link_candidate(
+    mention_canonical, alias_to_entity, fuzzy_threshold,
+    enable_fuzzy=FIN_LINK_ENABLE_FUZZY,  # module default, but now overridable
+)
+    if not fuzzy_match:
+        return None
+
+    _, entity, score = fuzzy_match
+    return {
+        **entity,
+        "link_method": "fuzzy",
+        "link_score": score,
+    }
+
+
 # Sourced from ISO 3166-1 common names. Extend as needed.
 _COUNTRIES: frozenset[str] = frozenset({
     "afghanistan", "albania", "algeria", "angola", "argentina", "australia",
@@ -508,21 +657,11 @@ def _is_prominent_person(canonical: str) -> bool:
 def extract_entities_from_chunks(
     chunks: list[dict],
     pipe,
-    alias_to_ticker: dict[str, str],
-    ticker_to_canonical: dict[str, str],
+    alias_to_fin_entity: dict[str, dict[str, Any]],
 ) -> list[dict]:
     """
-    Run NER over chunk texts. Returns entity mention dicts.
-
-    Entity filtering:
-      ORG  → must resolve to a known ticker (companies only)
-      PER  → must have >= 2 tokens (prominent figures heuristic)
-      LOC  → must be a known country name
-
-    Canonical identity:
-      - ORG entities: canonical_name = ticker (e.g. "AAPL")
-                      so "Apple", "Apple Inc.", "Apple Inc" all merge
-      - PER/LOC:      canonical_name = lowercased normalized string
+    Run NER over chunk texts, then resolve ORG/MISC mentions via
+    a financial entity linker. PER/LOC fallback to heuristic filters.
     """
     mentions = []
     seen: set[tuple[str, str]] = set()  # (chunk_uid, canonical_name)
@@ -550,28 +689,32 @@ def extract_entities_from_chunks(
                     continue
 
                 base_canonical = _canonicalize(raw_name)
+                ticker: str | None = None
+                resolved_type = etype
+                link_method = "ner_heuristic"
+                link_score: float | None = None
 
-                # ── Per-type filtering and identity resolution ──────────────
-                if etype == "ORG":
-                    ticker = _resolve_company(base_canonical, alias_to_ticker)
-                    if not ticker:
-                        continue  # not a known company — drop
-                    # Ticker IS the canonical identity: Apple Inc. == Apple == AAPL
-                    canonical_name = ticker
-                    display_name = ticker_to_canonical.get(ticker, raw_name)
+                linked = None
+                if ENABLE_FIN_ENTITY_LINKER:
+                    linked = link_financial_entity(raw_name, etype, alias_to_fin_entity)
 
+                if linked:
+                    canonical_name = str(linked["canonical_name"])
+                    display_name = str(linked["display_name"])
+                    ticker = linked.get("ticker")
+                    resolved_type = str(linked.get("entity_type") or etype)
+                    link_method = str(linked.get("link_method") or "exact")
+                    link_score = float(linked.get("link_score")) if linked.get("link_score") is not None else None
                 elif etype == "PER":
                     if not _is_prominent_person(base_canonical):
                         continue
                     canonical_name = base_canonical
                     display_name = raw_name
-
                 elif etype == "LOC":
                     if not _is_country(base_canonical):
                         continue
                     canonical_name = base_canonical
                     display_name = raw_name
-
                 else:
                     continue
 
@@ -585,8 +728,10 @@ def extract_entities_from_chunks(
                     "canonical_name": canonical_name,
                     "display_name":   display_name,
                     "raw_name":       raw_name,
-                    "entity_type":    etype,
-                    "ticker":         ticker if etype == "ORG" else None,
+                    "entity_type":    resolved_type,
+                    "ticker":         ticker,
+                    "link_method":    link_method,
+                    "link_score":     link_score,
                     "period_key":     chunk["period_key"],
                     "article_id":     chunk["article_id"],
                 })
@@ -599,7 +744,7 @@ def build_knowledge_nodes(
 ) -> dict[str, dict]:
     """
     Aggregate mentions into KnowledgeNode specs.
-    One KnowledgeNode per (canonical_name × period_key).
+    One KnowledgeNode per (canonical_name - period_key).
 
     Returns {kn_uid: kn_dict}
     """
@@ -614,7 +759,7 @@ def build_knowledge_nodes(
                 "entity_type":    m["entity_type"],
                 "period_key":     m["period_key"],
                 "ticker":         m["ticker"],
-                # description is the aggregated knowledge text — built below
+                # description is the aggregated knowledge text - built below
                 "description":    "",
                 "source_chunks":  [],  # chunk_uids that mention this entity in this period
                 "embedding":      None,
@@ -1008,14 +1153,14 @@ def run_setup(
 
     if not skip_entities:
         pipe = load_extraction_model()
-        alias_to_ticker, ticker_to_canonical = load_ticker_company_map()
+        alias_to_fin_entity = load_financial_entity_map()
 
         print("[setup] Extracting entities ...")
-        mentions = extract_entities_from_chunks(chunks, pipe, alias_to_ticker, ticker_to_canonical)
+        mentions = extract_entities_from_chunks(chunks, pipe, alias_to_fin_entity)
         print(f"[setup] {len(mentions)} entity mentions extracted")
 
         knowledge_nodes = build_knowledge_nodes(mentions)
-        print(f"[setup] {len(knowledge_nodes)} KnowledgeNodes (entity × period)")
+        print(f"[setup] {len(knowledge_nodes)} KnowledgeNodes (entity - period)")
 
         knowledge_units = build_knowledge_units(chunks, mentions, knowledge_nodes)
         print(f"[setup] {len(knowledge_units)} Knowledge units")

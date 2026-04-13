@@ -1,0 +1,10 @@
+canonical_id,display_name,entity_type,ticker,aliases
+federal-reserve,Federal Reserve,ORG,,Fed;U.S. Federal Reserve;US Federal Reserve;Federal Reserve System;FOMC
+us-treasury,U.S. Treasury,ORG,,US Treasury;U.S. Treasury Department;Treasury Department;Treasury
+european-central-bank,European Central Bank,ORG,,ECB;Eurozone central bank
+bank-of-england,Bank of England,ORG,,BoE;BOE
+peoples-bank-of-china,People's Bank of China,ORG,,PBOC;PBoc;Peoples Bank of China
+international-monetary-fund,International Monetary Fund,ORG,,IMF
+world-bank,World Bank,ORG,,IBRD;International Bank for Reconstruction and Development
+opec,OPEC,ORG,,Organization of the Petroleum Exporting Countries;Oil cartel
+bank-for-international-settlements,Bank for International Settlements,ORG,,BIS

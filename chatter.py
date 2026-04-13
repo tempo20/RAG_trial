@@ -56,6 +56,7 @@ from graph_schema import (
 from tgrag_setup import (
     EMBED_MODEL_NAME,
     _canonicalize,
+    load_financial_entity_map,
     load_ticker_company_map,
 )
 from convo_memory import (
@@ -74,6 +75,7 @@ from convo_memory import (
 GEN_MODEL_NAME = os.getenv("GEN_MODEL_NAME")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
 TICKER_MAP_PATH = Path(os.getenv("TICKER_MAP_PATH", "ticker_company_map.csv"))
+FIN_ENTITY_MAP_PATH = Path(os.getenv("FIN_ENTITY_MAP_PATH", "financial_entity_map.csv"))
 
 TOP_K = int(os.getenv("TOP_K", "4"))
 EXPANDED_K = int(os.getenv("EXPANDED_K", "8"))
@@ -485,6 +487,7 @@ def resolve_query_target(
     alias_to_ticker: dict[str, str],
     ticker_to_canonical: dict[str, str],
     driver,
+    alias_to_fin_entity: dict[str, dict] | None = None,  # ADD
 ) -> QueryTarget:
     """
     Resolve the primary entity in a query to a QueryTarget.
@@ -526,6 +529,20 @@ def resolve_query_target(
             confidence=0.98,
             candidates=[(ticker, display)],
         )
+    # Tier 2b: financial entity map — catches Fed, ECB, FOMC, indices, etc.
+    if alias_to_fin_entity:
+        from tgrag_setup import link_financial_entity
+        linked = link_financial_entity(q_norm, "ORG", alias_to_fin_entity)
+        if linked:
+            return QueryTarget(
+                query_type=QUERY_TYPE_SINGLE,
+                canonical_name=linked["canonical_name"],
+                display_name=linked["display_name"],
+                ticker=linked.get("ticker"),
+                entity_type=linked["entity_type"],
+                confidence=0.97,
+                candidates=[(linked["canonical_name"], linked["display_name"])],
+            )
 
     # Tier 3: longest alias phrase found inside normalized query
     phrase_hits: list[tuple[str, str, str]] = []  # (alias, ticker, display)
@@ -547,6 +564,27 @@ def resolve_query_target(
             confidence=0.95,
             candidates=[(ticker, display)],
         )
+
+    if alias_to_fin_entity:
+        fin_phrase_hits: list[tuple[str, dict[str, Any]]] = []
+        for alias, entity in alias_to_fin_entity.items():
+            if re.search(r"\b" + re.escape(alias) + r"\b", q_norm):
+                fin_phrase_hits.append((alias, entity))
+
+        if fin_phrase_hits:
+            fin_phrase_hits.sort(key=lambda x: len(x[0]), reverse=True)
+            _, entity = fin_phrase_hits[0]
+            canonical_name = str(entity["canonical_name"])
+            display_name = str(entity.get("display_name") or canonical_name)
+            return QueryTarget(
+                query_type=QUERY_TYPE_SINGLE,
+                canonical_name=canonical_name,
+                display_name=display_name,
+                ticker=entity.get("ticker"),
+                entity_type=entity.get("entity_type") or "ORG",
+                confidence=0.94,
+                candidates=[(canonical_name, display_name)],
+            )
 
     # Tier 4: check if any KnowledgeNode canonical_name (PER/LOC) matches the query
     with driver.session() as session:
@@ -663,27 +701,28 @@ def retrieve_knowledge_chunks(
     top_k: int = 6,
 ) -> list[dict]:
     """
-    R_knowledge:
-      - Vector search over Knowledge.embedding for this entity's knowledge units
-      - Back-link via SOURCED_FROM_CHUNK to get source Chunks
-      - Return chunk dicts enriched with knowledge match score
+    R_knowledge — corrected to pre-filter by entity before vector ranking.
+
+    Fetches all Knowledge UIDs for the target entity, then scores them
+    in Python against the query vector. This avoids the global-index
+    post-filter problem where top_k ANN results may contain zero
+    matches for the target entity.
     """
     if not target.canonical_name:
         return []
 
-    qvec = embed_model.encode([query], normalize_embeddings=True)[0].tolist()
+    qvec = embed_model.encode([query], normalize_embeddings=True)[0]
 
     period_filter = "AND kn.period_key IN $period_keys" if period_keys else ""
     date_start_filter = "AND c.published_date >= date($date_start)" if date_start else ""
     date_end_filter = "AND c.published_date <= date($date_end)" if date_end else ""
     source_filter_clause = "AND a.source = $source_filter" if source_filter else ""
 
+    # Step 1: fetch all Knowledge nodes + their chunk back-links for this entity
     cypher = f"""
     MATCH (kn:KnowledgeNode {{canonical_name: $canonical_name}})
     {period_filter}
-    CALL db.index.vector.queryNodes('vector_knowledge', $top_k, $qvec)
-    YIELD node AS k, score
-    WHERE (kn)-[:HAS_KNOWLEDGE]->(k)
+    MATCH (kn)-[:HAS_KNOWLEDGE]->(k:Knowledge)
     MATCH (k)-[:SOURCED_FROM_CHUNK]->(c:Chunk)
     MATCH (a:Article {{article_id: c.article_id}})
     WHERE 1=1
@@ -691,6 +730,8 @@ def retrieve_knowledge_chunks(
       {date_end_filter}
       {source_filter_clause}
     RETURN DISTINCT
+        k.knowledge_uid  AS knowledge_uid,
+        k.embedding      AS k_embedding,
         c.chunk_uid      AS chunk_uid,
         c.text           AS text,
         c.embedding      AS embedding,
@@ -699,16 +740,10 @@ def retrieve_knowledge_chunks(
         a.title          AS title,
         a.url            AS url,
         a.source         AS source,
-        a.article_id     AS article_id,
-        max(score)       AS knowledge_score
-    ORDER BY knowledge_score DESC
-    LIMIT $top_k
+        a.article_id     AS article_id
+    LIMIT 500
     """
-    params: dict = {
-        "canonical_name": target.canonical_name,
-        "qvec": qvec,
-        "top_k": top_k,
-    }
+    params: dict = {"canonical_name": target.canonical_name}
     if period_keys:
         params["period_keys"] = period_keys
     if date_start:
@@ -719,7 +754,23 @@ def retrieve_knowledge_chunks(
         params["source_filter"] = source_filter
 
     with driver.session() as session:
-        return session.run(cypher, params).data()
+        rows = session.run(cypher, params).data()
+
+    if not rows:
+        return []
+
+    # Step 2: score knowledge embeddings in Python, keep top_k chunks
+    scored = []
+    seen_chunks: dict[str, dict] = {}  # chunk_uid -> best row
+    for r in rows:
+        k_emb = r.get("k_embedding")
+        score = cosine_sim(qvec, np.array(k_emb, dtype=np.float32)) if k_emb is not None else 0.4
+        chunk_uid = r["chunk_uid"]
+        if chunk_uid not in seen_chunks or score > seen_chunks[chunk_uid]["knowledge_score"]:
+            seen_chunks[chunk_uid] = {**r, "knowledge_score": score}
+
+    scored = sorted(seen_chunks.values(), key=lambda x: x["knowledge_score"], reverse=True)
+    return scored[:top_k]
 
 
 # ---------------------------------------------------------------------------
@@ -930,6 +981,7 @@ def retrieve(
     driver,
     alias_to_ticker: dict[str, str],
     ticker_to_canonical: dict[str, str],
+    alias_to_fin_entity: dict[str, dict[str, Any]],
     top_k: int = TOP_K,
     expanded_k: int = EXPANDED_K,
     recency_half_life_days: float = RECENCY_HALF_LIFE_DAYS,
@@ -941,7 +993,7 @@ def retrieve(
     Full three-layer retrieval for one sub-query.
     Returns (ranked_chunks, target).
     """
-    target = resolve_query_target(query, alias_to_ticker, ticker_to_canonical, driver)
+    target = resolve_query_target(query, alias_to_ticker, ticker_to_canonical, driver, alias_to_fin_entity=alias_to_fin_entity)
     period_keys = _date_range_to_period_keys(date_start, date_end) or None
 
     query_vec = embed_model.encode([query], normalize_embeddings=True)[0]
@@ -1195,6 +1247,7 @@ def main():
 
     print("Loading ticker map...")
     alias_to_ticker, ticker_to_canonical = load_ticker_company_map(TICKER_MAP_PATH)
+    alias_to_fin_entity = load_financial_entity_map(FIN_ENTITY_MAP_PATH, TICKER_MAP_PATH)
 
     # Get article date range for system prompt base
     with driver.session() as session:
@@ -1275,6 +1328,7 @@ def main():
                 driver=driver,
                 alias_to_ticker=alias_to_ticker,
                 ticker_to_canonical=ticker_to_canonical,
+                alias_to_fin_entity=alias_to_fin_entity,
                 top_k=TOP_K,
                 expanded_k=EXPANDED_K,
                 recency_half_life_days=RECENCY_HALF_LIFE_DAYS,

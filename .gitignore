@@ -6,4 +6,6 @@ venv/
 __pycache__/
 *.parquet
 *.csv
+!requirements.txt
+!financial_entity_map.csv
 test_simple_scraper_v2.py

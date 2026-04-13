@@ -25,6 +25,7 @@ Retrieval layers:
   R_node      : vector index on KnowledgeNode.embedding  (coarse)
   R_knowledge : vector index on Knowledge.embedding      (fine-grained)
 
+
 Period granularity choices (set PERIOD_GRANULARITY in env or config):
   "week"    -> "2024-W12"    high temporal resolution, more nodes
   "month"   -> "2024-11"     good default for daily news
