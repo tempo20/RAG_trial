@@ -345,6 +345,7 @@ CAUSAL_SYSTEM_PROMPT_TEMPLATE = (
     "State the directional impact on the USD, the single most important transmission mechanism, "
     "and your confidence level. "
     "Label claims from the retrieved news as [EVIDENCE] and claims from macro theory as [THEORY]. "
+    "At the end, give me a concise summary based on the evidence and theory. "
     "Do not fabricate prices or statistics not present in the chunks. "
     "If the chunks are insufficient, say so in one sentence. "
     "Your database covers articles from {date_min} to {date_max}."
