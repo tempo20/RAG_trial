@@ -72,6 +72,7 @@ from convo_memory import (
 # Config
 # ---------------------------------------------------------------------------
 
+DEBUG_SKIP_GENERATION = os.getenv("DEBUG_SKIP_GENERATION", "0").strip() in {"1", "true", "yes"}
 GEN_MODEL_NAME = os.getenv("GEN_MODEL_NAME")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
 TICKER_MAP_PATH = Path(os.getenv("TICKER_MAP_PATH", "ticker_company_map.csv"))
@@ -136,6 +137,24 @@ MARKET_INTENT_HINTS = (
     "return",
 )
 
+CAUSAL_ENTITY_TICKER_MAP = {
+    "usd":              "DX-Y.NYB",   # DXY
+    "us-dollar-index":  "DX-Y.NYB",
+    "wti-crude":        "CL=F",       # WTI futures
+    "brent-crude":      "BZ=F",       # Brent futures
+    "natural-gas":      "NG=F",
+    "gold":             "GC=F",
+    "silver":           "SI=F",
+    "copper":           "HG=F",
+    "sp500":            "SPY",
+    "us-10y-yield":     "^TNX",
+    "us-2y-yield":      "^IRX",
+    "vix":              "^VIX",
+    "eur-usd":          "EURUSD=X",
+    "usd-jpy":          "USDJPY=X",
+    "gbp-usd":          "GBPUSD=X",
+}
+
 # ---------------------------------------------------------------------------
 # Utilities
 # ---------------------------------------------------------------------------
@@ -172,6 +191,266 @@ def is_market_data_intent(query: str) -> bool:
     q = query.lower()
     return any(hint in q for hint in MARKET_INTENT_HINTS)
 
+CAUSAL_INTENT_HINTS = (
+    "affect", "impact", "effect", "influence", "cause", "drive",
+    "mean for", "implication", "what does", "how does", "why is",
+    "because of", "result of", "due to", "respond to", "reaction",
+    "stronger", "weaker", "rise", "fall", "rally", "selloff",
+)
+
+CAUSAL_USD_ANCHORS = (
+    "dollar", "usd", "currency", "forex", "fx", "rate", "fed",
+    "inflation", "oil", "gold", "macro", "economy", "trade",
+    "tariff", "yield", "bond", "iran", "china", "russia", "war",
+    "sanction", "geopolit",
+)
+
+def is_causal_analysis_intent(query: str) -> bool:
+    q = query.lower()
+    has_causal_verb = any(hint in q for hint in CAUSAL_INTENT_HINTS)
+    has_usd_anchor = any(anchor in q for anchor in CAUSAL_USD_ANCHORS)
+    return has_causal_verb and has_usd_anchor
+
+CAUSAL_SYSTEM_PROMPT_TEMPLATE = (
+    "You are a macro-financial analyst. "
+    "Answer in 3-5 sentences maximum. "
+    "State the directional impact on the USD, the single most important transmission mechanism, "
+    "and your confidence level. "
+    "Label claims from the retrieved news as [EVIDENCE] and claims from macro theory as [THEORY]. "
+    "Do not fabricate prices or statistics not present in the chunks. "
+    "If the chunks are insufficient, say so in one sentence. "
+    "Your database covers articles from {date_min} to {date_max}."
+)
+
+# ---------------------------------------------------------------------------
+# Causal chain decomposition + multi-hop retrieval
+# ---------------------------------------------------------------------------
+
+CHAIN_DECOMPOSE_PROMPT = """\
+You are a macro-financial analyst. Given a question about how an event affects the U.S. Dollar, \
+identify the transmission chain as a list of entity canonical names that must be retrieved to \
+answer it fully.
+
+Rules:
+- Return ONLY valid JSON, no markdown.
+- Use only these canonical names (or close matches): iran, russia, china, saudi-arabia, \
+israel, ukraine, middle-east, opec, wti-crude, brent-crude, natural-gas, gold, silver, \
+copper, federal-reserve, fed-funds-rate, us-cpi, us-pce, us-gdp, us-jobs, us-10y-yield, \
+us-2y-yield, yield-curve, usd, us-dollar-index, eur-usd, usd-jpy, sp500, vix, \
+us-trade-balance, tariffs, petrodollar, us-debt, us-treasury, us-sanctions
+- Include 2 to 4 hops. Always include the trigger entity and usd or us-dollar-index as the last hop.
+- Order hops from trigger → intermediate → usd.
+
+Output format:
+{{"hops": ["entity1", "entity2", "entity3"]}}
+
+Question: {query}"""
+
+
+def decompose_causal_chain(query: str, gen_client: Any) -> list[str]:
+    """
+    Ask the LLM to decompose a causal query into ordered transmission hops.
+    Returns a list of canonical entity names, e.g. ["iran", "wti-crude", "usd"].
+    Falls back to [query_entity, "usd"] on any failure.
+    """
+    prompt = CHAIN_DECOMPOSE_PROMPT.format(query=query)
+    try:
+        out = gen_client.messages.create(
+            model=GEN_MODEL_NAME,
+            max_tokens=128,
+            temperature=0,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        raw = strip_think_tags(anthropic_text(out))
+        match = re.search(r"\{.*\}", raw, re.DOTALL)
+        if match:
+            data = json.loads(match.group())
+            hops = data.get("hops", [])
+            if isinstance(hops, list) and len(hops) >= 2:
+                return [str(h).strip() for h in hops if h]
+    except Exception as exc:
+        print(f"  [causal chain] decomposition failed: {exc}")
+    return []
+
+
+def retrieve_causal_chain(
+    query: str,
+    hops: list[str],
+    embed_model: SentenceTransformer,
+    driver,
+    alias_to_ticker: dict[str, str],
+    ticker_to_canonical: dict[str, str],
+    alias_to_fin_entity: dict[str, dict[str, Any]],
+    source_filter: str | None = None,
+    date_start: str | None = None,
+    date_end: str | None = None,
+    chunks_per_hop: int = 4,
+) -> tuple[list[dict], QueryTarget]:
+    """
+    Run retrieve() for each hop entity and merge the results.
+    Returns (all_chunks, hop_labels_per_chunk, primary_target).
+
+    Each chunk gets an 'expansion_kind' label showing which hop it came from,
+    so build_context() surfaces this in the context passed to the LLM.
+    """
+    all_chunks: list[dict] = []
+    seen_uids: set[str] = set()
+    primary_target: QueryTarget | None = None
+
+    for hop in hops:
+        # Reuse the full retrieve() stack — entity resolution + 3-layer retrieval
+        hop_chunks, hop_target = retrieve(
+            query=hop,          # retrieve by canonical entity name, not the full query
+            embed_model=embed_model,
+            driver=driver,
+            alias_to_ticker=alias_to_ticker,
+            ticker_to_canonical=ticker_to_canonical,
+            alias_to_fin_entity=alias_to_fin_entity,
+            top_k=chunks_per_hop,
+            expanded_k=chunks_per_hop * 2,
+            recency_half_life_days=RECENCY_HALF_LIFE_DAYS,
+            source_filter=source_filter,
+            date_start=date_start,
+            date_end=date_end,
+        )
+
+        if primary_target is None and hop_target.canonical_name:
+            primary_target = hop_target
+
+        for ch in hop_chunks[:chunks_per_hop]:
+            uid = ch.get("chunk_uid")
+            if uid and uid not in seen_uids:
+                seen_uids.add(uid)
+                ch["expansion_kind"] = f"causal_hop:{hop}"
+                all_chunks.append(ch)
+
+        print(f"  [causal hop: {hop} | chunks: {len([c for c in hop_chunks[:chunks_per_hop] if c.get('chunk_uid') not in seen_uids - {c.get('chunk_uid')}])}]")
+
+    # Fall back to a general semantic search on the original query
+    # in case hop-entity retrieval returned nothing useful
+    if not all_chunks:
+        sem_chunks, sem_target = retrieve(
+            query=query,
+            embed_model=embed_model,
+            driver=driver,
+            alias_to_ticker=alias_to_ticker,
+            ticker_to_canonical=ticker_to_canonical,
+            alias_to_fin_entity=alias_to_fin_entity,
+            source_filter=source_filter,
+            date_start=date_start,
+            date_end=date_end,
+        )
+        all_chunks = sem_chunks
+        if primary_target is None:
+            primary_target = sem_target
+
+    return all_chunks, primary_target
+
+def fetch_market_context(
+    hops: list[str],
+    date_start: str | None,
+    date_end: str | None,
+    lookback_days: int = 7,
+) -> str:
+    """
+    For any hop in the causal chain that maps to a known market symbol,
+    fetch recent historical price data and format it as a context string
+    for injection into the generation prompt.
+
+    Returns an empty string if FMP_API_KEY is not set or financetoolkit
+    is not installed.
+    """
+    api_key = os.getenv("FMP_API_KEY", "").strip()
+    if not api_key:
+        return ""
+
+    try:
+        from financetoolkit import Toolkit
+    except ImportError:
+        return ""
+
+    # Resolve which hops have known symbols
+    symbols = []
+    symbol_to_hop = {}
+    for hop in hops:
+        symbol = CAUSAL_ENTITY_TICKER_MAP.get(hop)
+        if symbol and symbol not in symbols:
+            symbols.append(symbol)
+            symbol_to_hop[symbol] = hop
+
+    if not symbols:
+        return ""
+
+    # Determine date range — use query dates if present, else last N days
+    from datetime import datetime, timezone, timedelta
+    now = datetime.now(timezone.utc)
+    if date_end:
+        end_dt = date_end
+    else:
+        end_dt = now.strftime("%Y-%m-%d")
+    if date_start:
+        start_dt = date_start
+    else:
+        start_dt = (now - timedelta(days=lookback_days)).strftime("%Y-%m-%d")
+
+    lines = ["MARKET DATA (fetched via FMP):"]
+
+    try:
+        toolkit = Toolkit(symbols, api_key=api_key, start_date=start_dt, end_date=end_dt)
+        hist = toolkit.get_historical_data()
+        print(f"  [market debug] columns type: {type(hist.columns).__name__}, shape: {hist.shape}")
+        print(f"  [market debug] top-level keys: {hist.columns.get_level_values(0).unique().tolist()[:5]}")
+
+        # hist is a DataFrame with MultiIndex columns (symbol, OHLCV fields)
+        # or a flat DataFrame if single symbol — handle both
+        for symbol in symbols:
+            hop = symbol_to_hop[symbol]
+            try:
+                # financetoolkit MultiIndex: top level = field, second level = symbol
+                # e.g. hist["Close"]["CL=F"] or hist["Close"] if single symbol
+                if hasattr(hist.columns, "levels"):
+                    # MultiIndex — fields are top level, symbols are second level
+                    top_level = hist.columns.get_level_values(0).unique().tolist()
+                    if "Close" not in top_level:
+                        lines.append(f"[{hop.upper()}] No Close data for {symbol}")
+                        continue
+                    close_col = hist["Close"]
+                    if symbol not in close_col.columns:
+                        lines.append(f"[{hop.upper()}] Symbol {symbol} not in results")
+                        continue
+                    df = hist.xs(symbol, axis=1, level=1)
+                else:
+                    # Flat DataFrame — single symbol case
+                    df = hist
+
+                if df is None or df.empty:
+                    lines.append(f"[{hop.upper()}] No data returned for {symbol}")
+                    continue
+
+                lines.append(f"\n[{hop.upper()} | {symbol}]")
+                close_series = df["Close"].tail(5).dropna()
+
+                for i, (date_idx, close_val) in enumerate(close_series.items()):
+                    date_str = str(date_idx)[:10]
+                    close_fmt = f"{close_val:.2f}"
+
+                    if i == 0:
+                        ret_str = ""
+                    else:
+                        prev_val = close_series.iloc[i - 1]
+                        ret = (close_val - prev_val) / prev_val * 100
+                        ret_str = f"({ret:+.2f}%)"
+
+                    lines.append(f"  {date_str}: {close_fmt} {ret_str}".strip())
+
+            except Exception as e:
+                lines.append(f"[{hop.upper()}] Parse error: {e}")
+
+    except Exception as e:
+        print(f"  [market data] fetch failed: {e}")
+        return ""
+
+    return "\n".join(lines)
 
 def build_alpha_mcp_url(base_url: str, api_key: str) -> str:
     parsed = urlparse(base_url)
@@ -1262,6 +1541,7 @@ def main():
     date_max = str(row["latest"]) if row and row["latest"] else "unknown"
     # Base prompt — conversation history is injected per-turn via build_system_prompt()
     base_system_prompt = SYSTEM_PROMPT_TEMPLATE.format(date_min=date_min, date_max=date_max)
+    base_causal_system_prompt = CAUSAL_SYSTEM_PROMPT_TEMPLATE.format(date_min=date_min, date_max=date_max)
 
     # ── Memory: load from disk if available ──────────────────────────────────
     memory = load_memory(MEMORY_PATH)
@@ -1291,6 +1571,7 @@ def main():
         # ── Hook 1: Coreference resolution ───────────────────────────────────
         query, was_rewritten = resolve_coreference(query, memory)
         market_data_intent = is_market_data_intent(query)
+        causal_intent = is_causal_analysis_intent(query)
         if was_rewritten:
             print(f"  [memory] Coreference resolved → \"{query}\"")
 
@@ -1314,7 +1595,7 @@ def main():
         primary_date_start = None
         primary_date_end = None
         all_chunks: list[dict] = []
-
+        market_ctx = ""
         for sq in sub_queries:
             date_start = sq.get("time_start")
             date_end = sq.get("time_end")
@@ -1322,20 +1603,64 @@ def main():
             if date_start or date_end:
                 print(f"  [time filter: {date_start} → {date_end}]")
 
-            chunks, target = retrieve(
-                query=sq["query"],
-                embed_model=embed_model,
-                driver=driver,
-                alias_to_ticker=alias_to_ticker,
-                ticker_to_canonical=ticker_to_canonical,
-                alias_to_fin_entity=alias_to_fin_entity,
-                top_k=TOP_K,
-                expanded_k=EXPANDED_K,
-                recency_half_life_days=RECENCY_HALF_LIFE_DAYS,
-                source_filter=source_filter,
-                date_start=date_start,
-                date_end=date_end,
-            )
+            if causal_intent and not market_data_intent:
+                # ── Causal path: decompose into transmission hops, retrieve each ──
+                hops = decompose_causal_chain(sq["query"], gen_client)
+                if hops:
+                    print(f"  [causal chain: {' → '.join(hops)}]")
+                    chunks, target = retrieve_causal_chain(
+                        query=sq["query"],
+                        hops=hops,
+                        embed_model=embed_model,
+                        driver=driver,
+                        alias_to_ticker=alias_to_ticker,
+                        ticker_to_canonical=ticker_to_canonical,
+                        alias_to_fin_entity=alias_to_fin_entity,
+                        source_filter=source_filter,
+                        date_start=date_start,
+                        date_end=date_end,
+                    )
+                    market_ctx = fetch_market_context(
+                        hops=hops,
+                        date_start=date_start,
+                        date_end=date_end,
+                    )
+                    print(f"  [market data: {len([l for l in market_ctx.splitlines() if l.strip().startswith('20')])} price points fetched]")
+                    if market_ctx:
+                        print(f"  [market data fetched for causal hops]")
+                else:
+                    # Decomposition returned nothing — fall back to standard retrieve
+                    print("  [causal chain] decomposition empty, falling back to standard retrieve")
+                    chunks, target = retrieve(
+                        query=sq["query"],
+                        embed_model=embed_model,
+                        driver=driver,
+                        alias_to_ticker=alias_to_ticker,
+                        ticker_to_canonical=ticker_to_canonical,
+                        alias_to_fin_entity=alias_to_fin_entity,
+                        top_k=TOP_K,
+                        expanded_k=EXPANDED_K,
+                        recency_half_life_days=RECENCY_HALF_LIFE_DAYS,
+                        source_filter=source_filter,
+                        date_start=date_start,
+                        date_end=date_end,
+                    )
+            else:
+                # ── Standard path: unchanged ──────────────────────────────────────
+                chunks, target = retrieve(
+                    query=sq["query"],
+                    embed_model=embed_model,
+                    driver=driver,
+                    alias_to_ticker=alias_to_ticker,
+                    ticker_to_canonical=ticker_to_canonical,
+                    alias_to_fin_entity=alias_to_fin_entity,
+                    top_k=TOP_K,
+                    expanded_k=EXPANDED_K,
+                    recency_half_life_days=RECENCY_HALF_LIFE_DAYS,
+                    source_filter=source_filter,
+                    date_start=date_start,
+                    date_end=date_end,
+                )
 
             print(f"  [entity: {target.display_name or 'general'} | "
                   f"canonical: {target.canonical_name or '—'} | "
@@ -1354,6 +1679,8 @@ def main():
 
             period_label = f"[{date_start} → {date_end}] " if (date_start or date_end) else ""
             ctx = build_context(sq["query"], target, chunks)
+            if market_ctx:
+                ctx = ctx + "\n\n" + market_ctx
             all_contexts.append(period_label + ctx)
 
             for ch in chunks:
@@ -1368,7 +1695,18 @@ def main():
         # ── Hook 4: Inject conversation memory into system prompt ─────────────
         system_prompt = build_system_prompt(base_system_prompt, memory)
 
+        # Route causal queries to the analyst prompt instead of the factual prompt
+        if causal_intent and not market_data_intent:
+            causal_system_prompt = build_system_prompt(base_causal_system_prompt, memory)
+            print("  [causal analysis mode]")
+        else:
+            causal_system_prompt = None
+
         merged_context = "\n\n---\n\n".join(all_contexts)
+
+        if DEBUG_SKIP_GENERATION:
+            continue
+
         final = ""
         market_data_note: str | None = None
 
@@ -1397,12 +1735,15 @@ def main():
             else:
                 reason = mcp_meta.get("reason", "unknown") if isinstance(mcp_meta, dict) else "unknown"
                 print(f"  [alpha mcp fallback: {reason}]")
-                final = generate_answer(query, merged_context, gen_client, system_prompt)
+                # Use causal prompt on MCP fallback too if applicable
+                active_prompt = causal_system_prompt if causal_system_prompt else system_prompt
+                final = generate_answer(query, merged_context, gen_client, active_prompt)
                 market_data_note = ALPHA_MCP_FALLBACK_NOTE
         else:
             if market_data_intent and ENABLE_ALPHA_MCP_REMOTE and (primary_target is None or not primary_target.ticker):
                 print("  [alpha mcp skipped: no resolved ticker]")
-            final = generate_answer(query, merged_context, gen_client, system_prompt)
+            active_prompt = causal_system_prompt if causal_system_prompt else system_prompt
+            final = generate_answer(query, merged_context, gen_client, active_prompt)
 
         if market_data_note:
             final = f"{final}\n\nNote: {market_data_note}"
