@@ -63,6 +63,10 @@ RSS_SOURCES = [
         "name": "CBS MoneyWatch",
         "url": "https://www.cbsnews.com/latest/rss/moneywatch",
     },
+        {
+        "name": "OilPrice.com",
+        "url": "https://oilprice.com/rss/main",
+    },
 ]
 
 DEFAULT_ALPHA_TOPICS = (

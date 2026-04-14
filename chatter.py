@@ -138,21 +138,149 @@ MARKET_INTENT_HINTS = (
 )
 
 CAUSAL_ENTITY_TICKER_MAP = {
-    "usd":              "DX-Y.NYB",   # DXY
-    "us-dollar-index":  "DX-Y.NYB",
-    "wti-crude":        "CL=F",       # WTI futures
-    "brent-crude":      "BZ=F",       # Brent futures
-    "natural-gas":      "NG=F",
-    "gold":             "GC=F",
-    "silver":           "SI=F",
-    "copper":           "HG=F",
-    "sp500":            "SPY",
-    "us-10y-yield":     "^TNX",
-    "us-2y-yield":      "^IRX",
-    "vix":              "^VIX",
-    "eur-usd":          "EURUSD=X",
-    "usd-jpy":          "USDJPY=X",
-    "gbp-usd":          "GBPUSD=X",
+    # ------------------------------------------------------------------
+    # USD / broad dollar
+    # ------------------------------------------------------------------
+    "usd":                  "DX-Y.NYB",
+    "dollar":               "DX-Y.NYB",
+    "us-dollar":            "DX-Y.NYB",
+    "us-dollar-index":      "DX-Y.NYB",
+    "dxy":                  "DX-Y.NYB",
+
+    # ------------------------------------------------------------------
+    # U.S. rates / curve
+    # ------------------------------------------------------------------
+    "us-3m-yield":          "^IRX",      # 13-week bill proxy on Yahoo
+    "us-13w-yield":         "^IRX",
+    "us-5y-yield":          "^FVX",
+    "us-10y-yield":         "^TNX",
+    "us-30y-yield":         "^TYX",
+
+    # Better to derive curve spreads in code rather than map them directly
+    # e.g. yield_curve_10y_3m = ^TNX - ^IRX
+    #      yield_curve_10y_2y = external source or explicit chosen proxy
+    "yield-curve":          "^TNX",      # placeholder anchor only
+    "real-yields":          "TIP",       # practical proxy
+    "treasuries":           "TLT",       # long-duration Treasury proxy
+    "fed":                  "ZQ=F",      # Fed funds futures proxy
+    "fed-funds-rate":       "ZQ=F",
+
+    # ------------------------------------------------------------------
+    # Energy
+    # ------------------------------------------------------------------
+    "oil":                  "CL=F",
+    "crude":                "CL=F",
+    "wti":                  "CL=F",
+    "wti-crude":            "CL=F",
+    "brent":                "BZ=F",
+    "brent-crude":          "BZ=F",
+    "natural-gas":          "NG=F",
+    "gas":                  "NG=F",
+    "gasoline":             "RB=F",
+    "heating-oil":          "HO=F",
+
+    # ------------------------------------------------------------------
+    # Metals / commodities
+    # ------------------------------------------------------------------
+    "gold":                 "GC=F",
+    "silver":               "SI=F",
+    "copper":               "HG=F",
+    "platinum":             "PL=F",
+    "palladium":            "PA=F",
+
+    # ------------------------------------------------------------------
+    # U.S. equity / volatility / risk sentiment
+    # ------------------------------------------------------------------
+    "sp500":                "SPY",
+    "s&p500":               "SPY",
+    "s-and-p-500":          "SPY",
+    "nasdaq":               "QQQ",
+    "nasdaq-100":           "QQQ",
+    "dow":                  "DIA",
+    "russell-2000":         "IWM",
+    "small-caps":           "IWM",
+    "vix":                  "^VIX",
+    "equities":             "SPY",
+    "stocks":               "SPY",
+
+    # ------------------------------------------------------------------
+    # Credit / spread proxies
+    # ------------------------------------------------------------------
+    "credit":               "LQD",
+    "investment-grade":     "LQD",
+    "high-yield":           "HYG",
+    "junk-bonds":           "HYG",
+    "em-credit":            "EMB",
+
+    # ------------------------------------------------------------------
+    # Major FX
+    # ------------------------------------------------------------------
+    "eur-usd":              "EURUSD=X",
+    "euro-dollar":          "EURUSD=X",
+    "usd-jpy":              "USDJPY=X",
+    "dollar-yen":           "USDJPY=X",
+    "gbp-usd":              "GBPUSD=X",
+    "sterling-dollar":      "GBPUSD=X",
+    "aud-usd":              "AUDUSD=X",
+    "aussie-dollar":        "AUDUSD=X",
+    "nzd-usd":              "NZDUSD=X",
+    "kiwi-dollar":          "NZDUSD=X",
+    "usd-chf":              "USDCHF=X",
+    "dollar-franc":         "USDCHF=X",
+    "usd-cad":              "USDCAD=X",
+    "dollar-loonie":        "USDCAD=X",
+    "usd-cnh":              "CNH=X",
+    "offshore-yuan":        "CNH=X",
+    "usd-cny":              "CNY=X",
+    "dollar-yuan":          "CNH=X",     # prefer offshore for trading sensitivity
+    "eur-jpy":              "EURJPY=X",
+    "gbp-jpy":              "GBPJPY=X",
+    "aud-jpy":              "AUDJPY=X",
+
+    # ------------------------------------------------------------------
+    # Region / country / macro proxies
+    # ------------------------------------------------------------------
+    "eurozone":             "FXE",
+    "euro":                 "FXE",
+    "japan":                "EWJ",
+    "yen":                  "FXY",
+    "uk":                   "FXB",
+    "british-pound":        "FXB",
+    "china":                "FXI",
+    "hong-kong":            "EWH",
+    "emerging-markets":     "EEM",
+    "em":                   "EEM",
+
+    # ------------------------------------------------------------------
+    # Commodity equity proxies
+    # ------------------------------------------------------------------
+    "energy-stocks":        "XLE",
+    "oil-stocks":           "XLE",
+    "gold-miners":          "GDX",
+    "miners":               "XME",
+
+    # ------------------------------------------------------------------
+    # Inflation / commodity basket proxies
+    # ------------------------------------------------------------------
+    "inflation":            "TIP",
+    "commodities":          "DBC",
+    "commodity-index":      "DBC",
+
+    # ------------------------------------------------------------------
+    # Crypto / alternative risk sentiment
+    # ------------------------------------------------------------------
+    "bitcoin":              "BTC-USD",
+    "btc":                  "BTC-USD",
+    "ethereum":             "ETH-USD",
+    "eth":                  "ETH-USD",
+
+    # ------------------------------------------------------------------
+    # Safe havens / defensive
+    # ------------------------------------------------------------------
+    "safe-havens":          "GC=F",
+    "gold-proxy":           "GC=F",
+    "yen-safe-haven":       "USDJPY=X",
+    "treasury-safe-haven":  "TLT",
 }
 
 # ---------------------------------------------------------------------------
