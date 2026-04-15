@@ -1,4 +1,4 @@
-﻿"""
+"""
 simple_scraper_v2.py - Alpha-primary news scraper with RSS fallback.
 
 Key features:
@@ -9,15 +9,20 @@ Key features:
 
 Usage:
     python simple_scraper_v2.py
+    python simple_scraper_v2.py --reset-db
 """
 
 from __future__ import annotations
 
+import argparse
 import asyncio
+import hashlib
 import json
 import os
 import random
+import sqlite3
 import time
+import re
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -63,9 +68,24 @@ RSS_SOURCES = [
         "name": "CBS MoneyWatch",
         "url": "https://www.cbsnews.com/latest/rss/moneywatch",
     },
-        {
+    {
         "name": "OilPrice.com",
         "url": "https://oilprice.com/rss/main",
+    },
+    {
+        "name": "Federal Reserve", 
+        "url": "https://www.federalreserve.gov/feeds/press_all.xml",
+        "content_from_feed": True
+    },
+    {
+        "name": "BLS",
+        "url": "https://www.bls.gov/feed/bls_latest.rss",
+        "content_from_feed": True
+    },
+    {
+        "name": "US Treasury",
+        "url": "https://home.treasury.gov/system/files/press-releases/rss.xml",
+        "content_from_feed": True
     },
 ]
 
@@ -77,6 +97,7 @@ ALPHA_SENTIMENT_FUNCTION = "NEWS_SENTIMENT"
 ALPHA_SOURCE_FEED = "alpha://news_sentiment"
 
 OUTPUT_JSON = os.getenv("OUTPUT_JSON", "cnbc_articles.json")
+SQLITE_DB = os.getenv("SQLITE_DB", "my_database.db")
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "20"))
 CONCURRENT_REQUESTS = int(os.getenv("CONCURRENT_REQUESTS", "10"))
 
@@ -100,6 +121,8 @@ ARTICLE_FETCH_MAX_ATTEMPTS = int(os.getenv("ARTICLE_FETCH_MAX_ATTEMPTS", "3"))
 
 RETRYABLE_STATUS_CODES = frozenset({408, 429, 500, 502, 503, 504})
 
+MIN_ARTICLE_WORDS = int(os.getenv("MIN_ARTICLE_WORDS", "80"))
+MIN_FEED_WORDS = int(os.getenv("MIN_FEED_WORDS", "40"))
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -445,18 +468,38 @@ def discover_links_fallback_rss(
             errors.append(f"{source['name']}: parse_error: {resp.bozo_exception}")
             continue
 
+        content_from_feed = source.get("content_from_feed", False)
+
         for entry in resp.entries:
             link = (entry.get("link") or "").strip()
             if not link or link in seen:
                 continue
             seen.add(link)
             links.append(link)
+
+            # Extract body text directly from feed entry if flagged
+            feed_text = ""
+            if content_from_feed:
+                # Try content first, then summary, then description
+                if entry.get("content"):
+                    feed_text = entry["content"][0].get("value", "")
+                elif entry.get("summary"):
+                    feed_text = entry.get("summary", "")
+                elif entry.get("description"):
+                    feed_text = entry.get("description", "")
+                
+                # Strip HTML tags if present
+                feed_text = re.sub(r"<[^>]+>", " ", feed_text)
+                feed_text = re.sub(r"\s+", " ", feed_text).strip()
+
             source_by_url[link] = {
                 "name": source.get("name"),
                 "url": source.get("url"),
                 "provider": "rss",
                 "published": entry.get("published") or entry.get("updated"),
                 "title_hint": entry.get("title"),
+                # NEW: pre-extracted text bypasses page scraping
+                "feed_text": feed_text if content_from_feed else "",
             }
 
     meta: dict[str, Any] = {
@@ -685,6 +728,13 @@ async def scrape_articles_async(
                 "author": None,
                 "source_provider": source_meta.get("provider"),
             }
+            feed_text = source_meta.get("feed_text", "")
+            if feed_text and len(feed_text.split()) >= MIN_FEED_WORDS:
+                article["text"] = feed_text
+                article["title"] = source_meta.get("title_hint")
+                article["published"] = source_meta.get("published")
+                articles.append(article)
+                continue
 
             if error:
                 article["status"] = "error"
@@ -710,13 +760,132 @@ async def scrape_articles_async(
 
 
 # ---------------------------------------------------------------------------
+# SQLite helpers
+# ---------------------------------------------------------------------------
+
+def _article_id(url: str, published_str: str | None) -> str:
+    """Stable ID: MD5 of url::YYYY-MM-DD (matches tgrag_setup._article_id)."""
+    try:
+        dt = datetime.fromisoformat(published_str) if published_str else None
+    except ValueError:
+        dt = None
+    date_str = dt.strftime("%Y-%m-%d") if dt else "nodate"
+    return hashlib.md5(f"{url}::{date_str}".encode()).hexdigest()
+
+
+def _content_hash(text: str) -> str:
+    normalised = " ".join(text.lower().split())
+    return hashlib.sha256(normalised.encode()).hexdigest()[:16]
+
+
+def _is_boilerplate_article(text: str, url: str = "") -> bool:
+    """
+    Heuristic filter for navigation-heavy pages (menus, video index pages).
+    """
+    compact = " ".join((text or "").split())
+    if not compact:
+        return True
+
+    lowered = compact.lower()
+    words = lowered.split()
+    if len(words) < 80:
+        return True
+
+    nav_markers = (
+        "skip to content",
+        "home",
+        "news",
+        "sport",
+        "business",
+        "technology",
+        "health",
+        "culture",
+        "travel",
+        "audio",
+        "video",
+        "live",
+        "weather",
+        "newsletters",
+        "share",
+        "save",
+    )
+    marker_hits = sum(lowered.count(marker) for marker in nav_markers)
+    marker_density = marker_hits / len(words)
+    unique_ratio = len(set(words)) / len(words)
+    is_video_page = "/videos/" in (url or "").lower()
+
+    return marker_density > 0.08 or unique_ratio < 0.35 or is_video_page
+
+
+def _save_to_sqlite(articles: list[dict], scraped_at_utc: str) -> None:
+    """Persist ok articles to SQLite, silently skipping duplicates."""
+    from create_sql_db import create_database
+    create_database(SQLITE_DB)
+    conn = sqlite3.connect(SQLITE_DB)
+    inserted = skipped = skipped_boilerplate = 0
+    for art in articles:
+        if art.get("status") != "ok" or not art.get("text"):
+            continue
+        if _is_boilerplate_article(art["text"], art.get("url", "")):
+            skipped_boilerplate += 1
+            continue
+        aid = _article_id(art.get("url", ""), art.get("published"))
+        row = (
+            aid,
+            art.get("url", ""),
+            art.get("title"),
+            art.get("source"),
+            art.get("source_rss"),
+            art.get("published"),
+            scraped_at_utc,
+            _content_hash(art["text"]),
+            art.get("status"),
+            art["text"],
+        )
+        cur = conn.execute(
+            "INSERT OR IGNORE INTO articles "
+            "(article_id,url,title,source,source_rss,published_at,"
+            "scraped_at_utc,content_hash,status,raw_text) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?)",
+            row,
+        )
+        if cur.rowcount:
+            inserted += 1
+        else:
+            skipped += 1
+    conn.commit()
+    conn.close()
+    print(f"  SQLite ({SQLITE_DB}): {inserted} new articles saved, {skipped} duplicates skipped")
+    if skipped_boilerplate:
+        print(f"  SQLite ({SQLITE_DB}): {skipped_boilerplate} boilerplate/nav-heavy articles skipped")
+
+
+# ---------------------------------------------------------------------------
+# CLI helpers
+# ---------------------------------------------------------------------------
+
+def _reset_sqlite_db() -> None:
+    """Delete and recreate the SQLite DB file."""
+    from create_sql_db import create_database
+    if os.path.exists(SQLITE_DB):
+        os.remove(SQLITE_DB)
+        print(f"Reset SQLite database file: {SQLITE_DB}")
+    else:
+        print(f"SQLite database file not found, creating new DB: {SQLITE_DB}")
+    create_database(SQLITE_DB)
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
-def main() -> None:
+def main(reset_db: bool = False) -> None:
     print("=" * 60)
     print("News Scraper v2 (alpha-primary + rss fallback + async + trafilatura)")
     print("=" * 60)
+    if reset_db:
+        print("\n[sqlite] --reset-db enabled: wiping SQLite database before scrape.")
+        _reset_sqlite_db()
 
     print("\nStep 1: Discovering article links ...")
     with requests.Session() as discovery_session:
@@ -778,6 +947,15 @@ def main() -> None:
     print(f"  Empty text: {status_counts.get('empty_text', 0)}")
     print(f"  Errors: {status_counts.get('error', 0)}")
 
+    _save_to_sqlite(articles, payload["scraped_at_utc"])
+
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(description="News Scraper v2")
+    parser.add_argument(
+        "--reset-db",
+        action="store_true",
+        help="Delete and recreate SQLite DB before scraping and ingesting",
+    )
+    args = parser.parse_args()
+    main(reset_db=args.reset_db)
