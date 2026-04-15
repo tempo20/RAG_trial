@@ -9,3 +9,5 @@ __pycache__/
 !requirements.txt
 !financial_entity_map.csv
 test_simple_scraper_v2.py
+create_sql_db.py
+my_database.db

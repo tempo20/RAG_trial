@@ -636,6 +636,14 @@ _COUNTRIES: frozenset[str] = frozenset({
     "german", "french", "indian", "korean", "iranian", "israeli",
 })
 
+_MACRO_REGIONS: frozenset[str] = frozenset({
+    "middle east", "middle-east", "mena",
+    "gulf", "gulf states", "gulf region",
+    "eurozone", "euro area",
+    "emerging markets", "latin america",
+    "asia pacific", "southeast asia",
+})
+
 # Minimum token count for a PER entity to be retained.
 # Filters out single-word names that are rarely prominent figures.
 _MIN_PER_TOKENS = 2
@@ -644,6 +652,8 @@ _MIN_PER_TOKENS = 2
 def _is_country(canonical: str) -> bool:
     return canonical in _COUNTRIES
 
+def _is_known_location(canonical: str) -> bool:
+    return _is_country(canonical) or canonical in _MACRO_REGIONS
 
 def _is_prominent_person(canonical: str) -> bool:
     """
@@ -711,7 +721,7 @@ def extract_entities_from_chunks(
                     canonical_name = base_canonical
                     display_name = raw_name
                 elif etype == "LOC":
-                    if not _is_country(base_canonical):
+                    if not _is_known_location(base_canonical):
                         continue
                     canonical_name = base_canonical
                     display_name = raw_name

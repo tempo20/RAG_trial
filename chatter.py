@@ -427,21 +427,25 @@ def retrieve_causal_chain(
     primary_target: QueryTarget | None = None
 
     for hop in hops:
-        # Reuse the full retrieve() stack — entity resolution + 3-layer retrieval
-        hop_chunks, hop_target = retrieve(
-            query=hop,          # retrieve by canonical entity name, not the full query
-            embed_model=embed_model,
-            driver=driver,
-            alias_to_ticker=alias_to_ticker,
-            ticker_to_canonical=ticker_to_canonical,
-            alias_to_fin_entity=alias_to_fin_entity,
-            top_k=chunks_per_hop,
-            expanded_k=chunks_per_hop * 2,
-            recency_half_life_days=RECENCY_HALF_LIFE_DAYS,
-            source_filter=source_filter,
-            date_start=date_start,
-            date_end=date_end,
-        )
+        try:
+            # Reuse the full retrieve() stack — entity resolution + 3-layer retrieval
+            hop_chunks, hop_target = retrieve(
+                query=hop,          # retrieve by canonical entity name, not the full query
+                embed_model=embed_model,
+                driver=driver,
+                alias_to_ticker=alias_to_ticker,
+                ticker_to_canonical=ticker_to_canonical,
+                alias_to_fin_entity=alias_to_fin_entity,
+                top_k=chunks_per_hop,
+                expanded_k=chunks_per_hop * 2,
+                recency_half_life_days=RECENCY_HALF_LIFE_DAYS,
+                source_filter=source_filter,
+                date_start=date_start,
+                date_end=date_end,
+            )
+        except Exception as e:
+            print(f"  [causal hop: {hop} | retrieval failed: {e}")
+            continue
 
         if primary_target is None and hop_target.canonical_name:
             primary_target = hop_target
@@ -458,20 +462,34 @@ def retrieve_causal_chain(
     # Fall back to a general semantic search on the original query
     # in case hop-entity retrieval returned nothing useful
     if not all_chunks:
-        sem_chunks, sem_target = retrieve(
-            query=query,
-            embed_model=embed_model,
-            driver=driver,
-            alias_to_ticker=alias_to_ticker,
-            ticker_to_canonical=ticker_to_canonical,
-            alias_to_fin_entity=alias_to_fin_entity,
-            source_filter=source_filter,
-            date_start=date_start,
-            date_end=date_end,
+        try:
+            sem_chunks, sem_target = retrieve(
+                query=query,
+                embed_model=embed_model,
+                driver=driver,
+                alias_to_ticker=alias_to_ticker,
+                ticker_to_canonical=ticker_to_canonical,
+                alias_to_fin_entity=alias_to_fin_entity,
+                source_filter=source_filter,
+                date_start=date_start,
+                date_end=date_end,
+            )
+            all_chunks = sem_chunks
+            if primary_target is None:
+                primary_target = sem_target
+        except Exception as exc:
+            print(f"  [causal fallback failed: {exc}]")
+
+    # Safety net — always return a valid QueryTarget
+    if primary_target is None:
+        primary_target = QueryTarget(
+            query_type=QUERY_TYPE_GENERAL,
+            canonical_name=None,
+            display_name="general",
+            ticker=None,
+            entity_type=None,
+            confidence=0.0,
         )
-        all_chunks = sem_chunks
-        if primary_target is None:
-            primary_target = sem_target
 
     return all_chunks, primary_target
 
