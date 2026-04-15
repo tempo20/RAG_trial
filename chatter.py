@@ -1,27 +1,24 @@
 """
-chatter.py — T-GRAG Chatbot (schema-aligned rewrite)
+chatter.py - Hybrid QA chatbot using lean Neo4j plus SQLite evidence.
 
-Retrieval layers follow the actual Neo4j graph built by tgrag_setup.py:
+Neo4j stores structured macro objects only:
+  - Period
+  - Entity
+  - MacroEvent
+  - Asset
+  - Channel
 
-  Nodes : Article, Chunk, KnowledgeNode, Knowledge, Period
-  Edges : HAS_CHUNK, IN_PERIOD, SOURCED_FROM, HAS_KNOWLEDGE,
-          SOURCED_FROM_CHUNK, RELATED_TO, SAME_ENTITY_AS
+SQLite remains the source of truth for:
+  - articles
+  - chunks
+  - entity_mentions
+  - macro_events and related normalized tables
 
-Three-layer retrieval (per sub-query):
-  1. R_time      — filter Chunks by period_key derived from temporal expression
-  2. R_node      — find KnowledgeNodes matching the resolved entity (by canonical_name),
-                   then walk SOURCED_FROM back to Chunks
-  3. R_knowledge — vector search over Knowledge embeddings, back-link to Chunks via
-                   SOURCED_FROM_CHUNK, re-rank with recency decay
-
-Entity resolution:
-  - Ticker queries  → canonical_name IS the ticker (e.g. "AAPL")
-  - Company aliases → resolved via alias_to_ticker map, canonical = ticker
-  - Person / country → canonical_name is normalized string
-  All three cases are stored as KnowledgeNode.canonical_name in the DB.
-
-Usage:
-    python chatter.py
+Retrieval strategy:
+  1. Resolve entity / asset intent from the query
+  2. Use Neo4j for structured event reasoning
+  3. Use SQLite to materialize chunk/article evidence
+  4. Fall back to SQLite chunk embedding search for broad news QA
 """
 
 from __future__ import annotations
@@ -30,6 +27,7 @@ import json
 import importlib
 import os
 import re
+import sqlite3
 import time
 import warnings
 from dataclasses import dataclass, field
@@ -50,8 +48,12 @@ from neo4j import GraphDatabase
 from sentence_transformers import SentenceTransformer
 
 from graph_schema import (
-    NEO4J_URI, NEO4J_USER, NEO4J_PASSWORD,
-    PERIOD_GRANULARITY, period_key_for,
+    NEO4J_URI,
+    NEO4J_USER,
+    NEO4J_PASSWORD,
+    PERIOD_GRANULARITY,
+    asset_key,
+    period_key_for,
 )
 from tgrag_setup import (
     EMBED_MODEL_NAME,
@@ -77,10 +79,13 @@ GEN_MODEL_NAME = os.getenv("GEN_MODEL_NAME")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
 TICKER_MAP_PATH = Path(os.getenv("TICKER_MAP_PATH", "ticker_company_map.csv"))
 FIN_ENTITY_MAP_PATH = Path(os.getenv("FIN_ENTITY_MAP_PATH", "financial_entity_map.csv"))
+SQLITE_DB = os.getenv("SQLITE_DB", "my_database.db")
 
 TOP_K = int(os.getenv("TOP_K", "4"))
 EXPANDED_K = int(os.getenv("EXPANDED_K", "8"))
 RECENCY_HALF_LIFE_DAYS = float(os.getenv("RECENCY_HALF_LIFE_DAYS", "5"))
+SQLITE_SEMANTIC_CANDIDATE_LIMIT = int(os.getenv("SQLITE_SEMANTIC_CANDIDATE_LIMIT", "1500"))
+MACRO_EVENT_CANDIDATE_LIMIT = int(os.getenv("MACRO_EVENT_CANDIDATE_LIMIT", "600"))
 GEN_MAX_TOKENS = int(os.getenv("GEN_MAX_TOKENS", "1024"))
 ALPHA_VANTAGE_API_KEY = os.getenv("ALPHA_VANTAGE_API_KEY", "").strip()
 ALPHA_VANTAGE_MCP_URL = os.getenv("ALPHA_VANTAGE_MCP_URL", "https://mcp.alphavantage.co/mcp").strip()
@@ -307,6 +312,92 @@ def anthropic_text(response) -> str:
     return "".join(parts).strip()
 
 
+def connect_sqlite(db_path: str = SQLITE_DB) -> sqlite3.Connection:
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def _parse_embedding_json(raw: str | None) -> list[float] | None:
+    if not raw:
+        return None
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        return None
+    return parsed if isinstance(parsed, list) else None
+
+
+def _sqlite_row_to_chunk_dict(row: sqlite3.Row) -> dict:
+    return {
+        "chunk_uid": row["chunk_id"],
+        "text": row["text"],
+        "embedding": _parse_embedding_json(row["embedding_json"]),
+        "published_date": row["published_date"],
+        "period_key": row["period_key"],
+        "title": row["title"],
+        "url": row["url"],
+        "source": row["source"],
+        "article_id": row["article_id"],
+    }
+
+
+def _fetch_chunk_rows_by_ids(
+    conn: sqlite3.Connection,
+    chunk_ids: list[str],
+    date_start: str | None = None,
+    date_end: str | None = None,
+    source_filter: str | None = None,
+) -> dict[str, dict]:
+    if not chunk_ids:
+        return {}
+
+    placeholders = ",".join("?" for _ in chunk_ids)
+    sql = f"""
+        SELECT
+            c.chunk_id,
+            c.article_id,
+            c.text,
+            c.published_date,
+            c.period_key,
+            c.embedding_json,
+            a.title,
+            a.url,
+            a.source
+        FROM chunks c
+        JOIN articles a ON a.article_id = c.article_id
+        WHERE c.chunk_id IN ({placeholders})
+    """
+    params: list[Any] = list(chunk_ids)
+    if date_start:
+        sql += " AND c.published_date >= ?"
+        params.append(date_start)
+    if date_end:
+        sql += " AND c.published_date <= ?"
+        params.append(date_end)
+    if source_filter:
+        sql += " AND a.source = ?"
+        params.append(source_filter)
+
+    rows = conn.execute(sql, params).fetchall()
+    return {row["chunk_id"]: _sqlite_row_to_chunk_dict(row) for row in rows}
+
+
+def _get_sqlite_date_range(conn: sqlite3.Connection) -> tuple[str, str]:
+    row = conn.execute(
+        """
+        SELECT
+            MIN(COALESCE(chunks.published_date, substr(articles.published_at, 1, 10))) AS earliest,
+            MAX(COALESCE(chunks.published_date, substr(articles.published_at, 1, 10))) AS latest
+        FROM articles
+        LEFT JOIN chunks ON chunks.article_id = articles.article_id
+        """
+    ).fetchone()
+    date_min = str(row["earliest"]) if row and row["earliest"] else "unknown"
+    date_max = str(row["latest"]) if row and row["latest"] else "unknown"
+    return date_min, date_max
+
+
 def extract_source_filter(query: str) -> str | None:
     q = query.lower()
     for kw, label in SOURCE_KEYWORDS.items():
@@ -407,6 +498,7 @@ def retrieve_causal_chain(
     hops: list[str],
     embed_model: SentenceTransformer,
     driver,
+    sqlite_conn: sqlite3.Connection,
     alias_to_ticker: dict[str, str],
     ticker_to_canonical: dict[str, str],
     alias_to_fin_entity: dict[str, dict[str, Any]],
@@ -433,6 +525,7 @@ def retrieve_causal_chain(
                 query=hop,          # retrieve by canonical entity name, not the full query
                 embed_model=embed_model,
                 driver=driver,
+                sqlite_conn=sqlite_conn,
                 alias_to_ticker=alias_to_ticker,
                 ticker_to_canonical=ticker_to_canonical,
                 alias_to_fin_entity=alias_to_fin_entity,
@@ -467,6 +560,7 @@ def retrieve_causal_chain(
                 query=query,
                 embed_model=embed_model,
                 driver=driver,
+                sqlite_conn=sqlite_conn,
                 alias_to_ticker=alias_to_ticker,
                 ticker_to_canonical=ticker_to_canonical,
                 alias_to_fin_entity=alias_to_fin_entity,
@@ -886,7 +980,7 @@ QUERY_TYPE_GENERAL = "general"
 @dataclass
 class QueryTarget:
     query_type: str
-    canonical_name: Optional[str]   # what's stored in KnowledgeNode.canonical_name
+    canonical_name: Optional[str]   # stable entity id from SQLite / Neo4j
     display_name: Optional[str]     # human-readable, for context header
     ticker: Optional[str]           # non-None only for ORG entities
     entity_type: Optional[str]      # ORG / PER / LOC
@@ -908,11 +1002,91 @@ def _normalize_for_matching(query: str) -> str:
     return re.sub(r"\s+", " ", q).strip()
 
 
+def _lookup_entity_in_sqlite(conn: sqlite3.Connection, q_norm: str) -> dict | None:
+    rows = conn.execute(
+        """
+        SELECT
+            canonical_entity_id,
+            display_name,
+            entity_type,
+            ticker,
+            MAX(COALESCE(confidence, 0)) AS confidence
+        FROM entity_mentions
+        WHERE canonical_entity_id = ?
+           OR lower(display_name) = lower(?)
+        GROUP BY canonical_entity_id, display_name, entity_type, ticker
+        ORDER BY confidence DESC, canonical_entity_id
+        LIMIT 1
+        """,
+        (q_norm, q_norm),
+    ).fetchall()
+    return dict(rows[0]) if rows else None
+
+
+def _resolve_asset_target(
+    conn: sqlite3.Connection,
+    query: str,
+    target: QueryTarget | None = None,
+) -> dict | None:
+    if target and target.ticker:
+        return {
+            "asset_key": asset_key("ticker", target.ticker),
+            "target_type": "ticker",
+            "target_id": target.ticker,
+            "display_name": target.ticker,
+        }
+
+    q_norm = _normalize_for_matching(query)
+    exact = conn.execute(
+        """
+        SELECT DISTINCT target_type, target_id
+        FROM asset_impacts
+        WHERE lower(target_id) = lower(?)
+        LIMIT 1
+        """,
+        (q_norm,),
+    ).fetchone()
+    if exact:
+        return {
+            "asset_key": asset_key(exact["target_type"], exact["target_id"]),
+            "target_type": exact["target_type"],
+            "target_id": exact["target_id"],
+            "display_name": exact["target_id"],
+        }
+
+    rows = conn.execute(
+        """
+        SELECT DISTINCT target_type, target_id
+        FROM asset_impacts
+        WHERE target_id IS NOT NULL
+          AND target_id <> ''
+        """
+    ).fetchall()
+    phrase_hits: list[tuple[str, sqlite3.Row]] = []
+    for row in rows:
+        target_norm = _canonicalize(str(row["target_id"]))
+        if target_norm and re.search(r"\b" + re.escape(target_norm) + r"\b", q_norm):
+            phrase_hits.append((target_norm, row))
+
+    if not phrase_hits:
+        return None
+
+    phrase_hits.sort(key=lambda item: len(item[0]), reverse=True)
+    match = phrase_hits[0][1]
+    return {
+        "asset_key": asset_key(match["target_type"], match["target_id"]),
+        "target_type": match["target_type"],
+        "target_id": match["target_id"],
+        "display_name": match["target_id"],
+    }
+
+
 def resolve_query_target(
     query: str,
     alias_to_ticker: dict[str, str],
     ticker_to_canonical: dict[str, str],
     driver,
+    sqlite_conn: sqlite3.Connection | None = None,
     alias_to_fin_entity: dict[str, dict] | None = None,  # ADD
 ) -> QueryTarget:
     """
@@ -922,7 +1096,7 @@ def resolve_query_target(
       Tier 1 — explicit uppercase ticker token in query (e.g. "AAPL", "NVDA")
       Tier 2 — exact alias match in alias_to_ticker
       Tier 3 — longest alias phrase found inside normalized query
-      Tier 4 — KnowledgeNode canonical_name match in DB (catches PER/LOC)
+      Tier 4 — SQLite entity_mentions canonical_entity_id / display_name match
       Tier 5 — general (no entity resolved)
     """
     q_norm = _normalize_for_matching(query)
@@ -1012,31 +1186,21 @@ def resolve_query_target(
                 candidates=[(canonical_name, display_name)],
             )
 
-    # Tier 4: check if any KnowledgeNode canonical_name (PER/LOC) matches the query
-    with driver.session() as session:
-        rows = session.run(
-            """
-            MATCH (kn:KnowledgeNode)
-            WHERE kn.canonical_name = $q_norm
-               OR kn.display_name = $q_norm
-            RETURN kn.canonical_name AS canonical_name,
-                   kn.display_name   AS display_name,
-                   kn.entity_type    AS entity_type
-            LIMIT 1
-            """,
-            {"q_norm": q_norm},
-        ).data()
+    # Tier 4: SQLite entity_mentions for PER/LOC/ORG fallback
+    if sqlite_conn is not None:
+        r = _lookup_entity_in_sqlite(sqlite_conn, q_norm)
+    else:
+        r = None
 
-    if rows:
-        r = rows[0]
+    if r:
         return QueryTarget(
             query_type=QUERY_TYPE_SINGLE,
-            canonical_name=r["canonical_name"],
-            display_name=r.get("display_name") or r["canonical_name"],
-            ticker=None,
+            canonical_name=r["canonical_entity_id"],
+            display_name=r.get("display_name") or r["canonical_entity_id"],
+            ticker=r.get("ticker"),
             entity_type=r.get("entity_type"),
-            confidence=0.85,
-            candidates=[(r["canonical_name"], r.get("display_name") or r["canonical_name"])],
+            confidence=max(0.75, float(r.get("confidence") or 0.0)),
+            candidates=[(r["canonical_entity_id"], r.get("display_name") or r["canonical_entity_id"])],
         )
 
     # Tier 5: no entity resolved
@@ -1050,134 +1214,235 @@ def resolve_query_target(
     )
 
 
-# ---------------------------------------------------------------------------
-# Retrieval — Layer 1+2: entity-anchored chunk fetch
-# ---------------------------------------------------------------------------
-
 def retrieve_entity_chunks(
-    driver,
+    sqlite_conn: sqlite3.Connection,
     target: QueryTarget,
     period_keys: list[str] | None = None,
     date_start: str | None = None,
     date_end: str | None = None,
     source_filter: str | None = None,
+    top_k: int = 80,
 ) -> list[dict]:
-    """
-    R_time + R_node combined:
-      - Find all KnowledgeNodes for this entity (canonical_name match)
-      - Optionally filter to specific period_keys (R_time)
-      - Walk SOURCED_FROM back to Chunks
-      - Apply date range and source filters on Chunks
-    """
+    """Direct SQLite entity-mention retrieval for broad QA coverage."""
     if not target.canonical_name:
         return []
 
-    period_filter = "AND kn.period_key IN $period_keys" if period_keys else ""
-    date_start_filter = "AND c.published_date >= date($date_start)" if date_start else ""
-    date_end_filter = "AND c.published_date <= date($date_end)" if date_end else ""
-    source_filter_clause = "AND a.source = $source_filter" if source_filter else ""
-
-    cypher = f"""
-    MATCH (kn:KnowledgeNode {{canonical_name: $canonical_name}})
-    {period_filter}
-    MATCH (c:Chunk)-[:SOURCED_FROM]->(kn)
-    MATCH (a:Article {{article_id: c.article_id}})
-    WHERE 1=1
-      {date_start_filter}
-      {date_end_filter}
-      {source_filter_clause}
-    RETURN DISTINCT
-        c.chunk_uid      AS chunk_uid,
-        c.text           AS text,
-        c.embedding      AS embedding,
-        c.published_date AS published_date,
-        c.period_key     AS period_key,
-        a.title          AS title,
-        a.url            AS url,
-        a.source         AS source,
-        a.article_id     AS article_id
+    sql = """
+        SELECT
+            c.chunk_id,
+            c.article_id,
+            c.text,
+            c.published_date,
+            c.period_key,
+            c.embedding_json,
+            a.title,
+            a.url,
+            a.source,
+            em.display_name AS entity_display,
+            em.confidence AS mention_confidence
+        FROM entity_mentions em
+        JOIN chunks c ON c.chunk_id = em.chunk_id
+        JOIN articles a ON a.article_id = c.article_id
+        WHERE em.canonical_entity_id = ?
     """
-    params: dict = {"canonical_name": target.canonical_name}
+    params: list[Any] = [target.canonical_name]
+    if period_keys:
+        placeholders = ",".join("?" for _ in period_keys)
+        sql += f" AND c.period_key IN ({placeholders})"
+        params.extend(period_keys)
+    if date_start:
+        sql += " AND c.published_date >= ?"
+        params.append(date_start)
+    if date_end:
+        sql += " AND c.published_date <= ?"
+        params.append(date_end)
+    if source_filter:
+        sql += " AND a.source = ?"
+        params.append(source_filter)
+    sql += " ORDER BY c.published_date DESC, c.chunk_index ASC LIMIT ?"
+    params.append(max(top_k, 1) * 10)
+
+    rows = sqlite_conn.execute(sql, params).fetchall()
+    out: list[dict] = []
+    for row in rows:
+        item = _sqlite_row_to_chunk_dict(row)
+        item["retrieval_kind"] = "entity_mentions"
+        item["entity_display"] = row["entity_display"]
+        item["mention_confidence"] = row["mention_confidence"]
+        out.append(item)
+    return out
+
+
+def retrieve_graph_event_chunks(
+    driver,
+    sqlite_conn: sqlite3.Connection,
+    target: QueryTarget,
+    period_keys: list[str] | None = None,
+    date_start: str | None = None,
+    date_end: str | None = None,
+    source_filter: str | None = None,
+    top_k: int = 24,
+) -> list[dict]:
+    """Fetch macro events linked to the resolved entity, then materialize SQLite evidence."""
+    if not target.canonical_name:
+        return []
+
+    period_filter = "AND m.period_key IN $period_keys" if period_keys else ""
+    cypher = f"""
+    MATCH (e:Entity {{entity_id: $entity_id}})<-[:INVOLVES]-(m:MacroEvent)
+    WHERE 1=1
+      {period_filter}
+    RETURN
+        m.macro_event_id AS macro_event_id,
+        m.chunk_id       AS chunk_id,
+        m.article_id     AS article_id,
+        m.summary        AS macro_summary,
+        m.event_type     AS event_type,
+        m.region         AS region,
+        m.time_horizon   AS time_horizon,
+        m.confidence     AS macro_confidence,
+        m.evidence_text  AS evidence_text
+    ORDER BY coalesce(m.confidence, 0.0) DESC
+    LIMIT $top_k
+    """
+    params: dict[str, Any] = {"entity_id": target.canonical_name, "top_k": top_k}
     if period_keys:
         params["period_keys"] = period_keys
-    if date_start:
-        params["date_start"] = date_start
-    if date_end:
-        params["date_end"] = date_end
-    if source_filter:
-        params["source_filter"] = source_filter
 
     with driver.session() as session:
-        return session.run(cypher, params).data()
+        rows = session.run(cypher, params).data()
+
+    chunk_lookup = _fetch_chunk_rows_by_ids(
+        sqlite_conn,
+        [str(row["chunk_id"]) for row in rows if row.get("chunk_id")],
+        date_start=date_start,
+        date_end=date_end,
+        source_filter=source_filter,
+    )
+    out: list[dict] = []
+    for row in rows:
+        chunk_id = row.get("chunk_id")
+        base = chunk_lookup.get(chunk_id)
+        if not base:
+            continue
+        out.append(
+            {
+                **base,
+                "retrieval_kind": "macro_event_entity",
+                "macro_event_id": row["macro_event_id"],
+                "macro_summary": row["macro_summary"],
+                "event_type": row["event_type"],
+                "region": row["region"],
+                "time_horizon": row["time_horizon"],
+                "macro_confidence": row["macro_confidence"],
+                "evidence_text": row["evidence_text"],
+                "semantic_score": float(row.get("macro_confidence") or 0.55),
+            }
+        )
+    return out
 
 
-# ---------------------------------------------------------------------------
-# Retrieval — Layer 3: Knowledge-unit vector search → back to Chunks
-# ---------------------------------------------------------------------------
-
-def retrieve_knowledge_chunks(
+def retrieve_asset_chunks(
     driver,
-    embed_model: SentenceTransformer,
-    query: str,
-    target: QueryTarget,
+    sqlite_conn: sqlite3.Connection,
+    asset_target: dict | None,
     period_keys: list[str] | None = None,
     date_start: str | None = None,
     date_end: str | None = None,
     source_filter: str | None = None,
-    top_k: int = 6,
+    top_k: int = 20,
 ) -> list[dict]:
-    """
-    R_knowledge — corrected to pre-filter by entity before vector ranking.
-
-    Fetches all Knowledge UIDs for the target entity, then scores them
-    in Python against the query vector. This avoids the global-index
-    post-filter problem where top_k ANN results may contain zero
-    matches for the target entity.
-    """
-    if not target.canonical_name:
+    """Fetch macro events that impact an asset, then materialize SQLite evidence."""
+    if not asset_target:
         return []
 
-    qvec = embed_model.encode([query], normalize_embeddings=True)[0]
-
-    period_filter = "AND kn.period_key IN $period_keys" if period_keys else ""
-    date_start_filter = "AND c.published_date >= date($date_start)" if date_start else ""
-    date_end_filter = "AND c.published_date <= date($date_end)" if date_end else ""
-    source_filter_clause = "AND a.source = $source_filter" if source_filter else ""
-
-    # Step 1: fetch all Knowledge nodes + their chunk back-links for this entity
+    period_filter = "AND m.period_key IN $period_keys" if period_keys else ""
     cypher = f"""
-    MATCH (kn:KnowledgeNode {{canonical_name: $canonical_name}})
-    {period_filter}
-    MATCH (kn)-[:HAS_KNOWLEDGE]->(k:Knowledge)
-    MATCH (k)-[:SOURCED_FROM_CHUNK]->(c:Chunk)
-    MATCH (a:Article {{article_id: c.article_id}})
+    MATCH (a:Asset {{asset_key: $asset_key}})<-[r:IMPACTS]-(m:MacroEvent)
     WHERE 1=1
-      {date_start_filter}
-      {date_end_filter}
-      {source_filter_clause}
-    RETURN DISTINCT
-        k.knowledge_uid  AS knowledge_uid,
-        k.embedding      AS k_embedding,
-        c.chunk_uid      AS chunk_uid,
-        c.text           AS text,
-        c.embedding      AS embedding,
-        c.published_date AS published_date,
-        c.period_key     AS period_key,
-        a.title          AS title,
-        a.url            AS url,
-        a.source         AS source,
-        a.article_id     AS article_id
-    LIMIT 500
+      {period_filter}
+    RETURN
+        m.macro_event_id AS macro_event_id,
+        m.chunk_id       AS chunk_id,
+        m.summary        AS macro_summary,
+        m.event_type     AS event_type,
+        m.confidence     AS macro_confidence,
+        r.direction      AS impact_direction,
+        r.strength       AS impact_strength,
+        r.horizon        AS impact_horizon,
+        r.rationale      AS impact_rationale
+    ORDER BY coalesce(m.confidence, 0.0) DESC
+    LIMIT $top_k
     """
-    params: dict = {"canonical_name": target.canonical_name}
+    params: dict[str, Any] = {"asset_key": asset_target["asset_key"], "top_k": top_k}
     if period_keys:
         params["period_keys"] = period_keys
-    if date_start:
-        params["date_start"] = date_start
-    if date_end:
-        params["date_end"] = date_end
-    if source_filter:
-        params["source_filter"] = source_filter
+
+    with driver.session() as session:
+        rows = session.run(cypher, params).data()
+
+    chunk_lookup = _fetch_chunk_rows_by_ids(
+        sqlite_conn,
+        [str(row["chunk_id"]) for row in rows if row.get("chunk_id")],
+        date_start=date_start,
+        date_end=date_end,
+        source_filter=source_filter,
+    )
+    out: list[dict] = []
+    for row in rows:
+        chunk_id = row.get("chunk_id")
+        base = chunk_lookup.get(chunk_id)
+        if not base:
+            continue
+        out.append(
+            {
+                **base,
+                "retrieval_kind": "macro_event_asset",
+                "macro_event_id": row["macro_event_id"],
+                "macro_summary": row["macro_summary"],
+                "event_type": row["event_type"],
+                "macro_confidence": row["macro_confidence"],
+                "asset_target_id": asset_target["target_id"],
+                "asset_target_type": asset_target["target_type"],
+                "impact_direction": row["impact_direction"],
+                "impact_strength": row["impact_strength"],
+                "impact_horizon": row["impact_horizon"],
+                "impact_rationale": row["impact_rationale"],
+                "semantic_score": float(row.get("macro_confidence") or 0.55),
+            }
+        )
+    return out
+
+
+def retrieve_macro_semantic_chunks(
+    driver,
+    sqlite_conn: sqlite3.Connection,
+    embed_model: SentenceTransformer,
+    query: str,
+    period_keys: list[str] | None = None,
+    date_start: str | None = None,
+    date_end: str | None = None,
+    source_filter: str | None = None,
+    top_k: int = 12,
+) -> list[dict]:
+    """Semantic search over MacroEvent summaries, then fetch SQLite evidence."""
+    period_filter = "WHERE m.period_key IN $period_keys" if period_keys else ""
+    cypher = f"""
+    MATCH (m:MacroEvent)
+    {period_filter}
+    RETURN
+        m.macro_event_id AS macro_event_id,
+        m.chunk_id       AS chunk_id,
+        m.summary        AS macro_summary,
+        m.event_type     AS event_type,
+        m.region         AS region,
+        m.time_horizon   AS time_horizon,
+        m.confidence     AS macro_confidence
+    LIMIT $limit
+    """
+    params: dict[str, Any] = {"limit": MACRO_EVENT_CANDIDATE_LIMIT}
+    if period_keys:
+        params["period_keys"] = period_keys
 
     with driver.session() as session:
         rows = session.run(cypher, params).data()
@@ -1185,26 +1450,49 @@ def retrieve_knowledge_chunks(
     if not rows:
         return []
 
-    # Step 2: score knowledge embeddings in Python, keep top_k chunks
-    scored = []
-    seen_chunks: dict[str, dict] = {}  # chunk_uid -> best row
-    for r in rows:
-        k_emb = r.get("k_embedding")
-        score = cosine_sim(qvec, np.array(k_emb, dtype=np.float32)) if k_emb is not None else 0.4
-        chunk_uid = r["chunk_uid"]
-        if chunk_uid not in seen_chunks or score > seen_chunks[chunk_uid]["knowledge_score"]:
-            seen_chunks[chunk_uid] = {**r, "knowledge_score": score}
+    summaries = [str(row.get("macro_summary") or "") for row in rows]
+    qvec = embed_model.encode([query], normalize_embeddings=True)[0]
+    svecs = embed_model.encode(summaries, normalize_embeddings=True)
 
-    scored = sorted(seen_chunks.values(), key=lambda x: x["knowledge_score"], reverse=True)
-    return scored[:top_k]
+    scored: list[tuple[float, dict]] = []
+    for row, svec in zip(rows, svecs):
+        score = cosine_sim(qvec, np.array(svec, dtype=np.float32))
+        scored.append((score, row))
+    scored.sort(key=lambda item: item[0], reverse=True)
+    top_rows = [row for score, row in scored[:top_k] if score > 0.20]
 
+    chunk_lookup = _fetch_chunk_rows_by_ids(
+        sqlite_conn,
+        [str(row["chunk_id"]) for row in top_rows if row.get("chunk_id")],
+        date_start=date_start,
+        date_end=date_end,
+        source_filter=source_filter,
+    )
 
-# ---------------------------------------------------------------------------
-# Retrieval — CO_OCCURS neighbor expansion
-# ---------------------------------------------------------------------------
+    out: list[dict] = []
+    for score, row in scored[:top_k]:
+        chunk_id = row.get("chunk_id")
+        base = chunk_lookup.get(chunk_id)
+        if not base:
+            continue
+        out.append(
+            {
+                **base,
+                "retrieval_kind": "macro_event_semantic",
+                "macro_event_id": row["macro_event_id"],
+                "macro_summary": row["macro_summary"],
+                "event_type": row["event_type"],
+                "region": row["region"],
+                "time_horizon": row["time_horizon"],
+                "macro_confidence": row["macro_confidence"],
+                "semantic_score": score,
+            }
+        )
+    return out
+
 
 def retrieve_cooccurrence_chunks(
-    driver,
+    sqlite_conn: sqlite3.Connection,
     target: QueryTarget,
     period_keys: list[str] | None = None,
     date_start: str | None = None,
@@ -1213,72 +1501,79 @@ def retrieve_cooccurrence_chunks(
     max_neighbors: int = 3,
     max_chunks: int = 4,
 ) -> list[dict]:
-    """
-    Walk RELATED_TO (CO_OCCURS) edges from the target KnowledgeNode to
-    neighboring entities, then fetch their Chunks as expansion context.
-    Only uses same-period neighbors.
-    """
+    """SQLite substitute for co-occurrence expansion using shared chunks."""
     if not target.canonical_name:
         return []
 
-    period_filter = "AND kn.period_key IN $period_keys" if period_keys else ""
-    date_start_filter = "AND c.published_date >= date($date_start)" if date_start else ""
-    date_end_filter = "AND c.published_date <= date($date_end)" if date_end else ""
-    source_filter_clause = "AND a.source = $source_filter" if source_filter else ""
+    neighbor_rows = sqlite_conn.execute(
+        """
+        SELECT
+            em2.canonical_entity_id AS neighbor_id,
+            MAX(NULLIF(em2.display_name, '')) AS neighbor_display,
+            COUNT(*) AS cooccur_count
+        FROM entity_mentions em1
+        JOIN entity_mentions em2
+          ON em1.chunk_id = em2.chunk_id
+        WHERE em1.canonical_entity_id = ?
+          AND em2.canonical_entity_id <> em1.canonical_entity_id
+        GROUP BY em2.canonical_entity_id
+        ORDER BY cooccur_count DESC, neighbor_id
+        LIMIT ?
+        """,
+        (target.canonical_name, max_neighbors),
+    ).fetchall()
+    if not neighbor_rows:
+        return []
 
-    cypher = f"""
-    MATCH (kn:KnowledgeNode {{canonical_name: $canonical_name}})
-    {period_filter}
-    MATCH (kn)-[r:RELATED_TO]-(neighbor:KnowledgeNode)
-    WHERE neighbor.canonical_name <> $canonical_name
-      AND r.period_key = kn.period_key
-    WITH neighbor
-    ORDER BY neighbor.canonical_name
-    LIMIT $max_neighbors
-
-    MATCH (c:Chunk)-[:SOURCED_FROM]->(neighbor)
-    MATCH (a:Article {{article_id: c.article_id}})
-    WHERE 1=1
-      {date_start_filter}
-      {date_end_filter}
-      {source_filter_clause}
-    RETURN DISTINCT
-        c.chunk_uid      AS chunk_uid,
-        c.text           AS text,
-        c.embedding      AS embedding,
-        c.published_date AS published_date,
-        c.period_key     AS period_key,
-        a.title          AS title,
-        a.url            AS url,
-        a.source         AS source,
-        a.article_id     AS article_id,
-        neighbor.display_name AS neighbor_display
-    LIMIT $max_chunks
+    neighbor_ids = [row["neighbor_id"] for row in neighbor_rows]
+    placeholders = ",".join("?" for _ in neighbor_ids)
+    sql = f"""
+        SELECT
+            c.chunk_id,
+            c.article_id,
+            c.text,
+            c.published_date,
+            c.period_key,
+            c.embedding_json,
+            a.title,
+            a.url,
+            a.source,
+            em.canonical_entity_id AS neighbor_id,
+            em.display_name AS neighbor_display
+        FROM entity_mentions em
+        JOIN chunks c ON c.chunk_id = em.chunk_id
+        JOIN articles a ON a.article_id = c.article_id
+        WHERE em.canonical_entity_id IN ({placeholders})
     """
-    params: dict = {
-        "canonical_name": target.canonical_name,
-        "max_neighbors": max_neighbors,
-        "max_chunks": max_chunks,
-    }
+    params: list[Any] = list(neighbor_ids)
     if period_keys:
-        params["period_keys"] = period_keys
+        period_placeholders = ",".join("?" for _ in period_keys)
+        sql += f" AND c.period_key IN ({period_placeholders})"
+        params.extend(period_keys)
     if date_start:
-        params["date_start"] = date_start
+        sql += " AND c.published_date >= ?"
+        params.append(date_start)
     if date_end:
-        params["date_end"] = date_end
+        sql += " AND c.published_date <= ?"
+        params.append(date_end)
     if source_filter:
-        params["source_filter"] = source_filter
+        sql += " AND a.source = ?"
+        params.append(source_filter)
+    sql += " ORDER BY c.published_date DESC LIMIT ?"
+    params.append(max_chunks)
 
-    with driver.session() as session:
-        return session.run(cypher, params).data()
+    rows = sqlite_conn.execute(sql, params).fetchall()
+    out: list[dict] = []
+    for row in rows:
+        item = _sqlite_row_to_chunk_dict(row)
+        item["expansion_kind"] = "cooccurrence"
+        item["neighbor_display"] = row["neighbor_display"] or row["neighbor_id"]
+        out.append(item)
+    return out
 
-
-# ---------------------------------------------------------------------------
-# Semantic fallback — pure vector search over Chunks
-# ---------------------------------------------------------------------------
 
 def retrieve_semantic_chunks(
-    driver,
+    sqlite_conn: sqlite3.Connection,
     embed_model: SentenceTransformer,
     query: str,
     period_keys: list[str] | None = None,
@@ -1287,52 +1582,56 @@ def retrieve_semantic_chunks(
     source_filter: str | None = None,
     top_k: int = 6,
 ) -> list[dict]:
+    """SQLite semantic fallback over chunk embeddings."""
+    sql = """
+        SELECT
+            c.chunk_id,
+            c.article_id,
+            c.text,
+            c.published_date,
+            c.period_key,
+            c.embedding_json,
+            a.title,
+            a.url,
+            a.source
+        FROM chunks c
+        JOIN articles a ON a.article_id = c.article_id
+        WHERE c.embedding_json IS NOT NULL
     """
-    Fallback for general queries with no resolved entity.
-    Pure vector search over Chunk.embedding via the vector_chunk index.
-    """
-    qvec = embed_model.encode([query], normalize_embeddings=True)[0].tolist()
-
-    period_filter = "AND c.period_key IN $period_keys" if period_keys else ""
-    date_start_filter = "AND c.published_date >= date($date_start)" if date_start else ""
-    date_end_filter = "AND c.published_date <= date($date_end)" if date_end else ""
-    source_filter_clause = "AND a.source = $source_filter" if source_filter else ""
-
-    cypher = f"""
-    CALL db.index.vector.queryNodes('vector_chunk', $top_k, $qvec)
-    YIELD node AS c, score
-    MATCH (a:Article {{article_id: c.article_id}})
-    WHERE 1=1
-      {period_filter}
-      {date_start_filter}
-      {date_end_filter}
-      {source_filter_clause}
-    RETURN
-        c.chunk_uid      AS chunk_uid,
-        c.text           AS text,
-        c.embedding      AS embedding,
-        c.published_date AS published_date,
-        c.period_key     AS period_key,
-        a.title          AS title,
-        a.url            AS url,
-        a.source         AS source,
-        a.article_id     AS article_id,
-        score            AS semantic_score
-    ORDER BY score DESC
-    LIMIT $top_k
-    """
-    params: dict = {"qvec": qvec, "top_k": top_k}
+    params: list[Any] = []
     if period_keys:
-        params["period_keys"] = period_keys
+        placeholders = ",".join("?" for _ in period_keys)
+        sql += f" AND c.period_key IN ({placeholders})"
+        params.extend(period_keys)
     if date_start:
-        params["date_start"] = date_start
+        sql += " AND c.published_date >= ?"
+        params.append(date_start)
     if date_end:
-        params["date_end"] = date_end
+        sql += " AND c.published_date <= ?"
+        params.append(date_end)
     if source_filter:
-        params["source_filter"] = source_filter
+        sql += " AND a.source = ?"
+        params.append(source_filter)
+    sql += " ORDER BY c.published_date DESC LIMIT ?"
+    params.append(max(SQLITE_SEMANTIC_CANDIDATE_LIMIT, top_k))
 
-    with driver.session() as session:
-        return session.run(cypher, params).data()
+    rows = sqlite_conn.execute(sql, params).fetchall()
+    if not rows:
+        return []
+
+    qvec = embed_model.encode([query], normalize_embeddings=True)[0]
+    scored: list[dict] = []
+    for row in rows:
+        item = _sqlite_row_to_chunk_dict(row)
+        emb = item.get("embedding")
+        if emb is None:
+            continue
+        item["semantic_score"] = cosine_sim(qvec, np.array(emb, dtype=np.float32))
+        item["retrieval_kind"] = "sqlite_semantic"
+        scored.append(item)
+
+    scored.sort(key=lambda item: item["semantic_score"], reverse=True)
+    return scored[:top_k]
 
 
 # ---------------------------------------------------------------------------
@@ -1405,6 +1704,7 @@ def retrieve(
     query: str,
     embed_model: SentenceTransformer,
     driver,
+    sqlite_conn: sqlite3.Connection,
     alias_to_ticker: dict[str, str],
     ticker_to_canonical: dict[str, str],
     alias_to_fin_entity: dict[str, dict[str, Any]],
@@ -1416,41 +1716,56 @@ def retrieve(
     date_end: str | None = None,
 ) -> tuple[list[dict], QueryTarget]:
     """
-    Full three-layer retrieval for one sub-query.
+    Hybrid retrieval for one sub-query.
     Returns (ranked_chunks, target).
     """
-    target = resolve_query_target(query, alias_to_ticker, ticker_to_canonical, driver, alias_to_fin_entity=alias_to_fin_entity)
+    target = resolve_query_target(
+        query,
+        alias_to_ticker,
+        ticker_to_canonical,
+        driver,
+        sqlite_conn=sqlite_conn,
+        alias_to_fin_entity=alias_to_fin_entity,
+    )
     period_keys = _date_range_to_period_keys(date_start, date_end) or None
 
     query_vec = embed_model.encode([query], normalize_embeddings=True)[0]
 
     if target.canonical_name:
-        # Layer 1+2: entity-anchored chunks
         entity_rows = retrieve_entity_chunks(
-            driver, target,
+            sqlite_conn,
+            target,
             period_keys=period_keys,
             date_start=date_start,
             date_end=date_end,
             source_filter=source_filter,
         )
-
-        # Layer 3: knowledge-unit vector search → chunks
-        knowledge_rows = retrieve_knowledge_chunks(
-            driver, embed_model, query, target,
+        macro_rows = retrieve_graph_event_chunks(
+            driver,
+            sqlite_conn,
+            target,
             period_keys=period_keys,
             date_start=date_start,
             date_end=date_end,
             source_filter=source_filter,
-            top_k=expanded_k,
         )
-
-        all_rows = entity_rows + knowledge_rows
+        asset_rows = retrieve_asset_chunks(
+            driver,
+            sqlite_conn,
+            _resolve_asset_target(sqlite_conn, query, target),
+            period_keys=period_keys,
+            date_start=date_start,
+            date_end=date_end,
+            source_filter=source_filter,
+            top_k=max(4, expanded_k),
+        )
+        all_rows = entity_rows + macro_rows + asset_rows
         ranked = score_and_rank(all_rows, query_vec, recency_half_life_days)
 
-        # If we got fewer than top_k direct hits, expand via CO_OCCURS neighbors
         if len(ranked) < top_k:
             cooccur_rows = retrieve_cooccurrence_chunks(
-                driver, target,
+                sqlite_conn,
+                target,
                 period_keys=period_keys,
                 date_start=date_start,
                 date_end=date_end,
@@ -1458,22 +1773,57 @@ def retrieve(
                 max_neighbors=3,
                 max_chunks=4,
             )
-            for r in cooccur_rows:
-                r["expansion_kind"] = "cooccurrence"
             all_rows += cooccur_rows
             ranked = score_and_rank(all_rows, query_vec, recency_half_life_days)
 
+        if len(ranked) < top_k:
+            semantic_rows = retrieve_semantic_chunks(
+                sqlite_conn,
+                embed_model,
+                query,
+                period_keys=period_keys,
+                date_start=date_start,
+                date_end=date_end,
+                source_filter=source_filter,
+                top_k=expanded_k,
+            )
+            all_rows += semantic_rows
+            ranked = score_and_rank(all_rows, query_vec, recency_half_life_days)
+
     else:
-        # General query — pure semantic search
+        asset_target = _resolve_asset_target(sqlite_conn, query)
+        asset_rows = retrieve_asset_chunks(
+            driver,
+            sqlite_conn,
+            asset_target,
+            period_keys=period_keys,
+            date_start=date_start,
+            date_end=date_end,
+            source_filter=source_filter,
+            top_k=max(4, expanded_k),
+        )
+        macro_rows = retrieve_macro_semantic_chunks(
+            driver,
+            sqlite_conn,
+            embed_model,
+            query,
+            period_keys=period_keys,
+            date_start=date_start,
+            date_end=date_end,
+            source_filter=source_filter,
+            top_k=max(4, expanded_k),
+        )
         sem_rows = retrieve_semantic_chunks(
-            driver, embed_model, query,
+            sqlite_conn,
+            embed_model,
+            query,
             period_keys=period_keys,
             date_start=date_start,
             date_end=date_end,
             source_filter=source_filter,
             top_k=expanded_k,
         )
-        ranked = score_and_rank(sem_rows, query_vec, recency_half_life_days)
+        ranked = score_and_rank(asset_rows + macro_rows + sem_rows, query_vec, recency_half_life_days)
 
     return ranked[:expanded_k], target
 
@@ -1505,8 +1855,21 @@ def build_context(
         lines.append(f"[TITLE: {ch.get('title', '?')}]")
         lines.append(f"[URL: {ch.get('url', '?')}]")
         lines.append(f"[PERIOD: {ch.get('period_key', '?')}]")
+        if ch.get("retrieval_kind"):
+            lines.append(f"[RETRIEVAL: {ch['retrieval_kind']}]")
         if ch.get("expansion_kind"):
             lines.append(f"[EXPANSION: {ch['expansion_kind']}]")
+        if ch.get("macro_summary"):
+            lines.append(f"[MACRO SUMMARY: {ch['macro_summary']}]")
+        if ch.get("event_type"):
+            lines.append(f"[EVENT TYPE: {ch['event_type']}]")
+        if ch.get("asset_target_id"):
+            lines.append(f"[ASSET TARGET: {ch['asset_target_type']}::{ch['asset_target_id']}]")
+        if ch.get("impact_direction") or ch.get("impact_strength"):
+            lines.append(
+                f"[IMPACT: direction={ch.get('impact_direction', '?')}, "
+                f"strength={ch.get('impact_strength', '?')}, horizon={ch.get('impact_horizon', '?')}]"
+            )
         lines.append(ch.get("text", ""))
         lines.append("")
 
@@ -1670,22 +2033,15 @@ def main():
     print("Connecting to Neo4j...")
     driver = GraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASSWORD))
     driver.verify_connectivity()
+    print("Connecting to SQLite...")
+    sqlite_conn = connect_sqlite(SQLITE_DB)
 
     print("Loading ticker map...")
     alias_to_ticker, ticker_to_canonical = load_ticker_company_map(TICKER_MAP_PATH)
     alias_to_fin_entity = load_financial_entity_map(FIN_ENTITY_MAP_PATH, TICKER_MAP_PATH)
 
-    # Get article date range for system prompt base
-    with driver.session() as session:
-        row = session.run(
-            """
-            MATCH (a:Article)
-            RETURN min(a.published_date) AS earliest,
-                   max(a.published_date) AS latest
-            """
-        ).single()
-    date_min = str(row["earliest"]) if row and row["earliest"] else "unknown"
-    date_max = str(row["latest"]) if row and row["latest"] else "unknown"
+    # Get article date range for system prompt base from SQLite source-of-truth
+    date_min, date_max = _get_sqlite_date_range(sqlite_conn)
     # Base prompt — conversation history is injected per-turn via build_system_prompt()
     base_system_prompt = SYSTEM_PROMPT_TEMPLATE.format(date_min=date_min, date_max=date_max)
     base_causal_system_prompt = CAUSAL_SYSTEM_PROMPT_TEMPLATE.format(date_min=date_min, date_max=date_max)
@@ -1760,6 +2116,7 @@ def main():
                         hops=hops,
                         embed_model=embed_model,
                         driver=driver,
+                        sqlite_conn=sqlite_conn,
                         alias_to_ticker=alias_to_ticker,
                         ticker_to_canonical=ticker_to_canonical,
                         alias_to_fin_entity=alias_to_fin_entity,
@@ -1782,6 +2139,7 @@ def main():
                         query=sq["query"],
                         embed_model=embed_model,
                         driver=driver,
+                        sqlite_conn=sqlite_conn,
                         alias_to_ticker=alias_to_ticker,
                         ticker_to_canonical=ticker_to_canonical,
                         alias_to_fin_entity=alias_to_fin_entity,
@@ -1798,6 +2156,7 @@ def main():
                     query=sq["query"],
                     embed_model=embed_model,
                     driver=driver,
+                    sqlite_conn=sqlite_conn,
                     alias_to_ticker=alias_to_ticker,
                     ticker_to_canonical=ticker_to_canonical,
                     alias_to_fin_entity=alias_to_fin_entity,
@@ -1925,6 +2284,7 @@ def main():
         # ── Hook 7: Persist to disk ───────────────────────────────────────────
         save_memory(memory, MEMORY_PATH)
 
+    sqlite_conn.close()
     driver.close()
 
 

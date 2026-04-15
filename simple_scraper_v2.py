@@ -1,4 +1,4 @@
-"""
+﻿"""
 simple_scraper_v2.py - Alpha-primary news scraper with RSS fallback.
 
 Key features:
