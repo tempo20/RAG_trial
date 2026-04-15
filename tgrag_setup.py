@@ -253,7 +253,10 @@ def filter_articles(
         if published_dt is None:
             published_dt = datetime.now(timezone.utc)
 
-        article_id = _article_id(art.get("url", ""), published_dt)
+        # Trust the article_id already stored in SQLite (authoritative source).
+        # Only recompute as a fallback for JSON-only paths that lack a stored ID.
+        existing_id = art.get("article_id")
+        article_id = existing_id if existing_id else _article_id(art.get("url", ""), published_dt)
 
         if article_id in skip_ids:
             continue
@@ -1073,6 +1076,64 @@ def populate_neo4j(
 
 
 # ---------------------------------------------------------------------------
+# Integrity checks
+# ---------------------------------------------------------------------------
+
+def run_integrity_check(db_path: str = SQLITE_DB) -> None:
+    """
+    Lightweight post-write consistency checks. Raises RuntimeError on failure.
+
+    Checks:
+    - PRAGMA foreign_key_check  (any FK violation → immediate failure)
+    - orphan chunks             (chunks.article_id not in articles)
+    - orphan entity_mentions    (mentions referencing missing chunk or article)
+    """
+    from create_sql_db import connect_sqlite
+    conn = connect_sqlite(db_path)
+    try:
+        # Foreign key violations across all tables
+        fk_errors = conn.execute("PRAGMA foreign_key_check").fetchall()
+        if fk_errors:
+            detail = "; ".join(
+                f"table={r[0]} rowid={r[1]} parent={r[2]}" for r in fk_errors[:5]
+            )
+            raise RuntimeError(
+                f"[integrity] PRAGMA foreign_key_check found {len(fk_errors)} "
+                f"violation(s): {detail}"
+            )
+
+        # Orphan chunks: article_id not in articles
+        orphan_chunks = conn.execute(
+            """
+            SELECT COUNT(*) FROM chunks c
+            LEFT JOIN articles a ON a.article_id = c.article_id
+            WHERE a.article_id IS NULL
+            """
+        ).fetchone()[0]
+        if orphan_chunks:
+            raise RuntimeError(
+                f"[integrity] {orphan_chunks} chunk row(s) reference a missing articles.article_id"
+            )
+
+        # Orphan entity_mentions: chunk_id not in chunks
+        orphan_mentions = conn.execute(
+            """
+            SELECT COUNT(*) FROM entity_mentions em
+            LEFT JOIN chunks c ON c.chunk_id = em.chunk_id
+            WHERE c.chunk_id IS NULL
+            """
+        ).fetchone()[0]
+        if orphan_mentions:
+            raise RuntimeError(
+                f"[integrity] {orphan_mentions} entity_mention row(s) reference a missing chunks.chunk_id"
+            )
+
+        print("[integrity] All checks passed.")
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
 # Top-level orchestration
 # ---------------------------------------------------------------------------
 
@@ -1092,7 +1153,7 @@ def run_sqlite_pass(
     keep_per_singletons: if True, skips the PER singleton filter so all
     extracted person entities are written regardless of chunk frequency.
     """
-    from create_sql_db import create_database, ensure_migrations
+    from create_sql_db import create_database, connect_sqlite, ensure_migrations
     create_database(db_path)
     ensure_migrations(db_path)
 
@@ -1139,12 +1200,17 @@ def run_sqlite_pass(
     else:
         print("[sqlite_pass] Skipping entity extraction (--skip-entities)")
 
+    # Fail loudly if the DB is inconsistent before downstream steps consume it.
+    print("[sqlite_pass] Running integrity checks ...")
+    run_integrity_check(db_path)
+
     print("[sqlite_pass] Done.")
 
 
 def _upsert_chunks_sqlite(chunks: list[dict], db_path: str = SQLITE_DB) -> None:
     """Write chunk dicts to SQLite chunks table. Skips already-present rows."""
-    conn = sqlite3.connect(db_path)
+    from create_sql_db import connect_sqlite
+    conn = connect_sqlite(db_path)
     inserted = 0
     for c in chunks:
         cur = conn.execute(
@@ -1169,7 +1235,8 @@ def _upsert_chunks_sqlite(chunks: list[dict], db_path: str = SQLITE_DB) -> None:
 
 def _upsert_entity_mentions_sqlite(mentions: list[dict], db_path: str = SQLITE_DB) -> None:
     """Write entity mention dicts to SQLite entity_mentions table."""
-    conn = sqlite3.connect(db_path)
+    from create_sql_db import connect_sqlite
+    conn = connect_sqlite(db_path)
     inserted = 0
     for m in mentions:
         mention_id = hashlib.md5(

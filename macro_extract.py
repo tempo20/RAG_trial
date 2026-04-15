@@ -551,7 +551,8 @@ def run_extraction(
     reprocess_failed: bool = False,
 ) -> None:
     client = _build_client()
-    conn = sqlite3.connect(db_path)
+    from create_sql_db import connect_sqlite
+    conn = connect_sqlite(db_path)
 
     chunks = _load_unprocessed_chunks(conn, reprocess_failed=reprocess_failed)
     if limit:
