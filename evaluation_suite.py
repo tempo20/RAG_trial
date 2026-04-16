@@ -75,11 +75,28 @@ _CONFIDENCE_RE = re.compile(
 
 
 def _extract_direction(text: str) -> str:
-    """Return the first matching directional label from a block of text."""
+    """
+    Extract dominant direction from Answer section.
+    Prioritizes explicit final calls.
+    """
     lower = text.lower()
+
+    # Strong explicit phrases first
+    if re.search(r"\bnegative\s+for\b|\bbearish\b", lower):
+        return "negative"
+    if re.search(r"\bpositive\s+for\b|\bbullish\b", lower):
+        return "positive"
+
+    if re.search(r"\bmixed\b", lower):
+        return "mixed"
+    if re.search(r"\bunclear\b|\binsufficient\b", lower):
+        return "unclear"
+
+    # fallback to patterns
     for pattern, label in _DIRECTION_PATTERNS:
         if re.search(pattern, lower):
             return label
+
     return "unclear"
 
 
@@ -93,16 +110,16 @@ def _extract_confidence(text: str) -> int | None:
 
 
 def _extract_mechanisms(text: str, known_mechanisms: list[str]) -> list[str]:
-    """
-    Return which of the caller-supplied mechanism strings appear in the text.
-    Matching is case-insensitive substring / word-boundary search.
-    """
     found = []
     lower = text.lower()
+
     for mech in known_mechanisms:
-        pattern = r"\b" + re.escape(mech.lower()) + r"\b"
-        if re.search(pattern, lower):
+        tokens = mech.lower().replace("_", " ").split()
+
+        # require partial match instead of exact phrase
+        if any(token in lower for token in tokens):
             found.append(mech)
+
     return found
 
 
@@ -117,33 +134,57 @@ def _detect_overclaims(text: str) -> list[str]:
     lower = text.lower()
     return [p for p in _OVERCLAIM_PATTERNS if re.search(p, lower)]
 
+def _split_sections(answer: str) -> dict[str, str]:
+    """
+    Split answer into Answer / Evidence / Theory sections.
+    """
+    sections = {"answer": "", "evidence": "", "theory": ""}
+    current = None
+
+    for line in (answer or "").splitlines():
+        lower = line.lower().strip()
+
+        if lower.startswith("answer"):
+            current = "answer"
+            continue
+        elif lower.startswith("evidence"):
+            current = "evidence"
+            continue
+        elif lower.startswith("theory"):
+            current = "theory"
+            continue
+
+        if current:
+            sections[current] += line + "\n"
+
+    return sections
 
 def parse_answer_meta(answer: str, all_mechanisms: list[str]) -> dict[str, Any]:
-    """
-    Extract structured quality signals from a free-text answer.
-
-    Returns a dict with:
-      direction          – positive / negative / mixed / unclear
-      confidence         – int 0-100 or None
-      mechanisms_found   – subset of all_mechanisms mentioned in text
-      has_counterargs    – True if answer references counter-arguments / offsetting channels
-      mixed_lang_hits    – list of mixed/hedge patterns that fired
-      overclaim_hits     – list of overclaim patterns that fired
-    """
     counterarg_re = re.compile(
         r"\b(however|nevertheless|that said|on the other hand|offset|counteract|"
         r"but also|though|mitigat(es?|ing)|headwind|tailwind|risk|caveat)\b",
         re.IGNORECASE,
     )
+    sections = _split_sections(answer)
+    answer_section = sections["answer"]
+    full_text = answer
+
     return {
-        "direction": _extract_direction(answer or ""),
-        "confidence": _extract_confidence(answer or ""),
-        "mechanisms_found": _extract_mechanisms(answer or "", all_mechanisms),
-        "has_counterargs": bool(counterarg_re.search(answer or "")),
-        "mixed_lang_hits": _detect_mixed_language(answer or ""),
-        "overclaim_hits": _detect_overclaims(answer or ""),
+        "direction": _extract_direction(answer_section),  # ✅ only Answer
+        "confidence": _extract_confidence(answer_section),
+        "mechanisms_found": _extract_mechanisms(full_text, all_mechanisms),
+        "has_counterargs": bool(counterarg_re.search(full_text)),
+        "mixed_lang_hits": _detect_mixed_language(full_text),
+        "overclaim_hits": _detect_overclaims(answer_section),  # ✅ only Answer
+        "_raw_answer": answer,
+        "_sections": sections,
     }
 
+def _has_dominance_language(text: str) -> bool:
+    return bool(re.search(
+        r"\b(dominates?|outweighs?|more\s+than\s+offsets?)\b",
+        (text or "").lower()
+    ))
 
 # ---------------------------------------------------------------------------
 # Macro-answer evaluation against gold expectations
@@ -253,8 +294,20 @@ def evaluate_macro_answer(
 
     # --- forbidden overclaims ---
     forbidden_oc = gold.get("forbidden_overclaims", [])
+    answer_section = (
+        parsed.get("_sections", {}).get("answer")
+        if isinstance(parsed.get("_sections"), dict)
+        else parsed.get("_raw_answer", "")
+    ) or ""
+    raw_answer = parsed.get("_raw_answer") or ""
+    has_counter = parsed["has_counterargs"]
+    confidence = parsed["confidence"]
+
     if forbidden_oc:
-        fired = [p for p in forbidden_oc if re.search(p, (parsed.get("_raw_answer") or ""), re.IGNORECASE)]
+        fired = [
+            p for p in forbidden_oc
+            if re.search(p, raw_answer, re.IGNORECASE)
+        ]
         oc_ok = not fired
         details["overclaim_check"] = {
             "passed": oc_ok,
@@ -263,8 +316,47 @@ def evaluate_macro_answer(
         }
         if not oc_ok:
             failures.append(f"forbidden overclaim patterns fired: {fired}")
+
+    elif has_counter and direction in ("positive", "negative"):
+        if not _has_dominance_language(answer_section):
+            if confidence is None or confidence > 50:
+                oc_ok = False
+                details["overclaim_check"] = {
+                    "passed": False,
+                    "auto_penalty": True,
+                    "has_counterargs": has_counter,
+                    "direction": direction,
+                    "confidence": confidence,
+                    "dominance_language": False,
+                    "reason": (
+                        "Directional call made despite counterarguments without "
+                        "dominance justification and with too much confidence."
+                    ),
+                }
+                failures.append(
+                    "overclaim: directional call made despite counterarguments "
+                    "without dominance justification"
+                )
+            else:
+                oc_ok = True
+                details["overclaim_check"] = {
+                    "passed": True,
+                    "softened_by_low_confidence": True,
+                    "has_counterargs": has_counter,
+                    "direction": direction,
+                    "confidence": confidence,
+                }
+        else:
+            oc_ok = True
+            details["overclaim_check"] = {
+                "passed": True,
+                "dominance_language": True,
+                "has_counterargs": has_counter,
+                "direction": direction,
+                "confidence": confidence,
+            }
+
     elif parsed["overclaim_hits"] and parsed.get("mixed_lang_hits"):
-        # Auto-penalty: model made a strong directional call while also hedging
         oc_ok = False
         details["overclaim_check"] = {
             "passed": False,
@@ -272,12 +364,13 @@ def evaluate_macro_answer(
             "overclaim_hits": parsed["overclaim_hits"],
             "mixed_lang_hits": parsed["mixed_lang_hits"],
             "reason": (
-                "Model used strong directional language alongside mixed/hedge language "
-                "without explicit dominance claim."
+                "Model used strong directional language alongside mixed/hedge language."
             ),
         }
         failures.append("overclaim: strong directional call conflicts with hedge language")
+
     else:
+        oc_ok = True
         details["overclaim_check"] = {"passed": True, "skipped": True}
 
     passed = not failures
