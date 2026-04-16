@@ -24,6 +24,7 @@ import sqlite3
 import uuid
 from collections import defaultdict
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
 from dotenv import load_dotenv
@@ -37,6 +38,7 @@ load_dotenv()
 SQLITE_DB         = os.getenv("SQLITE_DB", "my_database.db")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
 GEN_MODEL_NAME    = os.getenv("GEN_MODEL_NAME", "claude-haiku-4-5-20251001")
+PROMPT_TEMPLATES_PATH = Path(os.getenv("PROMPT_TEMPLATES_PATH", "prompt_templates.json"))
 
 PROMPT_VERSION              = "v2"
 SCHEMA_VERSION              = "v1"
@@ -91,7 +93,7 @@ HORIZONS   = ["intraday", "near_term", "medium_term", "long_term"]
 # Prompt template
 # ---------------------------------------------------------------------------
 
-MACRO_EXTRACTION_PROMPT = """\
+DEFAULT_MACRO_EXTRACTION_PROMPT = """\
 You are a macro-economic analyst. Read the news excerpt below and extract \
 macro-economic events that are explicitly stated or directly and unambiguously \
 supported by the text.
@@ -146,6 +148,37 @@ Use ONLY the allowed enum values listed — do not invent new labels.
 NEWS EXCERPT:
 {text}
 """
+
+
+def _coerce_template_value(value: Any, key: str) -> str:
+    if isinstance(value, str):
+        return value
+    if isinstance(value, list) and all(isinstance(item, str) for item in value):
+        return "\n".join(value)
+    raise ValueError(
+        f"Prompt template '{key}' must be either a string or a list of strings."
+    )
+
+
+def _load_macro_extraction_prompt(path: Path) -> str:
+    """
+    Load the macro extraction prompt from prompt_templates.json.
+    Falls back to DEFAULT_MACRO_EXTRACTION_PROMPT when unavailable.
+    """
+    if not path.exists():
+        return DEFAULT_MACRO_EXTRACTION_PROMPT
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return DEFAULT_MACRO_EXTRACTION_PROMPT
+
+    value = data.get("MACRO_EXTRACTION_PROMPT")
+    if value is None:
+        return DEFAULT_MACRO_EXTRACTION_PROMPT
+    return _coerce_template_value(value, "MACRO_EXTRACTION_PROMPT")
+
+
+MACRO_EXTRACTION_PROMPT = _load_macro_extraction_prompt(PROMPT_TEMPLATES_PATH)
 
 # ---------------------------------------------------------------------------
 # Enum enforcement helpers
@@ -379,20 +412,16 @@ def _article_is_hard_include(source: str, title: str) -> bool:
     title_lower = (title or "").lower()
     return any(kw in title_lower for kw in _TITLE_MACRO_KEYWORDS)
 
+def _count_term_hits(text: str, terms: list[str]) -> int:
+    low = text.lower()
+    return sum(1 for t in terms if t in low)
 
 def _chunk_macro_score(text: str) -> int:
-    """
-    Score a chunk for macro relevance without any API call.
-    Each hard macro term:   +2
-    Each directional term:  +1
-    Each noise term:        -2
-    """
     low = text.lower()
-    score = 0
-    score += sum(2 for t in _HARD_MACRO_TERMS if t in low)
-    score += sum(1 for t in _DIRECTIONAL_TERMS if t in low)
-    score -= sum(2 for t in _NOISE_TERMS if t in low)
-    return score
+    hard_hits = _count_term_hits(low, _HARD_MACRO_TERMS)
+    directional_hits = _count_term_hits(low, _DIRECTIONAL_TERMS)
+    noise_hits = _count_term_hits(low, _NOISE_TERMS)
+    return 2 * hard_hits + directional_hits - 2 * noise_hits
 
 
 def _should_process_chunk(chunk: dict) -> bool:
@@ -839,6 +868,10 @@ def run_extraction(
     for chunk in chunks:
         was_hard_include = _article_is_hard_include(chunk.get("source", ""), chunk.get("title", ""))
         chunk_score = _chunk_macro_score(chunk["text"])
+        chunk["_hard_macro_hits"] = _count_term_hits(chunk["text"], _HARD_MACRO_TERMS)
+        chunk["_directional_hits"] = _count_term_hits(chunk["text"], _DIRECTIONAL_TERMS)
+        chunk["_noise_hits"] = _count_term_hits(chunk["text"], _NOISE_TERMS)
+        chunk["_title_macro_hits"] = _count_term_hits(chunk.get("title", ""), _TITLE_MACRO_KEYWORDS)
         should_process = was_hard_include or chunk_score >= CHUNK_SCORE_THRESHOLD
         chunk["_macro_score"] = chunk_score
         chunk["_was_hard_include"] = was_hard_include
@@ -868,10 +901,37 @@ def run_extraction(
     dedup_surviving: list[dict] = []
     article_dedup_skipped = 0
     for _art_chunks in _article_buckets.values():
-        # Sort descending by macro score; hard-includes already set score
-        _art_chunks.sort(key=lambda c: c["_macro_score"], reverse=True)
-        kept   = _art_chunks[:MACRO_MAX_CHUNKS_PER_ARTICLE]
+        article_is_hard_include = any(bool(c.get("_was_hard_include")) for c in _art_chunks)
+
+        if article_is_hard_include:
+            dedup_surviving.extend(_art_chunks)
+            continue
+
+        _art_chunks.sort(
+            key=lambda c: (
+                c.get("_macro_score", 0),
+                c.get("_title_macro_hits", 0),
+                c.get("_hard_macro_hits", 0),
+                c.get("_directional_hits", 0),
+            ),
+            reverse=True,
+        )
+
+        kept = _art_chunks[:MACRO_MAX_CHUNKS_PER_ARTICLE]
         dropped = _art_chunks[MACRO_MAX_CHUNKS_PER_ARTICLE:]
+        dedup_surviving.extend(kept)
+
+        for sk in dropped:
+            article_dedup_skipped += 1
+            _write_processing_audit(
+                conn,
+                chunk=sk,
+                stage="article_dedup",
+                status="article_dedup_skipped",
+                chunk_macro_score=sk.get("_macro_score"),
+                was_hard_include=bool(sk.get("_was_hard_include")),
+                review_reasons=["article_level_redundancy_skip"],
+            )
         dedup_surviving.extend(kept)
         for sk in dropped:
             article_dedup_skipped += 1
