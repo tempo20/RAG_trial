@@ -19,6 +19,280 @@ from tgrag_setup import EMBED_MODEL_NAME, load_financial_entity_map, load_ticker
 
 DEFAULT_GOLD_PATH = Path("gold_eval_cases.json")
 
+# ---------------------------------------------------------------------------
+# Answer-quality parsing helpers (deterministic, no LLM judge)
+# ---------------------------------------------------------------------------
+
+# Phrases the model is instructed to use (from CAUSAL_SYSTEM_PROMPT_TEMPLATE).
+_DIRECTION_PATTERNS: list[tuple[str, str]] = [
+    # (regex pattern, canonical label)
+    (r"\b(strongly\s+)?positive\b", "positive"),
+    (r"\b(strongly\s+)?negative\b", "negative"),
+    (r"\bmixed\b", "mixed"),
+    (r"\bunclear\b", "unclear"),
+    (r"\bnet\s+positive\b", "positive"),
+    (r"\bnet\s+negative\b", "negative"),
+    (r"\boffsets?\b.*\bgains?\b|\bgains?\b.*\boffsets?\b", "mixed"),
+    (r"\binsufficient\s+(evidence|article|context)\b", "unclear"),
+]
+
+# Patterns that signal hedged / mixed-evidence language
+_MIXED_LANGUAGE_PATTERNS: list[str] = [
+    r"\bmixed\b",
+    r"\boffset(ting|s)?\b",
+    r"\bcounterbalance[sd]?\b",
+    r"\bpartly\s+offset\b",
+    r"\bon\s+(the\s+)?one\s+hand\b",
+    r"\bon\s+(the\s+)?other\s+hand\b",
+    r"\bwhile\s+(also|simultaneously)\b",
+    r"\bbut\s+(also|simultaneously)\b",
+    r"\bdepends\s+on\b",
+    r"\buncertain\b",
+    r"\bconflict(ing|s)?\b.*\b(evidence|signal|data)\b",
+    r"\b(evidence|signal|data)\b.*\bconflict(ing|s)?\b",
+]
+
+# Overclaim patterns: asserting one direction cleanly despite hedge language
+_OVERCLAIM_PATTERNS: list[str] = [
+    r"\bwill\s+(certainly|definitely|surely)\b",
+    r"\bclearly\s+(bullish|bearish|positive|negative)\b",
+    r"\bno\s+doubt\b",
+    r"\bguaranteed\s+to\b",
+    r"\bwithout\s+question\b",
+    r"\bonly\s+(positive|negative|bullish|bearish)\b",
+    r"\bpurely\s+(positive|negative|bullish|bearish)\b",
+    r"\bstraightforward(ly)?\b",
+    # asserting a direction even though offsetting channels exist
+    r"\boverall(ly)?\s+(positive|negative|bullish|bearish)\b",
+    r"\bnet\s+effect\s+is\s+(clearly|definitely|certainly)\b",
+]
+
+# Confidence extraction: looks for "confidence: 75%" or "75% confident" etc.
+_CONFIDENCE_RE = re.compile(
+    r"confidence[:\s]+(\d{1,3})\s*%|(\d{1,3})\s*%\s+confident",
+    re.IGNORECASE,
+)
+
+
+def _extract_direction(text: str) -> str:
+    """Return the first matching directional label from a block of text."""
+    lower = text.lower()
+    for pattern, label in _DIRECTION_PATTERNS:
+        if re.search(pattern, lower):
+            return label
+    return "unclear"
+
+
+def _extract_confidence(text: str) -> int | None:
+    """Return confidence as 0-100 integer, or None if not found."""
+    m = _CONFIDENCE_RE.search(text)
+    if m:
+        raw = int(m.group(1) or m.group(2))
+        return max(0, min(100, raw))
+    return None
+
+
+def _extract_mechanisms(text: str, known_mechanisms: list[str]) -> list[str]:
+    """
+    Return which of the caller-supplied mechanism strings appear in the text.
+    Matching is case-insensitive substring / word-boundary search.
+    """
+    found = []
+    lower = text.lower()
+    for mech in known_mechanisms:
+        pattern = r"\b" + re.escape(mech.lower()) + r"\b"
+        if re.search(pattern, lower):
+            found.append(mech)
+    return found
+
+
+def _detect_mixed_language(text: str) -> list[str]:
+    """Return which mixed/hedge patterns fire in the text."""
+    lower = text.lower()
+    return [p for p in _MIXED_LANGUAGE_PATTERNS if re.search(p, lower)]
+
+
+def _detect_overclaims(text: str) -> list[str]:
+    """Return which overclaim patterns fire in the text."""
+    lower = text.lower()
+    return [p for p in _OVERCLAIM_PATTERNS if re.search(p, lower)]
+
+
+def parse_answer_meta(answer: str, all_mechanisms: list[str]) -> dict[str, Any]:
+    """
+    Extract structured quality signals from a free-text answer.
+
+    Returns a dict with:
+      direction          – positive / negative / mixed / unclear
+      confidence         – int 0-100 or None
+      mechanisms_found   – subset of all_mechanisms mentioned in text
+      has_counterargs    – True if answer references counter-arguments / offsetting channels
+      mixed_lang_hits    – list of mixed/hedge patterns that fired
+      overclaim_hits     – list of overclaim patterns that fired
+    """
+    counterarg_re = re.compile(
+        r"\b(however|nevertheless|that said|on the other hand|offset|counteract|"
+        r"but also|though|mitigat(es?|ing)|headwind|tailwind|risk|caveat)\b",
+        re.IGNORECASE,
+    )
+    return {
+        "direction": _extract_direction(answer or ""),
+        "confidence": _extract_confidence(answer or ""),
+        "mechanisms_found": _extract_mechanisms(answer or "", all_mechanisms),
+        "has_counterargs": bool(counterarg_re.search(answer or "")),
+        "mixed_lang_hits": _detect_mixed_language(answer or ""),
+        "overclaim_hits": _detect_overclaims(answer or ""),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Macro-answer evaluation against gold expectations
+# ---------------------------------------------------------------------------
+
+
+def evaluate_macro_answer(
+    parsed: dict[str, Any],
+    gold: dict[str, Any],
+) -> dict[str, Any]:
+    """
+    Compare parsed answer metadata against gold-case answer-quality fields.
+
+    Gold fields (all optional):
+      expected_direction        – exact expected label (positive/negative/mixed/unclear)
+      allowed_directions        – list of acceptable labels (overrides expected_direction check)
+      required_mechanisms       – mechanisms that MUST appear in the answer
+      optional_mechanisms       – mechanisms that may appear (informational only)
+      required_counterarguments – set True / list of strings that must appear
+      forbidden_overclaims      – list of overclaim patterns that must NOT fire
+      max_confidence_if_mixed   – upper bound on confidence when direction is mixed/unclear
+
+    Returns a dict with per-check pass/fail booleans and an overall passed flag.
+    """
+    failures: list[str] = []
+    details: dict[str, Any] = {}
+
+    # --- direction check ---
+    direction = parsed["direction"]
+    allowed = gold.get("allowed_directions") or (
+        [gold["expected_direction"]] if gold.get("expected_direction") else None
+    )
+    if allowed is not None:
+        direction_ok = direction in allowed
+        details["direction_check"] = {
+            "passed": direction_ok,
+            "expected_one_of": allowed,
+            "observed": direction,
+        }
+        if not direction_ok:
+            failures.append(f"direction '{direction}' not in {allowed}")
+    else:
+        details["direction_check"] = {"passed": True, "skipped": True}
+
+    # --- confidence-cap check for mixed/unclear ---
+    confidence = parsed["confidence"]
+    max_conf = gold.get("max_confidence_if_mixed")
+    if max_conf is not None and direction in ("mixed", "unclear"):
+        cap_ok = (confidence is None) or (confidence <= max_conf)
+        details["confidence_cap_check"] = {
+            "passed": cap_ok,
+            "max_allowed": max_conf,
+            "observed": confidence,
+            "direction": direction,
+        }
+        if not cap_ok:
+            failures.append(
+                f"confidence {confidence}% exceeds cap {max_conf}% for direction '{direction}'"
+            )
+    else:
+        details["confidence_cap_check"] = {"passed": True, "skipped": True}
+
+    # --- required mechanisms ---
+    req_mechs = gold.get("required_mechanisms", [])
+    if req_mechs:
+        found_mechs = set(parsed["mechanisms_found"])
+        missing = [m for m in req_mechs if m not in found_mechs]
+        mech_ok = not missing
+        details["required_mechanisms_check"] = {
+            "passed": mech_ok,
+            "required": req_mechs,
+            "found": sorted(found_mechs),
+            "missing": missing,
+        }
+        if not mech_ok:
+            failures.append(f"required mechanisms not mentioned: {missing}")
+    else:
+        details["required_mechanisms_check"] = {"passed": True, "skipped": True}
+
+    # --- required counterarguments ---
+    req_counter = gold.get("required_counterarguments", False)
+    if req_counter is True or (isinstance(req_counter, list) and req_counter):
+        if isinstance(req_counter, list):
+            # Specific phrases expected
+            lower_answer = (parsed.get("_raw_answer") or "").lower()
+            missing_ca = [c for c in req_counter if c.lower() not in lower_answer]
+            ca_ok = not missing_ca
+            details["counterarg_check"] = {
+                "passed": ca_ok,
+                "required": req_counter,
+                "missing": missing_ca,
+            }
+            if not ca_ok:
+                failures.append(f"required counterargument phrases missing: {missing_ca}")
+        else:
+            # Just requires that some counterargument language exists
+            ca_ok = parsed["has_counterargs"]
+            details["counterarg_check"] = {
+                "passed": ca_ok,
+                "required": True,
+                "has_counterargs": ca_ok,
+            }
+            if not ca_ok:
+                failures.append("answer must acknowledge counterarguments / offsetting channels")
+    else:
+        details["counterarg_check"] = {"passed": True, "skipped": True}
+
+    # --- forbidden overclaims ---
+    forbidden_oc = gold.get("forbidden_overclaims", [])
+    if forbidden_oc:
+        fired = [p for p in forbidden_oc if re.search(p, (parsed.get("_raw_answer") or ""), re.IGNORECASE)]
+        oc_ok = not fired
+        details["overclaim_check"] = {
+            "passed": oc_ok,
+            "forbidden_patterns": forbidden_oc,
+            "fired": fired,
+        }
+        if not oc_ok:
+            failures.append(f"forbidden overclaim patterns fired: {fired}")
+    elif parsed["overclaim_hits"] and parsed.get("mixed_lang_hits"):
+        # Auto-penalty: model made a strong directional call while also hedging
+        oc_ok = False
+        details["overclaim_check"] = {
+            "passed": False,
+            "auto_penalty": True,
+            "overclaim_hits": parsed["overclaim_hits"],
+            "mixed_lang_hits": parsed["mixed_lang_hits"],
+            "reason": (
+                "Model used strong directional language alongside mixed/hedge language "
+                "without explicit dominance claim."
+            ),
+        }
+        failures.append("overclaim: strong directional call conflicts with hedge language")
+    else:
+        details["overclaim_check"] = {"passed": True, "skipped": True}
+
+    passed = not failures
+    return {
+        "passed": passed,
+        "failures": failures,
+        "direction": direction,
+        "confidence": confidence,
+        "mechanisms_found": parsed["mechanisms_found"],
+        "has_counterargs": parsed["has_counterargs"],
+        "mixed_lang_hits": parsed["mixed_lang_hits"],
+        "overclaim_hits": parsed["overclaim_hits"],
+        **details,
+    }
+
 
 def load_gold_cases(path: Path) -> dict[str, Any]:
     with path.open(encoding="utf-8") as f:
@@ -157,10 +431,18 @@ def evaluate_case(case: dict[str, Any], runtime: dict[str, Any], *, skip_generat
     required_grounding = case.get("expected_answer_grounding", {})
 
     chunk_score = _score_set(case.get("expected_chunks", []), chunk_ids)
-    entity_score = _score_set(case.get("expected_entities", []), entities + ([result["target"].canonical_name] if result.get("target") and result["target"].canonical_name else []))
+    entity_score = _score_set(
+        case.get("expected_entities", []),
+        entities + (
+            [result["target"].canonical_name]
+            if result.get("target") and result["target"].canonical_name
+            else []
+        ),
+    )
     macro_id_score = _score_set(case.get("expected_macro_event_ids", []), macro_event_ids)
     macro_type_score = _score_set(case.get("expected_macro_event_types", []), macro_event_types)
 
+    # --- existing retrieval + grounding passes ---
     passes = [
         chunk_score["recall"] >= case.get("min_chunk_recall", 0.5),
         entity_score["recall"] >= case.get("min_entity_recall", 1.0),
@@ -187,6 +469,26 @@ def evaluate_case(case: dict[str, Any], runtime: dict[str, Any], *, skip_generat
         ),
     ]
 
+    # --- macro answer quality evaluation (new) ---
+    macro_answer_eval: dict[str, Any] = {"passed": True, "skipped": True}
+    macro_answer_passed = True
+
+    gold_answer_quality = case.get("expected_answer_quality", {})
+    if gold_answer_quality and not skip_generation:
+        # Gather all mechanism strings the evaluator should look for
+        all_mechs: list[str] = list(
+            set(gold_answer_quality.get("required_mechanisms", []))
+            | set(gold_answer_quality.get("optional_mechanisms", []))
+        )
+        parsed = parse_answer_meta(result["answer"], all_mechs)
+        # Attach raw answer so evaluate_macro_answer can do phrase matching
+        parsed["_raw_answer"] = result["answer"]
+
+        macro_answer_eval = evaluate_macro_answer(parsed, gold_answer_quality)
+        macro_answer_passed = macro_answer_eval["passed"]
+
+    passes.append(macro_answer_passed)
+
     return {
         "id": case["id"],
         "query": case["query"],
@@ -195,6 +497,8 @@ def evaluate_case(case: dict[str, Any], runtime: dict[str, Any], *, skip_generat
         "macro_event_id_score": macro_id_score,
         "macro_event_type_score": macro_type_score,
         "grounding": grounding,
+        "macro_answer_eval": macro_answer_eval,
+        "macro_answer_passed": macro_answer_passed,
         "answer": result["answer"],
         "provenance": result["provenance"],
         "passed": all(passes),
@@ -282,6 +586,16 @@ def bootstrap_case(gold_path: Path, case_id: str, query: str, *, skip_generation
             "require_evidence_section": True,
             "require_theory_section": True,
             "min_cited_sources": 1,
+        },
+        # Stub for macro answer quality — edit after bootstrapping
+        "expected_answer_quality": {
+            "expected_direction": None,
+            "allowed_directions": [],
+            "required_mechanisms": [],
+            "optional_mechanisms": [],
+            "required_counterarguments": False,
+            "forbidden_overclaims": [],
+            "max_confidence_if_mixed": None,
         },
         "min_chunk_recall": 0.5,
         "min_entity_recall": 1.0,

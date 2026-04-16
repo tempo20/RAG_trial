@@ -80,6 +80,7 @@ ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
 TICKER_MAP_PATH = Path(os.getenv("TICKER_MAP_PATH", "ticker_company_map.csv"))
 FIN_ENTITY_MAP_PATH = Path(os.getenv("FIN_ENTITY_MAP_PATH", "financial_entity_map.csv"))
 SQLITE_DB = os.getenv("SQLITE_DB", "my_database.db")
+PROMPT_TEMPLATES_PATH = Path(os.getenv("PROMPT_TEMPLATES_PATH", "prompt_templates.json"))
 
 TOP_K = int(os.getenv("TOP_K", "4"))
 EXPANDED_K = int(os.getenv("EXPANDED_K", "8"))
@@ -124,6 +125,35 @@ SOURCE_KEYWORDS = {
 }
 
 _RERANKER = None
+
+
+def load_prompt_templates(path: Path) -> tuple[str, str]:
+    """
+    Load prompt templates from a JSON file so prompts can be edited
+    without modifying code.
+    Required keys:
+      - SYSTEM_PROMPT_TEMPLATE
+      - CAUSAL_SYSTEM_PROMPT_TEMPLATE
+    """
+    if not path.exists():
+        raise FileNotFoundError(
+            f"Prompt templates file not found: {path}. "
+            "Create it or set PROMPT_TEMPLATES_PATH."
+        )
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"Invalid JSON in prompt templates file {path}: {exc}") from exc
+
+    required = ("SYSTEM_PROMPT_TEMPLATE", "CAUSAL_SYSTEM_PROMPT_TEMPLATE")
+    missing = [key for key in required if key not in data]
+    if missing:
+        raise ValueError(f"Prompt templates file {path} is missing keys: {', '.join(missing)}")
+    if not all(isinstance(data[key], str) for key in required):
+        raise ValueError(
+            f"Prompt templates file {path} must define all template values as strings."
+        )
+    return data["SYSTEM_PROMPT_TEMPLATE"], data["CAUSAL_SYSTEM_PROMPT_TEMPLATE"]
 
 MARKET_INTENT_HINTS = (
     "price",
@@ -424,7 +454,10 @@ def format_provenance(chunks: list[dict]) -> str:
     if not chunks:
         return "Why this answer: no retrieved evidence."
     citation_map = build_citation_map(chunks)
-    lines = ["Why this answer:"]
+    lines = [
+        "Why this answer:",
+        "  [M] = market price data (FMP/Yahoo feed) — NOT from article database",
+    ]
     for chunk in chunks:
         chunk_uid = chunk.get("chunk_uid")
         if not chunk_uid:
@@ -535,19 +568,7 @@ def is_causal_analysis_intent(query: str) -> bool:
     has_usd_anchor = any(anchor in q for anchor in CAUSAL_USD_ANCHORS)
     return has_causal_verb and has_usd_anchor
 
-CAUSAL_SYSTEM_PROMPT_TEMPLATE = (
-    "You are a macro-financial analyst. "
-    "Answer in 3-5 sentences maximum. "
-    "Structure your response with these exact section headers: Answer, Evidence, Theory. "
-    "State the directional impact on the USD, the single most important transmission mechanism, "
-    "and your confidence level. "
-    "Every factual sentence in Answer and Evidence must include one or more inline citations like [S1] or [S1][S2]. "
-    "Label claims from the retrieved news as evidence and claims from macro theory as theory by placing them in the matching sections. "
-    "If no inference is needed, write 'Theory: None.' "
-    "Do not fabricate prices or statistics not present in the chunks. "
-    "If the chunks are insufficient, say so in one sentence. "
-    "Your database covers articles from {date_min} to {date_max}."
-)
+SYSTEM_PROMPT_TEMPLATE, CAUSAL_SYSTEM_PROMPT_TEMPLATE = load_prompt_templates(PROMPT_TEMPLATES_PATH)
 
 # ---------------------------------------------------------------------------
 # Causal chain decomposition + multi-hop retrieval
@@ -756,7 +777,11 @@ def fetch_market_context(
     else:
         start_dt = (now - timedelta(days=lookback_days)).strftime("%Y-%m-%d")
 
-    lines = ["MARKET DATA (fetched via FMP):"]
+    # The header tells the LLM this is [M]-citable price data, not article text.
+    lines = [
+        "MARKET DATA [M] — cite any fact from this block as [M], NOT as [Sx]:",
+        "(Source: FinancialModelingPrep / YahooFinance price feed, NOT from the article database)",
+    ]
 
     try:
         toolkit = Toolkit(symbols, api_key=api_key, start_date=start_dt, end_date=end_dt)
@@ -2053,22 +2078,6 @@ def build_context(
 # Generation
 # ---------------------------------------------------------------------------
 
-SYSTEM_PROMPT_TEMPLATE = (
-    "You are a financial news assistant. "
-    "Answer ONLY using the exact facts stated in the provided news chunks below. "
-    "Do NOT add any information not explicitly present in the chunks. "
-    "Do NOT use your own knowledge about companies, valuations, or events. "
-    "Structure your response with these exact section headers: Answer, Evidence, Theory. "
-    "Every factual sentence in Answer and Evidence must include one or more inline citations like [S1] or [S1][S2]. "
-    "Theory must be clearly separated from evidence-backed claims; if no inference is needed, write 'Theory: None.' "
-    "Never cite a source label that is not present in the context. "
-    "If the chunks do not contain enough information to answer, say: "
-    "'The retrieved articles do not contain sufficient information to answer this.' "
-    "Your database covers articles from {date_min} to {date_max}. "
-    "Do not output <think> tags or chain-of-thought reasoning."
-)
-
-
 def build_system_prompt(base: str, memory: "ConversationMemory") -> str:
     """
     Inject conversation history into the system prompt when memory is non-empty.
@@ -2090,7 +2099,13 @@ def generate_answer(query: str, context: str, gen_client: Any, system_prompt: st
         messages=[
             {
                 "role": "user",
-                "content": f"Context:\n{context}\n\nQuestion: {query}",
+                "content": (
+                    f"Question: {query}\n\n"
+                    "Use the context below to answer.\n"
+                    "Prefer directly relevant evidence over tangential mentions.\n"
+                    "If evidence is weak or indirect, say so clearly.\n\n"
+                    f"Context:\n{context}"
+                ),
             }
         ],
     )
