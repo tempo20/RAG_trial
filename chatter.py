@@ -443,39 +443,8 @@ def format_provenance(chunks: list[dict]) -> str:
 def ensure_structured_answer(answer: str, chunks: list[dict]) -> str:
     answer = (answer or "").strip()
     if not answer:
-        return "Answer: The retrieved articles do not contain sufficient information to answer this.\n\nEvidence:\n- No direct evidence retrieved.\n\nTheory: None."
-
-    citation_map = build_citation_map(chunks)
-    citation_labels = [citation_map[chunk["chunk_uid"]] for chunk in chunks if chunk.get("chunk_uid") in citation_map]
-    citation_suffix = "".join(f"[{label}]" for label in citation_labels[:2])
-    if citation_suffix and not re.search(r"\[S\d+\]", answer):
-        answer = f"{answer} {citation_suffix}".strip()
-
-    has_sections = all(
-        re.search(rf"(^|\n){marker}\s*:", answer, flags=re.IGNORECASE)
-        for marker in ("Answer", "Evidence", "Theory")
-    )
-    if has_sections:
-        return answer
-
-    evidence_lines = []
-    for chunk in chunks[:3]:
-        chunk_uid = chunk.get("chunk_uid")
-        if not chunk_uid or chunk_uid not in citation_map:
-            continue
-        snippet = chunk.get("evidence_text") or chunk.get("macro_summary") or chunk.get("text", "")
-        snippet = " ".join(str(snippet).split())
-        if len(snippet) > 220:
-            snippet = snippet[:217] + "..."
-        evidence_lines.append(f"- {snippet} [{citation_map[chunk_uid]}]")
-    if not evidence_lines:
-        evidence_lines.append("- No direct evidence retrieved.")
-
-    return (
-        f"Answer: {answer}\n\n"
-        f"Evidence:\n" + "\n".join(evidence_lines) + "\n\n"
-        "Theory: None."
-    )
+        return "The retrieved articles do not contain sufficient information to answer this."
+    return answer
 
 
 def _fetch_chunk_rows_by_ids(
@@ -653,11 +622,21 @@ def retrieve_causal_chain(
     Each chunk gets an 'expansion_kind' label showing which hop it came from,
     so build_context() surfaces this in the context passed to the LLM.
     """
+    # Normalize and dedupe hops to avoid repeated full retrieval passes.
+    normalized_hops: list[str] = []
+    seen_hops: set[str] = set()
+    for hop in hops:
+        hop_norm = str(hop).strip().lower()
+        if not hop_norm or hop_norm in seen_hops:
+            continue
+        seen_hops.add(hop_norm)
+        normalized_hops.append(hop_norm)
+
     all_chunks: list[dict] = []
     seen_uids: set[str] = set()
     primary_target: QueryTarget | None = None
 
-    for hop in hops:
+    for hop in normalized_hops:
         try:
             # Reuse the full retrieve() stack — entity resolution + 3-layer retrieval
             hop_chunks, hop_target = retrieve(
@@ -683,14 +662,16 @@ def retrieve_causal_chain(
         if primary_target is None and hop_target.canonical_name:
             primary_target = hop_target
 
+        added_from_hop = 0
         for ch in hop_chunks[:chunks_per_hop]:
             uid = ch.get("chunk_uid")
             if uid and uid not in seen_uids:
                 seen_uids.add(uid)
                 ch["expansion_kind"] = f"causal_hop:{hop}"
                 all_chunks.append(ch)
+                added_from_hop += 1
 
-        print(f"  [causal hop: {hop} | chunks: {len([c for c in hop_chunks[:chunks_per_hop] if c.get('chunk_uid') not in seen_uids - {c.get('chunk_uid')}])}]")
+        print(f"  [causal hop: {hop} | chunks: {added_from_hop}]")
 
     # Fall back to a general semantic search on the original query
     # in case hop-entity retrieval returned nothing useful
@@ -2480,10 +2461,6 @@ def main():
 
         elapsed = time.perf_counter() - t0
         print(f"\nAssistant: {result['answer']}")
-        if result["urls"]:
-            print("\nSources:")
-            for url in result["urls"]:
-                print(f"  - {url}")
         print()
         print(result["provenance"])
         print(f"  [{elapsed:.1f}s]\n")
