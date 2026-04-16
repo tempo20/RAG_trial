@@ -85,6 +85,34 @@ PROMPT_TEMPLATES_PATH = Path(os.getenv("PROMPT_TEMPLATES_PATH", "prompt_template
 TOP_K = int(os.getenv("TOP_K", "4"))
 EXPANDED_K = int(os.getenv("EXPANDED_K", "8"))
 RECENCY_HALF_LIFE_DAYS = float(os.getenv("RECENCY_HALF_LIFE_DAYS", "5"))
+
+SUMMARY_TOP_K = int(os.getenv("SUMMARY_TOP_K", "12"))
+SUMMARY_EXPANDED_K = int(os.getenv("SUMMARY_EXPANDED_K", "24"))
+SUMMARY_RECENCY_HALF_LIFE_DAYS = float(os.getenv("SUMMARY_RECENCY_HALF_LIFE_DAYS", "2"))
+SUMMARY_TERMS = (
+    "summary",
+    "summarise",
+    "summarize",
+    "recap",
+    "brief",
+    "wrap-up",
+    "wrap up",
+    "overview",
+)
+SUMMARY_TIME_TERMS = (
+    "today",
+    "today's",
+    "todays",
+    "daily",
+    "yesterday",
+    "yesterday's",
+)
+SUMMARY_DOMAIN_TERMS = (
+    "macro",
+    "news",
+    "market",
+    "markets",
+)
 SQLITE_SEMANTIC_CANDIDATE_LIMIT = int(os.getenv("SQLITE_SEMANTIC_CANDIDATE_LIMIT", "0"))
 MACRO_EVENT_CANDIDATE_LIMIT = int(os.getenv("MACRO_EVENT_CANDIDATE_LIMIT", "600"))
 GEN_MAX_TOKENS = int(os.getenv("GEN_MAX_TOKENS", "1024"))
@@ -126,15 +154,16 @@ SOURCE_KEYWORDS = {
 
 _RERANKER = None
 
+def _coerce_prompt_template(value: Any, key: str) -> str:
+    if isinstance(value, str):
+        return value
+    if isinstance(value, list) and all(isinstance(item, str) for item in value):
+        return "\n".join(value)
+    raise ValueError(
+        f"Prompt template '{key}' must be either a string or a list of strings."
+    )
 
-def load_prompt_templates(path: Path) -> tuple[str, str]:
-    """
-    Load prompt templates from a JSON file so prompts can be edited
-    without modifying code.
-    Required keys:
-      - SYSTEM_PROMPT_TEMPLATE
-      - CAUSAL_SYSTEM_PROMPT_TEMPLATE
-    """
+def load_prompt_templates(path: Path) -> tuple[str, str, str]:
     if not path.exists():
         raise FileNotFoundError(
             f"Prompt templates file not found: {path}. "
@@ -149,11 +178,27 @@ def load_prompt_templates(path: Path) -> tuple[str, str]:
     missing = [key for key in required if key not in data]
     if missing:
         raise ValueError(f"Prompt templates file {path} is missing keys: {', '.join(missing)}")
-    if not all(isinstance(data[key], str) for key in required):
-        raise ValueError(
-            f"Prompt templates file {path} must define all template values as strings."
+
+    system_prompt = _coerce_prompt_template(data["SYSTEM_PROMPT_TEMPLATE"], "SYSTEM_PROMPT_TEMPLATE")
+    causal_prompt = _coerce_prompt_template(data["CAUSAL_SYSTEM_PROMPT_TEMPLATE"], "CAUSAL_SYSTEM_PROMPT_TEMPLATE")
+
+    daily_summary_raw = data.get("DAILY_SUMMARY_PROMPT_TEMPLATE")
+    if daily_summary_raw is None:
+        daily_summary_prompt = (
+            "You are a grounded macro-financial news summarizer. "
+            "Answer using only the provided context. "
+            "Group related stories into 3-5 major themes. "
+            "Focus on macro-relevant developments and cite factual sentences as [S1], [S2], etc. "
+            "Do not use outside knowledge. "
+            "Your article database covers {date_min} to {date_max}."
         )
-    return data["SYSTEM_PROMPT_TEMPLATE"], data["CAUSAL_SYSTEM_PROMPT_TEMPLATE"]
+    else:
+        daily_summary_prompt = _coerce_prompt_template(
+            daily_summary_raw,
+            "DAILY_SUMMARY_PROMPT_TEMPLATE",
+        )
+
+    return system_prompt, causal_prompt, daily_summary_prompt
 
 MARKET_INTENT_HINTS = (
     "price",
@@ -548,6 +593,52 @@ def is_market_data_intent(query: str) -> bool:
     q = query.lower()
     return any(hint in q for hint in MARKET_INTENT_HINTS)
 
+def is_summary_query(query: str) -> bool:
+    q = (query or "").strip().lower()
+    has_summary = any(term in q for term in SUMMARY_TERMS)
+    has_time = any(term in q for term in SUMMARY_TIME_TERMS)
+    has_domain = any(term in q for term in SUMMARY_DOMAIN_TERMS)
+    return has_summary and (has_time or has_domain)
+
+
+def infer_summary_date_range(query: str) -> tuple[str | None, str | None]:
+    q = (query or "").strip().lower()
+    today = datetime.now(timezone.utc).date()
+
+    if "yesterday" in q or "yesterday's" in q:
+        d = today - timedelta(days=1)
+        return d.isoformat(), d.isoformat()
+
+    if "today" in q or "today's" in q or "todays" in q or "daily" in q:
+        return today.isoformat(), today.isoformat()
+
+    return None, None
+
+
+def dedupe_chunks_for_summary(chunks: list[dict], max_per_article: int = 2) -> list[dict]:
+    seen_chunk_ids: set[str] = set()
+    per_article_counts: dict[str, int] = {}
+    out: list[dict] = []
+
+    for ch in chunks:
+        chunk_uid = ch.get("chunk_uid")
+        article_id = ch.get("article_id")
+
+        if chunk_uid and chunk_uid in seen_chunk_ids:
+            continue
+        if chunk_uid:
+            seen_chunk_ids.add(chunk_uid)
+
+        if article_id:
+            count = per_article_counts.get(article_id, 0)
+            if count >= max_per_article:
+                continue
+            per_article_counts[article_id] = count + 1
+
+        out.append(ch)
+
+    return out
+
 CAUSAL_INTENT_HINTS = (
     "affect", "impact", "effect", "influence", "cause", "drive",
     "mean for", "implication", "what does", "how does", "why is",
@@ -568,7 +659,7 @@ def is_causal_analysis_intent(query: str) -> bool:
     has_usd_anchor = any(anchor in q for anchor in CAUSAL_USD_ANCHORS)
     return has_causal_verb and has_usd_anchor
 
-SYSTEM_PROMPT_TEMPLATE, CAUSAL_SYSTEM_PROMPT_TEMPLATE = load_prompt_templates(PROMPT_TEMPLATES_PATH)
+SYSTEM_PROMPT_TEMPLATE, CAUSAL_SYSTEM_PROMPT_TEMPLATE, DAILY_SUMMARY_PROMPT_TEMPLATE = load_prompt_templates(PROMPT_TEMPLATES_PATH)
 
 # ---------------------------------------------------------------------------
 # Causal chain decomposition + multi-hop retrieval
@@ -2217,12 +2308,15 @@ def run_query_once(
     alias_to_fin_entity: dict[str, dict[str, Any]],
     base_system_prompt: str,
     base_causal_system_prompt: str,
+    base_daily_summary_prompt: str,
     memory: ConversationMemory,
     skip_generation: bool = False,
 ) -> dict[str, Any]:
     query, was_rewritten = resolve_coreference(query, memory)
     market_data_intent = is_market_data_intent(query)
     causal_intent = is_causal_analysis_intent(query)
+    summary_mode = is_summary_query(query)
+    forced_summary_start, forced_summary_end = infer_summary_date_range(query)
     source_filter = extract_source_filter(query)
     sub_queries = resolve_temporal_carryover(decompose_query(query, gen_client), memory)
 
@@ -2245,6 +2339,9 @@ def run_query_once(
     for sq in sub_queries:
         date_start = sq.get("time_start")
         date_end = sq.get("time_end")
+        if summary_mode and forced_summary_start and forced_summary_end:
+            date_start = forced_summary_start
+            date_end = forced_summary_end
         if date_start or date_end:
             logs.append(f"  [time filter: {date_start} -> {date_end}]")
 
@@ -2282,9 +2379,11 @@ def run_query_once(
                     alias_to_ticker=alias_to_ticker,
                     ticker_to_canonical=ticker_to_canonical,
                     alias_to_fin_entity=alias_to_fin_entity,
-                    top_k=TOP_K,
-                    expanded_k=EXPANDED_K,
-                    recency_half_life_days=RECENCY_HALF_LIFE_DAYS,
+                    top_k=SUMMARY_TOP_K if summary_mode else TOP_K,
+                    expanded_k=SUMMARY_EXPANDED_K if summary_mode else EXPANDED_K,
+                    recency_half_life_days=(
+                        SUMMARY_RECENCY_HALF_LIFE_DAYS if summary_mode else RECENCY_HALF_LIFE_DAYS
+                    ),
                     source_filter=source_filter,
                     date_start=date_start,
                     date_end=date_end,
@@ -2299,9 +2398,11 @@ def run_query_once(
                 alias_to_ticker=alias_to_ticker,
                 ticker_to_canonical=ticker_to_canonical,
                 alias_to_fin_entity=alias_to_fin_entity,
-                top_k=TOP_K,
-                expanded_k=EXPANDED_K,
-                recency_half_life_days=RECENCY_HALF_LIFE_DAYS,
+                top_k=SUMMARY_TOP_K if summary_mode else TOP_K,
+                expanded_k=SUMMARY_EXPANDED_K if summary_mode else EXPANDED_K,
+                recency_half_life_days=(
+                    SUMMARY_RECENCY_HALF_LIFE_DAYS if summary_mode else RECENCY_HALF_LIFE_DAYS
+                ),
                 source_filter=source_filter,
                 date_start=date_start,
                 date_end=date_end,
@@ -2316,6 +2417,9 @@ def run_query_once(
             primary_target = target
             primary_date_start = date_start
             primary_date_end = date_end
+
+        if summary_mode:
+            chunks = dedupe_chunks_for_summary(chunks, max_per_article=2)
 
         all_chunks.extend(chunks)
         period_label = f"[{date_start} -> {date_end}] " if (date_start or date_end) else ""
@@ -2342,10 +2446,12 @@ def run_query_once(
             "date_end": primary_date_end,
         }
 
-    system_prompt = build_system_prompt(base_system_prompt, memory)
+    active_base_system_prompt = base_daily_summary_prompt if summary_mode else base_system_prompt
+
+    system_prompt = build_system_prompt(active_base_system_prompt, memory)
     causal_system_prompt = (
         build_system_prompt(base_causal_system_prompt, memory)
-        if causal_intent and not market_data_intent
+        if causal_intent and not market_data_intent and not summary_mode
         else None
     )
     merged_context = "\n\n---\n\n".join(all_contexts)
@@ -2432,6 +2538,7 @@ def main():
     # Base prompt — conversation history is injected per-turn via build_system_prompt()
     base_system_prompt = SYSTEM_PROMPT_TEMPLATE.format(date_min=date_min, date_max=date_max)
     base_causal_system_prompt = CAUSAL_SYSTEM_PROMPT_TEMPLATE.format(date_min=date_min, date_max=date_max)
+    base_daily_summary_prompt = DAILY_SUMMARY_PROMPT_TEMPLATE.format(date_min=date_min, date_max=date_max)
 
     # ── Memory: load from disk if available ──────────────────────────────────
     memory = load_memory(MEMORY_PATH)
@@ -2469,6 +2576,7 @@ def main():
             alias_to_fin_entity=alias_to_fin_entity,
             base_system_prompt=base_system_prompt,
             base_causal_system_prompt=base_causal_system_prompt,
+            base_daily_summary_prompt=base_daily_summary_prompt,
             memory=memory,
         )
         for log_line in result["logs"]:
