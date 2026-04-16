@@ -9,7 +9,9 @@ __pycache__/
 !requirements.txt
 !financial_entity_map.csv
 test_simple_scraper_v2.py
+test_financial_entity_linker.py
 create_sql_db.py
 my_database.db
 test*.py
 !prompt_templates.json
+!ticker_company_map.csv
