@@ -84,9 +84,13 @@ SQLITE_DB = os.getenv("SQLITE_DB", "my_database.db")
 TOP_K = int(os.getenv("TOP_K", "4"))
 EXPANDED_K = int(os.getenv("EXPANDED_K", "8"))
 RECENCY_HALF_LIFE_DAYS = float(os.getenv("RECENCY_HALF_LIFE_DAYS", "5"))
-SQLITE_SEMANTIC_CANDIDATE_LIMIT = int(os.getenv("SQLITE_SEMANTIC_CANDIDATE_LIMIT", "1500"))
+SQLITE_SEMANTIC_CANDIDATE_LIMIT = int(os.getenv("SQLITE_SEMANTIC_CANDIDATE_LIMIT", "0"))
 MACRO_EVENT_CANDIDATE_LIMIT = int(os.getenv("MACRO_EVENT_CANDIDATE_LIMIT", "600"))
 GEN_MAX_TOKENS = int(os.getenv("GEN_MAX_TOKENS", "1024"))
+RERANKER_MODEL_NAME = os.getenv("RERANKER_MODEL_NAME", "cross-encoder/ms-marco-MiniLM-L-6-v2")
+ENABLE_CROSS_ENCODER_RERANK = os.getenv("ENABLE_CROSS_ENCODER_RERANK", "1").strip().lower() in {"1", "true", "yes", "on"}
+RERANK_CANDIDATE_LIMIT = int(os.getenv("RERANK_CANDIDATE_LIMIT", "18"))
+RERANK_WEIGHT = float(os.getenv("RERANK_WEIGHT", "0.85"))
 ALPHA_VANTAGE_API_KEY = os.getenv("ALPHA_VANTAGE_API_KEY", "").strip()
 ALPHA_VANTAGE_MCP_URL = os.getenv("ALPHA_VANTAGE_MCP_URL", "https://mcp.alphavantage.co/mcp").strip()
 _alpha_mcp_remote_flag = os.getenv("ENABLE_ALPHA_MCP_REMOTE")
@@ -118,6 +122,8 @@ SOURCE_KEYWORDS = {
     "nasdaq": "Nasdaq",
     "cbs": "CBS MoneyWatch",
 }
+
+_RERANKER = None
 
 MARKET_INTENT_HINTS = (
     "price",
@@ -342,6 +348,136 @@ def _sqlite_row_to_chunk_dict(row: sqlite3.Row) -> dict:
     }
 
 
+def _keyword_overlap_score(query: str, text: str) -> float:
+    query_terms = {
+        token
+        for token in re.findall(r"[a-zA-Z0-9]{3,}", query.lower())
+        if token not in {"what", "when", "where", "which", "with", "from", "that", "this", "have"}
+    }
+    if not query_terms:
+        return 0.0
+    text_terms = set(re.findall(r"[a-zA-Z0-9]{3,}", (text or "").lower()))
+    if not text_terms:
+        return 0.0
+    return len(query_terms & text_terms) / max(len(query_terms), 1)
+
+
+def load_reranker():
+    global _RERANKER
+    if not ENABLE_CROSS_ENCODER_RERANK:
+        return None
+    if _RERANKER is not None:
+        return _RERANKER
+    try:
+        from sentence_transformers import CrossEncoder
+    except ImportError:
+        print("  [reranker unavailable: CrossEncoder import failed]")
+        _RERANKER = False
+        return None
+    try:
+        print(f"Loading reranker: {RERANKER_MODEL_NAME}")
+        _RERANKER = CrossEncoder(RERANKER_MODEL_NAME)
+        return _RERANKER
+    except Exception as exc:
+        print(f"  [reranker unavailable: {exc}]")
+        _RERANKER = False
+        return None
+
+
+def apply_reranker(query: str, ranked_rows: list[dict], reranker=None) -> list[dict]:
+    if not ranked_rows:
+        return ranked_rows
+    active_reranker = reranker if reranker is not None else load_reranker()
+    if not active_reranker:
+        return ranked_rows
+
+    pool_size = min(RERANK_CANDIDATE_LIMIT, len(ranked_rows))
+    pool = ranked_rows[:pool_size]
+    try:
+        scores = active_reranker.predict(
+            [(query, row.get("text", "")) for row in pool],
+            show_progress_bar=False,
+        )
+    except TypeError:
+        scores = active_reranker.predict([(query, row.get("text", "")) for row in pool])
+    reranked = []
+    for row, rerank_score in zip(pool, scores):
+        combined_score = (1.0 - RERANK_WEIGHT) * float(row.get("score") or 0.0) + RERANK_WEIGHT * float(rerank_score)
+        reranked.append({**row, "rerank_score": float(rerank_score), "score": combined_score})
+    reranked.sort(key=lambda item: item["score"], reverse=True)
+    return reranked + ranked_rows[pool_size:]
+
+
+def build_citation_map(chunks: list[dict]) -> dict[str, str]:
+    mapping: dict[str, str] = {}
+    next_idx = 1
+    for chunk in chunks:
+        chunk_uid = chunk.get("chunk_uid")
+        if not chunk_uid or chunk_uid in mapping:
+            continue
+        mapping[chunk_uid] = f"S{next_idx}"
+        next_idx += 1
+    return mapping
+
+
+def format_provenance(chunks: list[dict]) -> str:
+    if not chunks:
+        return "Why this answer: no retrieved evidence."
+    citation_map = build_citation_map(chunks)
+    lines = ["Why this answer:"]
+    for chunk in chunks:
+        chunk_uid = chunk.get("chunk_uid")
+        if not chunk_uid:
+            continue
+        lines.append(
+            f"- [{citation_map[chunk_uid]}] {chunk.get('source', '?')} | "
+            f"{chunk.get('title', '?')} | retrieval={chunk.get('retrieval_kind', '?')} | chunk={chunk_uid}"
+        )
+        if chunk.get("macro_summary"):
+            lines.append(f"  macro={chunk['macro_summary']}")
+        if chunk.get("evidence_text"):
+            lines.append(f"  evidence={chunk['evidence_text']}")
+    return "\n".join(lines)
+
+
+def ensure_structured_answer(answer: str, chunks: list[dict]) -> str:
+    answer = (answer or "").strip()
+    if not answer:
+        return "Answer: The retrieved articles do not contain sufficient information to answer this.\n\nEvidence:\n- No direct evidence retrieved.\n\nTheory: None."
+
+    citation_map = build_citation_map(chunks)
+    citation_labels = [citation_map[chunk["chunk_uid"]] for chunk in chunks if chunk.get("chunk_uid") in citation_map]
+    citation_suffix = "".join(f"[{label}]" for label in citation_labels[:2])
+    if citation_suffix and not re.search(r"\[S\d+\]", answer):
+        answer = f"{answer} {citation_suffix}".strip()
+
+    has_sections = all(
+        re.search(rf"(^|\n){marker}\s*:", answer, flags=re.IGNORECASE)
+        for marker in ("Answer", "Evidence", "Theory")
+    )
+    if has_sections:
+        return answer
+
+    evidence_lines = []
+    for chunk in chunks[:3]:
+        chunk_uid = chunk.get("chunk_uid")
+        if not chunk_uid or chunk_uid not in citation_map:
+            continue
+        snippet = chunk.get("evidence_text") or chunk.get("macro_summary") or chunk.get("text", "")
+        snippet = " ".join(str(snippet).split())
+        if len(snippet) > 220:
+            snippet = snippet[:217] + "..."
+        evidence_lines.append(f"- {snippet} [{citation_map[chunk_uid]}]")
+    if not evidence_lines:
+        evidence_lines.append("- No direct evidence retrieved.")
+
+    return (
+        f"Answer: {answer}\n\n"
+        f"Evidence:\n" + "\n".join(evidence_lines) + "\n\n"
+        "Theory: None."
+    )
+
+
 def _fetch_chunk_rows_by_ids(
     conn: sqlite3.Connection,
     chunk_ids: list[str],
@@ -433,10 +569,12 @@ def is_causal_analysis_intent(query: str) -> bool:
 CAUSAL_SYSTEM_PROMPT_TEMPLATE = (
     "You are a macro-financial analyst. "
     "Answer in 3-5 sentences maximum. "
+    "Structure your response with these exact section headers: Answer, Evidence, Theory. "
     "State the directional impact on the USD, the single most important transmission mechanism, "
     "and your confidence level. "
-    "Label claims from the retrieved news as [EVIDENCE] and claims from macro theory as [THEORY]. "
-    "At the end, give me a concise summary based on the evidence and theory. "
+    "Every factual sentence in Answer and Evidence must include one or more inline citations like [S1] or [S1][S2]. "
+    "Label claims from the retrieved news as evidence and claims from macro theory as theory by placing them in the matching sections. "
+    "If no inference is needed, write 'Theory: None.' "
     "Do not fabricate prices or statistics not present in the chunks. "
     "If the chunks are insufficient, say so in one sentence. "
     "Your database covers articles from {date_min} to {date_max}."
@@ -506,6 +644,7 @@ def retrieve_causal_chain(
     date_start: str | None = None,
     date_end: str | None = None,
     chunks_per_hop: int = 4,
+    reranker=None,
 ) -> tuple[list[dict], QueryTarget]:
     """
     Run retrieve() for each hop entity and merge the results.
@@ -524,6 +663,7 @@ def retrieve_causal_chain(
             hop_chunks, hop_target = retrieve(
                 query=hop,          # retrieve by canonical entity name, not the full query
                 embed_model=embed_model,
+                reranker=reranker,
                 driver=driver,
                 sqlite_conn=sqlite_conn,
                 alias_to_ticker=alias_to_ticker,
@@ -559,6 +699,7 @@ def retrieve_causal_chain(
             sem_chunks, sem_target = retrieve(
                 query=query,
                 embed_model=embed_model,
+                reranker=reranker,
                 driver=driver,
                 sqlite_conn=sqlite_conn,
                 alias_to_ticker=alias_to_ticker,
@@ -1612,8 +1753,9 @@ def retrieve_semantic_chunks(
     if source_filter:
         sql += " AND a.source = ?"
         params.append(source_filter)
-    sql += " ORDER BY c.published_date DESC LIMIT ?"
-    params.append(max(SQLITE_SEMANTIC_CANDIDATE_LIMIT, top_k))
+    if SQLITE_SEMANTIC_CANDIDATE_LIMIT > 0:
+        sql += " ORDER BY c.published_date DESC LIMIT ?"
+        params.append(max(SQLITE_SEMANTIC_CANDIDATE_LIMIT, top_k))
 
     rows = sqlite_conn.execute(sql, params).fetchall()
     if not rows:
@@ -1626,11 +1768,15 @@ def retrieve_semantic_chunks(
         emb = item.get("embedding")
         if emb is None:
             continue
-        item["semantic_score"] = cosine_sim(qvec, np.array(emb, dtype=np.float32))
+        semantic_score = cosine_sim(qvec, np.array(emb, dtype=np.float32))
+        lexical_score = _keyword_overlap_score(query, item.get("text", ""))
+        item["semantic_score"] = semantic_score
+        item["keyword_score"] = lexical_score
+        item["candidate_score"] = 0.85 * semantic_score + 0.15 * lexical_score
         item["retrieval_kind"] = "sqlite_semantic"
         scored.append(item)
 
-    scored.sort(key=lambda item: item["semantic_score"], reverse=True)
+    scored.sort(key=lambda item: item["candidate_score"], reverse=True)
     return scored[:top_k]
 
 
@@ -1696,6 +1842,18 @@ def score_and_rank(
     return sorted(seen.values(), key=lambda x: x["score"], reverse=True)
 
 
+def rank_candidates(
+    *,
+    query: str,
+    rows: list[dict],
+    query_vec: np.ndarray,
+    recency_half_life_days: float,
+    reranker=None,
+) -> list[dict]:
+    baseline = score_and_rank(rows, query_vec, recency_half_life_days)
+    return apply_reranker(query, baseline, reranker=reranker)
+
+
 # ---------------------------------------------------------------------------
 # Main retrieval orchestrator
 # ---------------------------------------------------------------------------
@@ -1714,6 +1872,7 @@ def retrieve(
     source_filter: str | None = None,
     date_start: str | None = None,
     date_end: str | None = None,
+    reranker=None,
 ) -> tuple[list[dict], QueryTarget]:
     """
     Hybrid retrieval for one sub-query.
@@ -1760,7 +1919,13 @@ def retrieve(
             top_k=max(4, expanded_k),
         )
         all_rows = entity_rows + macro_rows + asset_rows
-        ranked = score_and_rank(all_rows, query_vec, recency_half_life_days)
+        ranked = rank_candidates(
+            query=query,
+            rows=all_rows,
+            query_vec=query_vec,
+            recency_half_life_days=recency_half_life_days,
+            reranker=reranker,
+        )
 
         if len(ranked) < top_k:
             cooccur_rows = retrieve_cooccurrence_chunks(
@@ -1774,7 +1939,13 @@ def retrieve(
                 max_chunks=4,
             )
             all_rows += cooccur_rows
-            ranked = score_and_rank(all_rows, query_vec, recency_half_life_days)
+            ranked = rank_candidates(
+                query=query,
+                rows=all_rows,
+                query_vec=query_vec,
+                recency_half_life_days=recency_half_life_days,
+                reranker=reranker,
+            )
 
         if len(ranked) < top_k:
             semantic_rows = retrieve_semantic_chunks(
@@ -1788,7 +1959,13 @@ def retrieve(
                 top_k=expanded_k,
             )
             all_rows += semantic_rows
-            ranked = score_and_rank(all_rows, query_vec, recency_half_life_days)
+            ranked = rank_candidates(
+                query=query,
+                rows=all_rows,
+                query_vec=query_vec,
+                recency_half_life_days=recency_half_life_days,
+                reranker=reranker,
+            )
 
     else:
         asset_target = _resolve_asset_target(sqlite_conn, query)
@@ -1823,7 +2000,13 @@ def retrieve(
             source_filter=source_filter,
             top_k=expanded_k,
         )
-        ranked = score_and_rank(asset_rows + macro_rows + sem_rows, query_vec, recency_half_life_days)
+        ranked = rank_candidates(
+            query=query,
+            rows=asset_rows + macro_rows + sem_rows,
+            query_vec=query_vec,
+            recency_half_life_days=recency_half_life_days,
+            reranker=reranker,
+        )
 
     return ranked[:expanded_k], target
 
@@ -1837,6 +2020,7 @@ def build_context(
     target: QueryTarget,
     chunks: list[dict],
 ) -> str:
+    citation_map = build_citation_map(chunks)
     lines = []
     lines.append(f"TARGET ENTITY : {target.display_name or 'unknown'}")
     lines.append(f"TARGET CANONICAL: {target.canonical_name or 'unknown'}")
@@ -1851,10 +2035,16 @@ def build_context(
 
     lines.append("NEWS EVIDENCE:")
     for ch in chunks:
+        chunk_uid = ch.get("chunk_uid")
+        if chunk_uid:
+            lines.append(f"[CITATION: {citation_map.get(chunk_uid, '?')}]")
+            lines.append(f"[CHUNK ID: {chunk_uid}]")
         lines.append(f"[SOURCE: {ch.get('source', '?')}]")
         lines.append(f"[TITLE: {ch.get('title', '?')}]")
         lines.append(f"[URL: {ch.get('url', '?')}]")
         lines.append(f"[PERIOD: {ch.get('period_key', '?')}]")
+        if ch.get("score") is not None:
+            lines.append(f"[RANK SCORE: {float(ch['score']):.4f}]")
         if ch.get("retrieval_kind"):
             lines.append(f"[RETRIEVAL: {ch['retrieval_kind']}]")
         if ch.get("expansion_kind"):
@@ -1870,6 +2060,8 @@ def build_context(
                 f"[IMPACT: direction={ch.get('impact_direction', '?')}, "
                 f"strength={ch.get('impact_strength', '?')}, horizon={ch.get('impact_horizon', '?')}]"
             )
+        if ch.get("evidence_text"):
+            lines.append(f"[EVIDENCE SPAN: {ch['evidence_text']}]")
         lines.append(ch.get("text", ""))
         lines.append("")
 
@@ -1885,6 +2077,10 @@ SYSTEM_PROMPT_TEMPLATE = (
     "Answer ONLY using the exact facts stated in the provided news chunks below. "
     "Do NOT add any information not explicitly present in the chunks. "
     "Do NOT use your own knowledge about companies, valuations, or events. "
+    "Structure your response with these exact section headers: Answer, Evidence, Theory. "
+    "Every factual sentence in Answer and Evidence must include one or more inline citations like [S1] or [S1][S2]. "
+    "Theory must be clearly separated from evidence-backed claims; if no inference is needed, write 'Theory: None.' "
+    "Never cite a source label that is not present in the context. "
     "If the chunks do not contain enough information to answer, say: "
     "'The retrieved articles do not contain sufficient information to answer this.' "
     "Your database covers articles from {date_min} to {date_max}. "
@@ -2012,6 +2208,200 @@ def generate_answer_with_remote_mcp(
     return _run_once(primary_prompt)
 
 
+def run_query_once(
+    *,
+    query: str,
+    embed_model: SentenceTransformer,
+    reranker,
+    gen_client: Any,
+    driver,
+    sqlite_conn: sqlite3.Connection,
+    alias_to_ticker: dict[str, str],
+    ticker_to_canonical: dict[str, str],
+    alias_to_fin_entity: dict[str, dict[str, Any]],
+    base_system_prompt: str,
+    base_causal_system_prompt: str,
+    memory: ConversationMemory,
+    skip_generation: bool = False,
+) -> dict[str, Any]:
+    query, was_rewritten = resolve_coreference(query, memory)
+    market_data_intent = is_market_data_intent(query)
+    causal_intent = is_causal_analysis_intent(query)
+    source_filter = extract_source_filter(query)
+    sub_queries = resolve_temporal_carryover(decompose_query(query, gen_client), memory)
+
+    all_contexts: list[str] = []
+    all_urls: list[str] = []
+    primary_target = None
+    primary_date_start = None
+    primary_date_end = None
+    all_chunks: list[dict] = []
+    market_ctx = ""
+    logs: list[str] = []
+
+    if was_rewritten:
+        logs.append(f'  [memory] Coreference resolved -> "{query}"')
+    if source_filter:
+        logs.append(f"  [source filter: {source_filter}]")
+    if len(sub_queries) > 1:
+        logs.append(f"  [decomposed into {len(sub_queries)} sub-queries]")
+
+    for sq in sub_queries:
+        date_start = sq.get("time_start")
+        date_end = sq.get("time_end")
+        if date_start or date_end:
+            logs.append(f"  [time filter: {date_start} -> {date_end}]")
+
+        if causal_intent and not market_data_intent:
+            hops = decompose_causal_chain(sq["query"], gen_client)
+            if hops:
+                logs.append(f"  [causal chain: {' -> '.join(hops)}]")
+                chunks, target = retrieve_causal_chain(
+                    query=sq["query"],
+                    hops=hops,
+                    embed_model=embed_model,
+                    reranker=reranker,
+                    driver=driver,
+                    sqlite_conn=sqlite_conn,
+                    alias_to_ticker=alias_to_ticker,
+                    ticker_to_canonical=ticker_to_canonical,
+                    alias_to_fin_entity=alias_to_fin_entity,
+                    source_filter=source_filter,
+                    date_start=date_start,
+                    date_end=date_end,
+                )
+                market_ctx = fetch_market_context(
+                    hops=hops,
+                    date_start=date_start,
+                    date_end=date_end,
+                )
+            else:
+                logs.append("  [causal chain] decomposition empty, falling back to standard retrieve")
+                chunks, target = retrieve(
+                    query=sq["query"],
+                    embed_model=embed_model,
+                    reranker=reranker,
+                    driver=driver,
+                    sqlite_conn=sqlite_conn,
+                    alias_to_ticker=alias_to_ticker,
+                    ticker_to_canonical=ticker_to_canonical,
+                    alias_to_fin_entity=alias_to_fin_entity,
+                    top_k=TOP_K,
+                    expanded_k=EXPANDED_K,
+                    recency_half_life_days=RECENCY_HALF_LIFE_DAYS,
+                    source_filter=source_filter,
+                    date_start=date_start,
+                    date_end=date_end,
+                )
+        else:
+            chunks, target = retrieve(
+                query=sq["query"],
+                embed_model=embed_model,
+                reranker=reranker,
+                driver=driver,
+                sqlite_conn=sqlite_conn,
+                alias_to_ticker=alias_to_ticker,
+                ticker_to_canonical=ticker_to_canonical,
+                alias_to_fin_entity=alias_to_fin_entity,
+                top_k=TOP_K,
+                expanded_k=EXPANDED_K,
+                recency_half_life_days=RECENCY_HALF_LIFE_DAYS,
+                source_filter=source_filter,
+                date_start=date_start,
+                date_end=date_end,
+            )
+
+        logs.append(
+            f"  [entity: {target.display_name or 'general'} | canonical: {target.canonical_name or '-'} | "
+            f"confidence: {target.confidence:.2f} | chunks: {len(chunks)}]"
+        )
+
+        if primary_target is None or (target.canonical_name and not primary_target.canonical_name):
+            primary_target = target
+            primary_date_start = date_start
+            primary_date_end = date_end
+
+        all_chunks.extend(chunks)
+        period_label = f"[{date_start} -> {date_end}] " if (date_start or date_end) else ""
+        ctx = build_context(sq["query"], target, chunks)
+        if market_ctx:
+            ctx = ctx + "\n\n" + market_ctx
+        all_contexts.append(period_label + ctx)
+        for ch in chunks:
+            url = ch.get("url")
+            if url and url not in all_urls:
+                all_urls.append(url)
+
+    if not all_contexts:
+        return {
+            "query": query,
+            "answer": "No relevant chunks found.",
+            "chunks": [],
+            "urls": [],
+            "logs": logs,
+            "citation_map": {},
+            "provenance": "Why this answer: no retrieved evidence.",
+            "target": primary_target,
+            "date_start": primary_date_start,
+            "date_end": primary_date_end,
+        }
+
+    system_prompt = build_system_prompt(base_system_prompt, memory)
+    causal_system_prompt = (
+        build_system_prompt(base_causal_system_prompt, memory)
+        if causal_intent and not market_data_intent
+        else None
+    )
+    merged_context = "\n\n---\n\n".join(all_contexts)
+
+    final = ""
+    market_data_note: str | None = None
+    should_try_mcp = (
+        market_data_intent
+        and ENABLE_ALPHA_MCP_REMOTE
+        and bool(ALPHA_VANTAGE_API_KEY)
+        and primary_target is not None
+        and bool(primary_target.ticker)
+    )
+
+    if skip_generation or DEBUG_SKIP_GENERATION:
+        final = "Generation skipped because DEBUG_SKIP_GENERATION is enabled."
+    elif should_try_mcp:
+        mcp_answer, mcp_meta = generate_answer_with_remote_mcp(
+            query=query,
+            context=merged_context,
+            ticker=primary_target.ticker or "",
+            gen_client=gen_client,
+            system_prompt=system_prompt,
+        )
+        if mcp_answer is not None:
+            final = mcp_answer
+        else:
+            active_prompt = causal_system_prompt if causal_system_prompt else system_prompt
+            final = generate_answer(query, merged_context, gen_client, active_prompt)
+            market_data_note = ALPHA_MCP_FALLBACK_NOTE
+    else:
+        active_prompt = causal_system_prompt if causal_system_prompt else system_prompt
+        final = generate_answer(query, merged_context, gen_client, active_prompt)
+
+    if market_data_note:
+        final = f"{final}\n\nNote: {market_data_note}"
+    final = ensure_structured_answer(final, all_chunks)
+
+    return {
+        "query": query,
+        "answer": final,
+        "chunks": all_chunks,
+        "urls": all_urls,
+        "logs": logs,
+        "citation_map": build_citation_map(all_chunks),
+        "provenance": format_provenance(all_chunks),
+        "target": primary_target,
+        "date_start": primary_date_start,
+        "date_end": primary_date_end,
+    }
+
+
 # ---------------------------------------------------------------------------
 # Main loop
 # ---------------------------------------------------------------------------
@@ -2019,6 +2409,7 @@ def generate_answer_with_remote_mcp(
 def main():
     print("Loading embedding model...")
     embed_model = SentenceTransformer(EMBED_MODEL_NAME)
+    reranker = load_reranker()
 
     print("Loading generation model...")
     if not ANTHROPIC_API_KEY:
@@ -2070,207 +2461,42 @@ def main():
             break
 
         t0 = time.perf_counter()
-
-        # ── Hook 1: Coreference resolution ───────────────────────────────────
-        query, was_rewritten = resolve_coreference(query, memory)
-        market_data_intent = is_market_data_intent(query)
-        causal_intent = is_causal_analysis_intent(query)
-        if was_rewritten:
-            print(f"  [memory] Coreference resolved → \"{query}\"")
-
-        source_filter = extract_source_filter(query)
-        if source_filter:
-            print(f"  [source filter: {source_filter}]")
-
-        # ── Hook 2: Temporal decomposition ───────────────────────────────────
-        sub_queries = decompose_query(query, gen_client)
-        if len(sub_queries) > 1:
-            print(f"  [decomposed into {len(sub_queries)} sub-queries]")
-
-        # ── Hook 3: Temporal carryover from memory ────────────────────────────
-        sub_queries = resolve_temporal_carryover(sub_queries, memory)
-
-        all_contexts: list[str] = []
-        all_urls: list[str] = []
-
-        # Track the primary target across sub-queries (first resolved entity wins)
-        primary_target = None
-        primary_date_start = None
-        primary_date_end = None
-        all_chunks: list[dict] = []
-        market_ctx = ""
-        for sq in sub_queries:
-            date_start = sq.get("time_start")
-            date_end = sq.get("time_end")
-
-            if date_start or date_end:
-                print(f"  [time filter: {date_start} → {date_end}]")
-
-            if causal_intent and not market_data_intent:
-                # ── Causal path: decompose into transmission hops, retrieve each ──
-                hops = decompose_causal_chain(sq["query"], gen_client)
-                if hops:
-                    print(f"  [causal chain: {' → '.join(hops)}]")
-                    chunks, target = retrieve_causal_chain(
-                        query=sq["query"],
-                        hops=hops,
-                        embed_model=embed_model,
-                        driver=driver,
-                        sqlite_conn=sqlite_conn,
-                        alias_to_ticker=alias_to_ticker,
-                        ticker_to_canonical=ticker_to_canonical,
-                        alias_to_fin_entity=alias_to_fin_entity,
-                        source_filter=source_filter,
-                        date_start=date_start,
-                        date_end=date_end,
-                    )
-                    market_ctx = fetch_market_context(
-                        hops=hops,
-                        date_start=date_start,
-                        date_end=date_end,
-                    )
-                    print(f"  [market data: {len([l for l in market_ctx.splitlines() if l.strip().startswith('20')])} price points fetched]")
-                    if market_ctx:
-                        print(f"  [market data fetched for causal hops]")
-                else:
-                    # Decomposition returned nothing — fall back to standard retrieve
-                    print("  [causal chain] decomposition empty, falling back to standard retrieve")
-                    chunks, target = retrieve(
-                        query=sq["query"],
-                        embed_model=embed_model,
-                        driver=driver,
-                        sqlite_conn=sqlite_conn,
-                        alias_to_ticker=alias_to_ticker,
-                        ticker_to_canonical=ticker_to_canonical,
-                        alias_to_fin_entity=alias_to_fin_entity,
-                        top_k=TOP_K,
-                        expanded_k=EXPANDED_K,
-                        recency_half_life_days=RECENCY_HALF_LIFE_DAYS,
-                        source_filter=source_filter,
-                        date_start=date_start,
-                        date_end=date_end,
-                    )
-            else:
-                # ── Standard path: unchanged ──────────────────────────────────────
-                chunks, target = retrieve(
-                    query=sq["query"],
-                    embed_model=embed_model,
-                    driver=driver,
-                    sqlite_conn=sqlite_conn,
-                    alias_to_ticker=alias_to_ticker,
-                    ticker_to_canonical=ticker_to_canonical,
-                    alias_to_fin_entity=alias_to_fin_entity,
-                    top_k=TOP_K,
-                    expanded_k=EXPANDED_K,
-                    recency_half_life_days=RECENCY_HALF_LIFE_DAYS,
-                    source_filter=source_filter,
-                    date_start=date_start,
-                    date_end=date_end,
-                )
-
-            print(f"  [entity: {target.display_name or 'general'} | "
-                  f"canonical: {target.canonical_name or '—'} | "
-                  f"confidence: {target.confidence:.2f} | "
-                  f"chunks: {len(chunks)}]")
-
-            # Capture primary target from the first sub-query that resolves an entity
-            if primary_target is None or (
-                target.canonical_name and not primary_target.canonical_name
-            ):
-                primary_target = target
-                primary_date_start = date_start
-                primary_date_end = date_end
-
-            all_chunks.extend(chunks)
-
-            period_label = f"[{date_start} → {date_end}] " if (date_start or date_end) else ""
-            ctx = build_context(sq["query"], target, chunks)
-            if market_ctx:
-                ctx = ctx + "\n\n" + market_ctx
-            all_contexts.append(period_label + ctx)
-
-            for ch in chunks:
-                url = ch.get("url")
-                if url and url not in all_urls:
-                    all_urls.append(url)
-
-        if not all_contexts:
-            print("Assistant: No relevant chunks found.\n")
-            continue
-
-        # ── Hook 4: Inject conversation memory into system prompt ─────────────
-        system_prompt = build_system_prompt(base_system_prompt, memory)
-
-        # Route causal queries to the analyst prompt instead of the factual prompt
-        if causal_intent and not market_data_intent:
-            causal_system_prompt = build_system_prompt(base_causal_system_prompt, memory)
-            print("  [causal analysis mode]")
-        else:
-            causal_system_prompt = None
-
-        merged_context = "\n\n---\n\n".join(all_contexts)
-
-        if DEBUG_SKIP_GENERATION:
-            continue
-
-        final = ""
-        market_data_note: str | None = None
-
-        should_try_mcp = (
-            market_data_intent
-            and ENABLE_ALPHA_MCP_REMOTE
-            and bool(ALPHA_VANTAGE_API_KEY)
-            and primary_target is not None
-            and bool(primary_target.ticker)
+        result = run_query_once(
+            query=query,
+            embed_model=embed_model,
+            reranker=reranker,
+            gen_client=gen_client,
+            driver=driver,
+            sqlite_conn=sqlite_conn,
+            alias_to_ticker=alias_to_ticker,
+            ticker_to_canonical=ticker_to_canonical,
+            alias_to_fin_entity=alias_to_fin_entity,
+            base_system_prompt=base_system_prompt,
+            base_causal_system_prompt=base_causal_system_prompt,
+            memory=memory,
         )
-
-        if should_try_mcp:
-            print(f"  [alpha mcp: querying remote server (timeout={ALPHA_MCP_TIMEOUT_SECONDS:.0f}s)]")
-            mcp_answer, mcp_meta = generate_answer_with_remote_mcp(
-                query=query,
-                context=merged_context,
-                ticker=primary_target.ticker or "",
-                gen_client=gen_client,
-                system_prompt=system_prompt,
-            )
-            if mcp_answer is not None:
-                final = mcp_answer
-                tools_used = ", ".join(mcp_meta.get("tool_calls", [])) if isinstance(mcp_meta, dict) else ""
-                if tools_used:
-                    print(f"  [alpha mcp tools: {tools_used}]")
-            else:
-                reason = mcp_meta.get("reason", "unknown") if isinstance(mcp_meta, dict) else "unknown"
-                print(f"  [alpha mcp fallback: {reason}]")
-                # Use causal prompt on MCP fallback too if applicable
-                active_prompt = causal_system_prompt if causal_system_prompt else system_prompt
-                final = generate_answer(query, merged_context, gen_client, active_prompt)
-                market_data_note = ALPHA_MCP_FALLBACK_NOTE
-        else:
-            if market_data_intent and ENABLE_ALPHA_MCP_REMOTE and (primary_target is None or not primary_target.ticker):
-                print("  [alpha mcp skipped: no resolved ticker]")
-            active_prompt = causal_system_prompt if causal_system_prompt else system_prompt
-            final = generate_answer(query, merged_context, gen_client, active_prompt)
-
-        if market_data_note:
-            final = f"{final}\n\nNote: {market_data_note}"
+        for log_line in result["logs"]:
+            print(log_line)
 
         elapsed = time.perf_counter() - t0
-        print(f"\nAssistant: {final}")
-        if all_urls:
+        print(f"\nAssistant: {result['answer']}")
+        if result["urls"]:
             print("\nSources:")
-            for url in all_urls:
+            for url in result["urls"]:
                 print(f"  - {url}")
+        print()
+        print(result["provenance"])
         print(f"  [{elapsed:.1f}s]\n")
 
         # ── Hook 5: Record turn to memory ─────────────────────────────────────
         memory.record_turn(
-            query=query,
-            target=primary_target,
-            date_start=primary_date_start,
-            date_end=primary_date_end,
-            answer=final,
-            chunks=all_chunks,
-            source_urls=all_urls,
+            query=result["query"],
+            target=result["target"],
+            date_start=result["date_start"],
+            date_end=result["date_end"],
+            answer=result["answer"],
+            chunks=result["chunks"],
+            source_urls=result["urls"],
         )
 
         # ── Hook 6: Compress if session is getting long ───────────────────────
