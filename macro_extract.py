@@ -22,6 +22,7 @@ import json
 import os
 import sqlite3
 import uuid
+from collections import defaultdict
 from datetime import datetime, timezone
 from typing import Any
 
@@ -37,11 +38,12 @@ SQLITE_DB         = os.getenv("SQLITE_DB", "my_database.db")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
 GEN_MODEL_NAME    = os.getenv("GEN_MODEL_NAME", "claude-haiku-4-5-20251001")
 
-PROMPT_VERSION        = "v1"
-SCHEMA_VERSION        = "v1"
-MIN_TOKENS            = int(os.getenv("MACRO_MIN_TOKENS", "40"))
-MAX_TOKENS_OUT        = int(os.getenv("MACRO_MAX_TOKENS_OUT", "4096"))
-CHUNK_SCORE_THRESHOLD = int(os.getenv("MACRO_CHUNK_SCORE_THRESHOLD", "2"))
+PROMPT_VERSION              = "v2"
+SCHEMA_VERSION              = "v1"
+MIN_TOKENS                  = int(os.getenv("MACRO_MIN_TOKENS", "40"))
+MAX_TOKENS_OUT              = int(os.getenv("MACRO_MAX_TOKENS_OUT", "1200"))
+CHUNK_SCORE_THRESHOLD       = int(os.getenv("MACRO_CHUNK_SCORE_THRESHOLD", "3"))
+MACRO_MAX_CHUNKS_PER_ARTICLE = int(os.getenv("MACRO_MAX_CHUNKS_PER_ARTICLE", "2"))
 
 # ---------------------------------------------------------------------------
 # Canonical vocabularies
@@ -91,15 +93,27 @@ HORIZONS   = ["intraday", "near_term", "medium_term", "long_term"]
 
 MACRO_EXTRACTION_PROMPT = """\
 You are a macro-economic analyst. Read the news excerpt below and extract \
-all macro-economic events described or implied.
+macro-economic events that are explicitly stated or directly and unambiguously \
+supported by the text.
 
-Return ONLY a JSON object (no markdown, no prose) with the following structure:
+Rules:
+- Extract AT MOST 2 events. If you find more, keep only the 2 most significant.
+- Include an event ONLY if the text contains clear, direct evidence for it.
+- Do NOT infer weak, speculative, or ambiguous implications. If in doubt, omit.
+- Focus on the single dominant macro mechanism per event.
+- For evidence_spans: include 1-2 short phrases (under 15 words each) copied \
+verbatim from the text that directly support the event. Do not pad with extra quotes.
+- Keep asset_impacts to the 1-2 most directly affected assets.
+- Keep channels to the 1-2 most directly relevant transmission mechanisms.
+- Set confidence high (>= 0.7) only when the text is unambiguous.
+
+Return ONLY a JSON object (no markdown, no prose):
 
 {{
   "events": [
     {{
       "event_type": "<one of: {shock_types}>",
-      "summary": "<one sentence describing the event>",
+      "summary": "<one concise sentence>",
       "region": "<country, region, or 'global'>",
       "time_horizon": "<one of: {horizons}>",
       "shock_types": ["<subset of: {shock_types}>"],
@@ -113,21 +127,21 @@ Return ONLY a JSON object (no markdown, no prose) with the following structure:
       "asset_impacts": [
         {{
           "target_type": "<'ticker' | 'asset_class' | 'currency' | 'commodity'>",
-          "target_id": "<ticker symbol, asset class name, currency code, or commodity name>",
+          "target_id": "<symbol or name>",
           "direction": "<one of: {directions}>",
           "strength": "<one of: {strengths}>",
           "horizon": "<one of: {horizons}>",
-          "rationale": "<brief explanation>"
+          "rationale": "<one short phrase>"
         }}
       ],
-      "evidence_spans": ["<exact quoted phrase from the text>"],
+      "evidence_spans": ["<short verbatim phrase from text>"],
       "confidence": <float 0.0-1.0>
     }}
   ]
 }}
 
-If the text contains no macro-economic events, return {{"events": []}}.
-Use ONLY the allowed enum values listed above — do not invent new labels.
+If the text contains no clear macro-economic events, return {{"events": []}}.
+Use ONLY the allowed enum values listed — do not invent new labels.
 
 NEWS EXCERPT:
 {text}
@@ -841,9 +855,41 @@ def run_extraction(
                 review_reasons=[],
             )
     prefiltered_out = total - len(surviving)
+
+    # ------------------------------------------------------------------
+    # Article-level redundancy control — keep only the top-N scoring
+    # chunks per article to avoid paying for redundant API calls across
+    # chunks of the same article.
+    # ------------------------------------------------------------------
+    _article_buckets: dict[str, list[dict]] = defaultdict(list)
+    for chunk in surviving:
+        _article_buckets[chunk["article_id"]].append(chunk)
+
+    dedup_surviving: list[dict] = []
+    article_dedup_skipped = 0
+    for _art_chunks in _article_buckets.values():
+        # Sort descending by macro score; hard-includes already set score
+        _art_chunks.sort(key=lambda c: c["_macro_score"], reverse=True)
+        kept   = _art_chunks[:MACRO_MAX_CHUNKS_PER_ARTICLE]
+        dropped = _art_chunks[MACRO_MAX_CHUNKS_PER_ARTICLE:]
+        dedup_surviving.extend(kept)
+        for sk in dropped:
+            article_dedup_skipped += 1
+            _write_processing_audit(
+                conn,
+                chunk=sk,
+                stage="article_dedup",
+                status="article_dedup_skipped",
+                chunk_macro_score=sk.get("_macro_score"),
+                was_hard_include=bool(sk.get("_was_hard_include")),
+                review_reasons=["article_level_redundancy_skip"],
+            )
+    surviving = dedup_surviving
+
     print(
         f"[macro_extract] {total} unprocessed chunks — "
         f"{prefiltered_out} skipped by prefilter, "
+        f"{article_dedup_skipped} skipped by article dedup, "
         f"{len(surviving)} sent to Claude"
     )
 
@@ -957,7 +1003,8 @@ def run_extraction(
     print(
         f"\n[macro_extract] done — {ok} chunks with events, "
         f"{skipped_empty} empty, {failed} failed, "
-        f"{prefiltered_out} prefiltered (no API call)"
+        f"{prefiltered_out} prefiltered, "
+        f"{article_dedup_skipped} article-deduped (no API call)"
     )
 
 
