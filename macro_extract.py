@@ -137,39 +137,116 @@ NEWS EXCERPT:
 # Enum enforcement helpers
 # ---------------------------------------------------------------------------
 
-def _snap(value: str, allowed: list[str], label: str) -> str | None:
+def _snap(value: str, allowed: list[str], label: str) -> tuple[str | None, str]:
     """
     Return value if it is in allowed, otherwise find the closest match
     via difflib. Returns None if no close match found (score < 0.6).
     """
     if value in allowed:
-        return value
+        return value, "kept"
     matches = difflib.get_close_matches(value, allowed, n=1, cutoff=0.6)
     if matches:
         print(f"  [enum] '{value}' snapped to '{matches[0]}' for {label}")
-        return matches[0]
+        return matches[0], "snapped"
     print(f"  [enum] '{value}' has no close match in {label} — dropped")
-    return None
+    return None, "dropped"
 
 
-def _enforce_enums(events: list[dict]) -> list[dict]:
+def _enforce_enums(events: list[dict]) -> tuple[list[dict], list[dict]]:
     """Validate and snap all enum fields in a parsed events list."""
     clean = []
-    for ev in events:
+    audits: list[dict] = []
+    for idx, ev in enumerate(events):
         # event_type / shock_types
-        ev["event_type"] = _snap(ev.get("event_type", ""), SHOCK_TYPES, "SHOCK_TYPES") or ""
-        ev["shock_types"] = [
-            s for raw in ev.get("shock_types", [])
-            if (s := _snap(raw, SHOCK_TYPES, "shock_types")) is not None
-        ]
-        ev["time_horizon"] = _snap(ev.get("time_horizon", ""), HORIZONS, "HORIZONS") or ""
+        raw_event_type = ev.get("event_type", "")
+        normalized_event_type, action = _snap(raw_event_type, SHOCK_TYPES, "SHOCK_TYPES")
+        audits.append(
+            {
+                "macro_event_index": idx,
+                "parent_kind": "macro_event",
+                "field_label": "event_type",
+                "raw_value": raw_event_type,
+                "normalized_value": normalized_event_type,
+                "action": action,
+            }
+        )
+        ev["event_type"] = normalized_event_type or ""
+
+        clean_shocks = []
+        for raw in ev.get("shock_types", []):
+            normalized, action = _snap(raw, SHOCK_TYPES, "shock_types")
+            audits.append(
+                {
+                    "macro_event_index": idx,
+                    "parent_kind": "macro_event",
+                    "field_label": "shock_types",
+                    "raw_value": raw,
+                    "normalized_value": normalized,
+                    "action": action,
+                }
+            )
+            if normalized is not None:
+                clean_shocks.append(normalized)
+        ev["shock_types"] = clean_shocks
+
+        raw_horizon = ev.get("time_horizon", "")
+        normalized_horizon, action = _snap(raw_horizon, HORIZONS, "HORIZONS")
+        audits.append(
+            {
+                "macro_event_index": idx,
+                "parent_kind": "macro_event",
+                "field_label": "time_horizon",
+                "raw_value": raw_horizon,
+                "normalized_value": normalized_horizon,
+                "action": action,
+            }
+        )
+        ev["time_horizon"] = normalized_horizon or ""
 
         # channels
         clean_channels = []
         for ch in ev.get("channels", []):
-            ch["channel_name"] = _snap(ch.get("channel_name", ""), MACRO_CHANNELS, "MACRO_CHANNELS")
-            ch["direction"]    = _snap(ch.get("direction", ""), DIRECTIONS, "DIRECTIONS")
-            ch["strength"]     = _snap(ch.get("strength", ""), STRENGTHS, "STRENGTHS")
+            raw_name = ch.get("channel_name", "")
+            normalized_name, action = _snap(raw_name, MACRO_CHANNELS, "MACRO_CHANNELS")
+            audits.append(
+                {
+                    "macro_event_index": idx,
+                    "parent_kind": "channel",
+                    "field_label": "channel_name",
+                    "raw_value": raw_name,
+                    "normalized_value": normalized_name,
+                    "action": action,
+                }
+            )
+            ch["channel_name"] = normalized_name
+
+            raw_direction = ch.get("direction", "")
+            normalized_direction, action = _snap(raw_direction, DIRECTIONS, "DIRECTIONS")
+            audits.append(
+                {
+                    "macro_event_index": idx,
+                    "parent_kind": "channel",
+                    "field_label": "direction",
+                    "raw_value": raw_direction,
+                    "normalized_value": normalized_direction,
+                    "action": action,
+                }
+            )
+            ch["direction"] = normalized_direction
+
+            raw_strength = ch.get("strength", "")
+            normalized_strength, action = _snap(raw_strength, STRENGTHS, "STRENGTHS")
+            audits.append(
+                {
+                    "macro_event_index": idx,
+                    "parent_kind": "channel",
+                    "field_label": "strength",
+                    "raw_value": raw_strength,
+                    "normalized_value": normalized_strength,
+                    "action": action,
+                }
+            )
+            ch["strength"] = normalized_strength
             if all(ch.get(k) for k in ("channel_name", "direction", "strength")):
                 clean_channels.append(ch)
         ev["channels"] = clean_channels
@@ -177,15 +254,53 @@ def _enforce_enums(events: list[dict]) -> list[dict]:
         # asset_impacts
         clean_impacts = []
         for imp in ev.get("asset_impacts", []):
-            imp["direction"] = _snap(imp.get("direction", ""), DIRECTIONS, "DIRECTIONS")
-            imp["strength"]  = _snap(imp.get("strength", ""), STRENGTHS, "STRENGTHS")
-            imp["horizon"]   = _snap(imp.get("horizon", ""), HORIZONS, "HORIZONS")
+            raw_direction = imp.get("direction", "")
+            normalized_direction, action = _snap(raw_direction, DIRECTIONS, "DIRECTIONS")
+            audits.append(
+                {
+                    "macro_event_index": idx,
+                    "parent_kind": "asset_impact",
+                    "field_label": "direction",
+                    "raw_value": raw_direction,
+                    "normalized_value": normalized_direction,
+                    "action": action,
+                }
+            )
+            imp["direction"] = normalized_direction
+
+            raw_strength = imp.get("strength", "")
+            normalized_strength, action = _snap(raw_strength, STRENGTHS, "STRENGTHS")
+            audits.append(
+                {
+                    "macro_event_index": idx,
+                    "parent_kind": "asset_impact",
+                    "field_label": "strength",
+                    "raw_value": raw_strength,
+                    "normalized_value": normalized_strength,
+                    "action": action,
+                }
+            )
+            imp["strength"] = normalized_strength
+
+            raw_horizon = imp.get("horizon", "")
+            normalized_horizon, action = _snap(raw_horizon, HORIZONS, "HORIZONS")
+            audits.append(
+                {
+                    "macro_event_index": idx,
+                    "parent_kind": "asset_impact",
+                    "field_label": "horizon",
+                    "raw_value": raw_horizon,
+                    "normalized_value": normalized_horizon,
+                    "action": action,
+                }
+            )
+            imp["horizon"] = normalized_horizon
             if imp.get("target_id") and all(imp.get(k) for k in ("direction", "strength", "horizon")):
                 clean_impacts.append(imp)
         ev["asset_impacts"] = clean_impacts
 
         clean.append(ev)
-    return clean
+    return clean, audits
 
 # ---------------------------------------------------------------------------
 # Prefilter — zero-cost relevance screening before any API call
@@ -378,6 +493,146 @@ def _now_utc() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+RETRY_QUEUE_NAME = "retry_failed"
+REVIEW_QUEUE_NAME = "review_suspicious"
+
+
+def _raw_excerpt(raw_json: str | None, max_chars: int = 400) -> str | None:
+    if not raw_json:
+        return None
+    compact = " ".join(raw_json.split())
+    if len(compact) <= max_chars:
+        return compact
+    return compact[: max_chars - 3] + "..."
+
+
+def _load_chunks_by_ids(conn: sqlite3.Connection, chunk_ids: list[str]) -> list[dict]:
+    if not chunk_ids:
+        return []
+    placeholders = ",".join("?" for _ in chunk_ids)
+    rows = conn.execute(
+        f"""
+        SELECT c.chunk_id, c.article_id, c.text, c.token_count, a.title, a.source
+        FROM chunks c
+        JOIN articles a ON a.article_id = c.article_id
+        WHERE c.chunk_id IN ({placeholders})
+        ORDER BY c.published_date DESC, c.chunk_index ASC
+        """,
+        chunk_ids,
+    ).fetchall()
+    return [
+        {
+            "chunk_id": r[0],
+            "article_id": r[1],
+            "text": r[2],
+            "token_count": r[3],
+            "title": r[4] or "",
+            "source": r[5] or "",
+        }
+        for r in rows
+    ]
+
+
+def _write_processing_audit(
+    conn: sqlite3.Connection,
+    *,
+    chunk: dict,
+    stage: str,
+    status: str,
+    run_id: str | None = None,
+    failure_reason: str | None = None,
+    queue_name: str | None = None,
+    chunk_macro_score: int | None = None,
+    was_hard_include: bool = False,
+    event_count: int | None = None,
+    suspicious: bool = False,
+    review_reasons: list[str] | None = None,
+    raw_json: str | None = None,
+) -> None:
+    conn.execute(
+        """
+        INSERT INTO macro_processing_audit (
+            audit_id, run_id, article_id, chunk_id, created_at, stage, status,
+            failure_reason, queue_name, chunk_macro_score, was_hard_include,
+            event_count, suspicious, review_reasons_json, raw_response_excerpt
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            str(uuid.uuid4()),
+            run_id,
+            chunk["article_id"],
+            chunk["chunk_id"],
+            _now_utc(),
+            stage,
+            status,
+            failure_reason,
+            queue_name,
+            chunk_macro_score,
+            1 if was_hard_include else 0,
+            event_count,
+            1 if suspicious else 0,
+            json.dumps(review_reasons or []),
+            _raw_excerpt(raw_json),
+        ),
+    )
+    conn.commit()
+
+
+def _write_enum_audits(conn: sqlite3.Connection, run_id: str, audits: list[dict]) -> None:
+    if not audits:
+        return
+    rows = [
+        (
+            str(uuid.uuid4()),
+            run_id,
+            audit.get("macro_event_index"),
+            audit["parent_kind"],
+            audit["field_label"],
+            audit.get("raw_value"),
+            audit.get("normalized_value"),
+            audit["action"],
+            _now_utc(),
+        )
+        for audit in audits
+    ]
+    conn.executemany(
+        """
+        INSERT INTO macro_enum_audit (
+            audit_id, run_id, macro_event_index, parent_kind, field_label,
+            raw_value, normalized_value, action, created_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        rows,
+    )
+    conn.commit()
+
+
+def _review_reasons_for_output(
+    chunk: dict,
+    *,
+    chunk_score: int,
+    was_hard_include: bool,
+    events: list[dict],
+    enum_audits: list[dict],
+) -> list[str]:
+    reasons: list[str] = []
+    if not events and (was_hard_include or chunk_score >= CHUNK_SCORE_THRESHOLD + 3):
+        reasons.append("suspicious_empty_output")
+    if any(audit.get("action") == "dropped" for audit in enum_audits):
+        reasons.append("enum_value_dropped")
+    if any(audit.get("action") == "snapped" for audit in enum_audits):
+        reasons.append("enum_value_snapped")
+    if events and any(not ev.get("evidence_spans") for ev in events):
+        reasons.append("missing_evidence_spans")
+    if events and any(not ev.get("asset_impacts") for ev in events):
+        reasons.append("event_without_asset_impacts")
+    if events and any(not ev.get("channels") for ev in events):
+        reasons.append("event_without_channels")
+    return reasons
+
+
 def _load_unprocessed_chunks(
     conn: sqlite3.Connection,
     reprocess_failed: bool = False,
@@ -549,19 +804,42 @@ def run_extraction(
     db_path: str = SQLITE_DB,
     limit: int | None = None,
     reprocess_failed: bool = False,
+    chunk_ids: list[str] | None = None,
 ) -> None:
     client = _build_client()
-    from create_sql_db import connect_sqlite
+    from create_sql_db import create_database, connect_sqlite
+    create_database(db_path)
     conn = connect_sqlite(db_path)
 
-    chunks = _load_unprocessed_chunks(conn, reprocess_failed=reprocess_failed)
+    chunks = _load_chunks_by_ids(conn, chunk_ids) if chunk_ids else _load_unprocessed_chunks(
+        conn,
+        reprocess_failed=reprocess_failed,
+    )
     if limit:
         chunks = chunks[:limit]
 
     total = len(chunks)
 
     # Prefilter — fast, zero-cost pass before any API call
-    surviving = [c for c in chunks if _should_process_chunk(c)]
+    surviving = []
+    for chunk in chunks:
+        was_hard_include = _article_is_hard_include(chunk.get("source", ""), chunk.get("title", ""))
+        chunk_score = _chunk_macro_score(chunk["text"])
+        should_process = was_hard_include or chunk_score >= CHUNK_SCORE_THRESHOLD
+        chunk["_macro_score"] = chunk_score
+        chunk["_was_hard_include"] = was_hard_include
+        if should_process:
+            surviving.append(chunk)
+        else:
+            _write_processing_audit(
+                conn,
+                chunk=chunk,
+                stage="prefilter",
+                status="prefilter_skipped",
+                chunk_macro_score=chunk_score,
+                was_hard_include=was_hard_include,
+                review_reasons=[],
+            )
     prefiltered_out = total - len(surviving)
     print(
         f"[macro_extract] {total} unprocessed chunks — "
@@ -581,6 +859,20 @@ def run_extraction(
 
         if not success:
             print(f"FAILED: {error_text}")
+            _write_processing_audit(
+                conn,
+                chunk=chunk,
+                run_id=run_id,
+                stage="model_call",
+                status="api_failed",
+                failure_reason=error_text,
+                queue_name=RETRY_QUEUE_NAME,
+                chunk_macro_score=chunk.get("_macro_score"),
+                was_hard_include=bool(chunk.get("_was_hard_include")),
+                suspicious=True,
+                review_reasons=["api_failed"],
+                raw_json=raw_json,
+            )
             failed += 1
             continue
 
@@ -589,16 +881,75 @@ def run_extraction(
             events: list[dict] = parsed.get("events", [])
         except (json.JSONDecodeError, AttributeError) as exc:
             print(f"PARSE_ERROR: {exc}")
+            _write_processing_audit(
+                conn,
+                chunk=chunk,
+                run_id=run_id,
+                stage="parse",
+                status="parse_failed",
+                failure_reason=str(exc),
+                queue_name=RETRY_QUEUE_NAME,
+                chunk_macro_score=chunk.get("_macro_score"),
+                was_hard_include=bool(chunk.get("_was_hard_include")),
+                suspicious=True,
+                review_reasons=["parse_failed"],
+                raw_json=raw_json,
+            )
             failed += 1
             continue
 
         if not events:
             print("no events")
+            review_reasons = _review_reasons_for_output(
+                chunk,
+                chunk_score=int(chunk.get("_macro_score") or 0),
+                was_hard_include=bool(chunk.get("_was_hard_include")),
+                events=[],
+                enum_audits=[],
+            )
+            suspicious = bool(review_reasons)
+            _write_processing_audit(
+                conn,
+                chunk=chunk,
+                run_id=run_id,
+                stage="normalize",
+                status="empty_success",
+                queue_name=REVIEW_QUEUE_NAME if suspicious else None,
+                chunk_macro_score=chunk.get("_macro_score"),
+                was_hard_include=bool(chunk.get("_was_hard_include")),
+                event_count=0,
+                suspicious=suspicious,
+                review_reasons=review_reasons,
+                raw_json=raw_json,
+            )
             skipped_empty += 1
             continue
 
-        events = _enforce_enums(events)
+        events, enum_audits = _enforce_enums(events)
+        _write_enum_audits(conn, run_id, enum_audits)
+        review_reasons = _review_reasons_for_output(
+            chunk,
+            chunk_score=int(chunk.get("_macro_score") or 0),
+            was_hard_include=bool(chunk.get("_was_hard_include")),
+            events=events,
+            enum_audits=enum_audits,
+        )
+        suspicious = bool(review_reasons)
         _write_normalized(conn, run_id, chunk, events)
+        _write_processing_audit(
+            conn,
+            chunk=chunk,
+            run_id=run_id,
+            stage="normalize",
+            status="events_written",
+            queue_name=REVIEW_QUEUE_NAME if suspicious else None,
+            chunk_macro_score=chunk.get("_macro_score"),
+            was_hard_include=bool(chunk.get("_was_hard_include")),
+            event_count=len(events),
+            suspicious=suspicious,
+            review_reasons=review_reasons,
+            raw_json=raw_json,
+        )
         print(f"{len(events)} event(s)")
         ok += 1
 
@@ -608,6 +959,218 @@ def run_extraction(
         f"{skipped_empty} empty, {failed} failed, "
         f"{prefiltered_out} prefiltered (no API call)"
     )
+
+
+def _queue_rows(
+    conn: sqlite3.Connection,
+    *,
+    queue_name: str,
+    limit: int = 20,
+) -> list[sqlite3.Row]:
+    return conn.execute(
+        """
+        SELECT
+            audit_id,
+            run_id,
+            article_id,
+            chunk_id,
+            stage,
+            status,
+            failure_reason,
+            queue_name,
+            chunk_macro_score,
+            was_hard_include,
+            event_count,
+            suspicious,
+            review_reasons_json,
+            raw_response_excerpt,
+            created_at
+        FROM macro_processing_audit
+        WHERE queue_name = ?
+        ORDER BY created_at DESC
+        LIMIT ?
+        """,
+        (queue_name, limit),
+    ).fetchall()
+
+
+def print_queue(db_path: str = SQLITE_DB, *, queue_name: str, limit: int = 20) -> None:
+    from create_sql_db import create_database, connect_sqlite
+
+    create_database(db_path)
+    conn = connect_sqlite(db_path)
+    conn.row_factory = sqlite3.Row
+    rows = _queue_rows(conn, queue_name=queue_name, limit=limit)
+    print(f"[macro_extract] queue={queue_name} rows={len(rows)}")
+    for row in rows:
+        reasons = json.loads(row["review_reasons_json"] or "[]")
+        print(
+            f"- chunk={row['chunk_id']} run={row['run_id'] or '—'} status={row['status']} "
+            f"stage={row['stage']} score={row['chunk_macro_score']} reasons={','.join(reasons) or '—'}"
+        )
+        if row["failure_reason"]:
+            print(f"  failure: {row['failure_reason']}")
+        if row["raw_response_excerpt"]:
+            print(f"  excerpt: {row['raw_response_excerpt']}")
+    conn.close()
+
+
+def inspect_run(
+    *,
+    db_path: str = SQLITE_DB,
+    run_id: str | None = None,
+    chunk_id: str | None = None,
+) -> None:
+    if not run_id and not chunk_id:
+        raise ValueError("inspect_run requires run_id or chunk_id")
+
+    from create_sql_db import connect_sqlite
+    from create_sql_db import create_database
+
+    create_database(db_path)
+    conn = connect_sqlite(db_path)
+    conn.row_factory = sqlite3.Row
+    if run_id:
+        run = conn.execute(
+            """
+            SELECT run_id, article_id, chunk_id, model_provider, model_name, created_at,
+                   success, raw_json, error_text
+            FROM macro_extraction_runs
+            WHERE run_id = ?
+            """,
+            (run_id,),
+        ).fetchone()
+    else:
+        run = conn.execute(
+            """
+            SELECT run_id, article_id, chunk_id, model_provider, model_name, created_at,
+                   success, raw_json, error_text
+            FROM macro_extraction_runs
+            WHERE chunk_id = ?
+            ORDER BY created_at DESC
+            LIMIT 1
+            """,
+            (chunk_id,),
+        ).fetchone()
+    if not run:
+        print("[macro_extract] no matching run found")
+        conn.close()
+        return
+
+    print(
+        f"[macro_extract] run={run['run_id']} chunk={run['chunk_id']} "
+        f"success={run['success']} created_at={run['created_at']}"
+    )
+    if run["error_text"]:
+        print(f"  error: {run['error_text']}")
+    audit_rows = conn.execute(
+        """
+        SELECT stage, status, queue_name, suspicious, review_reasons_json, raw_response_excerpt, created_at
+        FROM macro_processing_audit
+        WHERE run_id = ?
+        ORDER BY created_at DESC
+        """,
+        (run["run_id"],),
+    ).fetchall()
+    for row in audit_rows:
+        reasons = json.loads(row["review_reasons_json"] or "[]")
+        print(
+            f"  audit stage={row['stage']} status={row['status']} queue={row['queue_name'] or '—'} "
+            f"suspicious={row['suspicious']} reasons={','.join(reasons) or '—'}"
+        )
+        if row["raw_response_excerpt"]:
+            print(f"    excerpt: {row['raw_response_excerpt']}")
+
+    enum_rows = conn.execute(
+        """
+        SELECT macro_event_index, parent_kind, field_label, raw_value, normalized_value, action
+        FROM macro_enum_audit
+        WHERE run_id = ?
+        ORDER BY macro_event_index, parent_kind, field_label
+        """,
+        (run["run_id"],),
+    ).fetchall()
+    if enum_rows:
+        print("  enum_audit:")
+        for row in enum_rows[:20]:
+            print(
+                f"    idx={row['macro_event_index']} kind={row['parent_kind']} field={row['field_label']} "
+                f"action={row['action']} raw={row['raw_value']!r} normalized={row['normalized_value']!r}"
+            )
+    conn.close()
+
+
+def retry_queue(
+    db_path: str = SQLITE_DB,
+    *,
+    queue_name: str = RETRY_QUEUE_NAME,
+    limit: int | None = None,
+) -> None:
+    from create_sql_db import create_database, connect_sqlite
+
+    create_database(db_path)
+    conn = connect_sqlite(db_path)
+    conn.row_factory = sqlite3.Row
+    sql = """
+        SELECT DISTINCT chunk_id
+        FROM macro_processing_audit
+        WHERE queue_name = ?
+        ORDER BY created_at DESC
+    """
+    params: list[object] = [queue_name]
+    if limit is not None:
+        sql += " LIMIT ?"
+        params.append(limit)
+    rows = conn.execute(sql, params).fetchall()
+    conn.close()
+    chunk_ids = [row["chunk_id"] for row in rows]
+    if not chunk_ids:
+        print(f"[macro_extract] queue {queue_name} is empty")
+        return
+    print(f"[macro_extract] retrying {len(chunk_ids)} queued chunk(s) from {queue_name}")
+    run_extraction(db_path=db_path, limit=limit, chunk_ids=chunk_ids)
+
+
+def report_diagnostics(db_path: str = SQLITE_DB, limit: int = 20) -> None:
+    from create_sql_db import create_database, connect_sqlite
+
+    create_database(db_path)
+    conn = connect_sqlite(db_path)
+    conn.row_factory = sqlite3.Row
+    enum_rows = conn.execute(
+        """
+        SELECT action, field_label, raw_value, normalized_value, COUNT(*) AS n
+        FROM macro_enum_audit
+        WHERE action IN ('dropped', 'snapped')
+        GROUP BY action, field_label, raw_value, normalized_value
+        ORDER BY n DESC, action, field_label
+        LIMIT ?
+        """,
+        (limit,),
+    ).fetchall()
+    malformed_rows = conn.execute(
+        """
+        SELECT status, failure_reason, COUNT(*) AS n
+        FROM macro_processing_audit
+        WHERE status IN ('api_failed', 'parse_failed', 'empty_success')
+           OR suspicious = 1
+        GROUP BY status, failure_reason
+        ORDER BY n DESC, status
+        LIMIT ?
+        """,
+        (limit,),
+    ).fetchall()
+    conn.close()
+
+    print("[macro_extract] enum issues:")
+    for row in enum_rows:
+        print(
+            f"- {row['action']} field={row['field_label']} raw={row['raw_value']!r} "
+            f"normalized={row['normalized_value']!r} count={row['n']}"
+        )
+    print("[macro_extract] malformed / suspicious outputs:")
+    for row in malformed_rows:
+        print(f"- status={row['status']} failure={row['failure_reason'] or '—'} count={row['n']}")
 
 
 # ---------------------------------------------------------------------------
@@ -623,5 +1186,74 @@ if __name__ == "__main__":
         action="store_true",
         help="Reprocess chunks that previously failed (success=0)",
     )
+    subparsers = parser.add_subparsers(dest="command")
+
+    extract_parser = subparsers.add_parser("extract", help="Run macro extraction")
+    extract_parser.add_argument("--db", default=SQLITE_DB, help="Path to SQLite DB")
+    extract_parser.add_argument("--limit", type=int, default=None, help="Max chunks to process")
+    extract_parser.add_argument(
+        "--reprocess",
+        action="store_true",
+        help="Reprocess chunks that previously failed (success=0)",
+    )
+
+    queue_parser = subparsers.add_parser("queue", help="Print retry or review queue")
+    queue_parser.add_argument("--db", default=SQLITE_DB, help="Path to SQLite DB")
+    queue_parser.add_argument(
+        "--name",
+        choices=[RETRY_QUEUE_NAME, REVIEW_QUEUE_NAME],
+        default=RETRY_QUEUE_NAME,
+        help="Queue to print",
+    )
+    queue_parser.add_argument("--limit", type=int, default=20, help="Rows to print")
+
+    inspect_parser = subparsers.add_parser("inspect", help="Inspect one macro run")
+    inspect_parser.add_argument("--db", default=SQLITE_DB, help="Path to SQLite DB")
+    inspect_parser.add_argument("--run-id", default=None, help="Run id to inspect")
+    inspect_parser.add_argument("--chunk-id", default=None, help="Chunk id to inspect")
+
+    retry_parser = subparsers.add_parser("retry-queue", help="Retry all chunks from a queue")
+    retry_parser.add_argument("--db", default=SQLITE_DB, help="Path to SQLite DB")
+    retry_parser.add_argument(
+        "--name",
+        choices=[RETRY_QUEUE_NAME, REVIEW_QUEUE_NAME],
+        default=RETRY_QUEUE_NAME,
+        help="Queue to retry",
+    )
+    retry_parser.add_argument("--limit", type=int, default=None, help="Max queued chunks to retry")
+
+    report_parser = subparsers.add_parser("report", help="Report malformed outputs and enum issues")
+    report_parser.add_argument("--db", default=SQLITE_DB, help="Path to SQLite DB")
+    report_parser.add_argument("--limit", type=int, default=20, help="Rows to print per report")
+
     args = parser.parse_args()
-    run_extraction(db_path=args.db, limit=args.limit, reprocess_failed=args.reprocess)
+    command = args.command or "extract"
+    if command == "extract":
+        run_extraction(
+            db_path=getattr(args, "db", SQLITE_DB),
+            limit=getattr(args, "limit", None),
+            reprocess_failed=getattr(args, "reprocess", False),
+        )
+    elif command == "queue":
+        print_queue(
+            db_path=getattr(args, "db", SQLITE_DB),
+            queue_name=getattr(args, "name", RETRY_QUEUE_NAME),
+            limit=getattr(args, "limit", 20),
+        )
+    elif command == "inspect":
+        inspect_run(
+            db_path=getattr(args, "db", SQLITE_DB),
+            run_id=getattr(args, "run_id", None),
+            chunk_id=getattr(args, "chunk_id", None),
+        )
+    elif command == "retry-queue":
+        retry_queue(
+            db_path=getattr(args, "db", SQLITE_DB),
+            queue_name=getattr(args, "name", RETRY_QUEUE_NAME),
+            limit=getattr(args, "limit", None),
+        )
+    elif command == "report":
+        report_diagnostics(
+            db_path=getattr(args, "db", SQLITE_DB),
+            limit=getattr(args, "limit", 20),
+        )
