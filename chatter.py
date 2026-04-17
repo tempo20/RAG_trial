@@ -89,6 +89,9 @@ RECENCY_HALF_LIFE_DAYS = float(os.getenv("RECENCY_HALF_LIFE_DAYS", "5"))
 SUMMARY_TOP_K = int(os.getenv("SUMMARY_TOP_K", "12"))
 SUMMARY_EXPANDED_K = int(os.getenv("SUMMARY_EXPANDED_K", "24"))
 SUMMARY_RECENCY_HALF_LIFE_DAYS = float(os.getenv("SUMMARY_RECENCY_HALF_LIFE_DAYS", "2"))
+SUMMARY_MAX_CHUNKS_PER_SOURCE = int(os.getenv("SUMMARY_MAX_CHUNKS_PER_SOURCE", "1"))
+SUMMARY_DUPLICATE_SIM_THRESHOLD = float(os.getenv("SUMMARY_DUPLICATE_SIM_THRESHOLD", "0.9"))
+SUMMARY_MIN_UNIQUE_SOURCES = int(os.getenv("SUMMARY_MIN_UNIQUE_SOURCES", "3"))
 SUMMARY_TERMS = (
     "summary",
     "summarise",
@@ -638,6 +641,104 @@ def dedupe_chunks_for_summary(chunks: list[dict], max_per_article: int = 2) -> l
         out.append(ch)
 
     return out
+
+
+def _filter_summary_chunks(
+    chunks: list[dict],
+    max_per_source: int = SUMMARY_MAX_CHUNKS_PER_SOURCE,
+    dup_sim_threshold: float = SUMMARY_DUPLICATE_SIM_THRESHOLD,
+) -> list[dict]:
+    """
+    Post-retrieval quality filter applied once to the globally-merged candidate
+    pool in the daily-summary path.
+
+    Pass 1 – near-duplicate removal:
+      Iterates chunks in rank order (highest rank first). Any chunk whose
+      similarity to an already-kept chunk meets or exceeds dup_sim_threshold
+      is dropped; the higher-ranked (earlier) chunk is always kept.
+      - When both chunks have embeddings: uses cosine similarity.
+      - When either embedding is absent: falls back to word-token Jaccard
+        similarity on the chunk text.
+
+    Pass 2 – per-source cap:
+      At most max_per_source chunks from each source domain are retained;
+      higher-ranked chunks win within each source.
+
+    Debug lines are always printed so they appear in terminal logs.
+    """
+    if not chunks:
+        return chunks
+
+    print(f"  [summary-filter] candidates={len(chunks)}")
+
+    def _jaccard(text_a: str, text_b: str) -> float:
+        toks_a = set(re.findall(r"[a-z0-9]{3,}", (text_a or "").lower()))
+        toks_b = set(re.findall(r"[a-z0-9]{3,}", (text_b or "").lower()))
+        if not toks_a or not toks_b:
+            return 0.0
+        return len(toks_a & toks_b) / len(toks_a | toks_b)
+
+    # Pass 1: drop near-duplicates -----------------------------------------
+    kept_after_dedup: list[dict] = []
+    kept_vecs: list[np.ndarray | None] = []
+    dropped_dup_uids: list[str] = []
+
+    for ch in chunks:
+        uid = ch.get("chunk_uid") or ch.get("article_id") or "?"
+        raw_emb = ch.get("embedding")
+        vec = np.asarray(raw_emb, dtype=np.float32) if raw_emb is not None else None
+
+        is_dup = False
+        for i, prev in enumerate(kept_after_dedup):
+            prev_vec = kept_vecs[i]
+            if vec is not None and prev_vec is not None:
+                sim = cosine_sim(vec, prev_vec)
+            else:
+                sim = _jaccard(ch.get("text", ""), prev.get("text", ""))
+            if sim >= dup_sim_threshold:
+                is_dup = True
+                break
+
+        if is_dup:
+            dropped_dup_uids.append(uid)
+            continue
+
+        kept_after_dedup.append(ch)
+        kept_vecs.append(vec)
+
+    if dropped_dup_uids:
+        print(
+            f"  [summary-filter] duplicates dropped "
+            f"(sim>={dup_sim_threshold}): {dropped_dup_uids}"
+        )
+
+    # Pass 2: per-source cap -----------------------------------------------
+    source_counts: dict[str, int] = {}
+    source_cap_uids: list[str] = []
+    out: list[dict] = []
+
+    for ch in kept_after_dedup:
+        src = (ch.get("source") or "unknown").strip().lower()
+        count = source_counts.get(src, 0)
+        if count >= max_per_source:
+            source_cap_uids.append(ch.get("chunk_uid") or ch.get("article_id") or "?")
+            continue
+        source_counts[src] = count + 1
+        out.append(ch)
+
+    if source_cap_uids:
+        print(
+            f"  [summary-filter] source-cap drops "
+            f"(max {max_per_source}/source): {source_cap_uids}"
+        )
+
+    unique_src_list = sorted(source_counts.keys())
+    print(
+        f"  [summary-filter] selected={len(out)} | "
+        f"unique sources ({len(unique_src_list)}): {unique_src_list}"
+    )
+    return out
+
 
 CAUSAL_INTENT_HINTS = (
     "affect", "impact", "effect", "influence", "cause", "drive",
@@ -2326,6 +2427,7 @@ def run_query_once(
     primary_date_start = None
     primary_date_end = None
     all_chunks: list[dict] = []
+    summary_raw_candidates: list[dict] = []  # merged pool across sub-queries (summary_mode only)
     market_ctx = ""
     logs: list[str] = []
 
@@ -2419,19 +2521,107 @@ def run_query_once(
             primary_date_end = date_end
 
         if summary_mode:
-            chunks = dedupe_chunks_for_summary(chunks, max_per_article=2)
+            # Collect raw candidates; the source cap, near-dup filter, and
+            # global re-rank are applied once after all sub-queries complete
+            # so they operate on the full merged pool rather than each
+            # sub-query in isolation.
+            summary_raw_candidates.extend(chunks)
+        else:
+            all_chunks.extend(chunks)
+            period_label = f"[{date_start} -> {date_end}] " if (date_start or date_end) else ""
+            ctx = build_context(sq["query"], target, chunks)
+            if market_ctx:
+                ctx = ctx + "\n\n" + market_ctx
+            all_contexts.append(period_label + ctx)
+            for ch in chunks:
+                url = ch.get("url")
+                if url and url not in all_urls:
+                    all_urls.append(url)
 
-        all_chunks.extend(chunks)
-        period_label = f"[{date_start} -> {date_end}] " if (date_start or date_end) else ""
-        ctx = build_context(sq["query"], target, chunks)
-        if market_ctx:
-            ctx = ctx + "\n\n" + market_ctx
-        all_contexts.append(period_label + ctx)
-        for ch in chunks:
+    # -------------------------------------------------------------------------
+    # Summary path: global merge → rank → dedup → filter → context assembly
+    # All four steps operate on the combined candidate pool so the source cap
+    # and near-dup removal span across sub-query boundaries.
+    # -------------------------------------------------------------------------
+    if summary_mode:
+        if not summary_raw_candidates:
+            return {
+                "query": query,
+                "answer": "No relevant chunks found.",
+                "chunks": [],
+                "urls": [],
+                "logs": logs,
+                "citation_map": {},
+                "provenance": "Why this answer: no retrieved evidence.",
+                "target": primary_target,
+                "date_start": primary_date_start,
+                "date_end": primary_date_end,
+            }
+
+        logs.append(
+            f"  [summary] merged candidate pool: {len(summary_raw_candidates)} chunks "
+            f"from {len(sub_queries)} sub-query/ies"
+        )
+
+        # 1. Global re-rank across the full merged candidate pool
+        query_vec = embed_model.encode([query], normalize_embeddings=True)[0]
+        globally_ranked = rank_candidates(
+            query=query,
+            rows=summary_raw_candidates,
+            query_vec=query_vec,
+            recency_half_life_days=SUMMARY_RECENCY_HALF_LIFE_DAYS,
+            reranker=reranker,
+        )
+
+        # 2. Article-level dedup (existing helper, unchanged)
+        deduped = dedupe_chunks_for_summary(globally_ranked, max_per_article=2)
+
+        # 3. Source cap + near-duplicate removal applied once to merged pool
+        all_chunks = _filter_summary_chunks(deduped)
+
+        # 4. Min-unique-sources guard
+        unique_summary_sources = {
+            (ch.get("source") or "unknown").strip().lower()
+            for ch in all_chunks
+        }
+        print(
+            f"  [summary] unique sources after filtering "
+            f"({len(unique_summary_sources)}): {sorted(unique_summary_sources)}"
+        )
+        if len(unique_summary_sources) < SUMMARY_MIN_UNIQUE_SOURCES:
+            msg = (
+                f"Not enough distinct news sources to generate a reliable daily summary "
+                f"(found {len(unique_summary_sources)}, minimum required: {SUMMARY_MIN_UNIQUE_SOURCES}). "
+                "Try a broader date range or check that more sources have been ingested."
+            )
+            logs.append(
+                f"  [summary] skipped generation – only {len(unique_summary_sources)} "
+                "unique source(s) found"
+            )
+            return {
+                "query": query,
+                "answer": msg,
+                "chunks": all_chunks,
+                "urls": [ch.get("url") for ch in all_chunks if ch.get("url")],
+                "logs": logs,
+                "citation_map": build_citation_map(all_chunks),
+                "provenance": format_provenance(all_chunks),
+                "target": primary_target,
+                "date_start": primary_date_start,
+                "date_end": primary_date_end,
+            }
+
+        # 5. Build urls and a single merged context for generation
+        for ch in all_chunks:
             url = ch.get("url")
             if url and url not in all_urls:
                 all_urls.append(url)
+        ctx = build_context(query, primary_target, all_chunks)
+        if market_ctx:
+            ctx = ctx + "\n\n" + market_ctx
+        all_contexts = [ctx]
 
+    # Non-summary path: all_contexts was populated per sub-query inside the loop.
     if not all_contexts:
         return {
             "query": query,
