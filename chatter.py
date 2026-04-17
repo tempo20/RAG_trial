@@ -92,6 +92,7 @@ SUMMARY_RECENCY_HALF_LIFE_DAYS = float(os.getenv("SUMMARY_RECENCY_HALF_LIFE_DAYS
 SUMMARY_MAX_CHUNKS_PER_SOURCE = int(os.getenv("SUMMARY_MAX_CHUNKS_PER_SOURCE", "1"))
 SUMMARY_DUPLICATE_SIM_THRESHOLD = float(os.getenv("SUMMARY_DUPLICATE_SIM_THRESHOLD", "0.9"))
 SUMMARY_MIN_UNIQUE_SOURCES = int(os.getenv("SUMMARY_MIN_UNIQUE_SOURCES", "3"))
+SUMMARY_CANDIDATE_LIMIT = int(os.getenv("SUMMARY_CANDIDATE_LIMIT", "300"))
 SUMMARY_TERMS = (
     "summary",
     "summarise",
@@ -608,14 +609,69 @@ def infer_summary_date_range(query: str) -> tuple[str | None, str | None]:
     q = (query or "").strip().lower()
     today = datetime.now(timezone.utc).date()
 
-    if "yesterday" in q or "yesterday's" in q:
+    has_today = any(w in q for w in ("today", "today's", "todays", "daily"))
+    has_yesterday = any(w in q for w in ("yesterday", "yesterday's"))
+
+    # Multi-day query: let decompose_query handle each day's date range separately.
+    if has_today and has_yesterday:
+        return None, None
+
+    if has_yesterday:
         d = today - timedelta(days=1)
         return d.isoformat(), d.isoformat()
 
-    if "today" in q or "today's" in q or "todays" in q or "daily" in q:
+    if has_today:
         return today.isoformat(), today.isoformat()
 
     return None, None
+
+
+def _build_summary_date_resolution_block(
+    query: str,
+    forced_start: str | None,
+    forced_end: str | None,
+    used_date_ranges: list[tuple[str | None, str | None]],
+) -> str:
+    """
+    Build a DATE RESOLUTION preamble for summary-mode contexts.
+
+    The LLM retrieves chunks that are already filtered to the correct calendar
+    dates, but without an explicit binding it will guess what "today" and
+    "yesterday" mean from training-data priors and get them wrong.  This block
+    pins each relative label to its exact ISO-8601 date so the model uses the
+    right dates when writing its answer.
+    """
+    today = datetime.now(timezone.utc).date()
+    yesterday = today - timedelta(days=1)
+    q = query.lower()
+
+    has_today = any(w in q for w in ("today", "today's", "todays", "daily"))
+    has_yesterday = any(w in q for w in ("yesterday", "yesterday's"))
+
+    lines: list[str] = [
+        "DATE RESOLUTION",
+        "(These are the exact calendar dates for this query. "
+        "Use absolute dates in your answer; do NOT write 'today' or 'yesterday'.)",
+    ]
+    if has_today:
+        lines.append(f'  "today"     = {today.isoformat()}')
+    if has_yesterday:
+        lines.append(f'  "yesterday" = {yesterday.isoformat()}')
+
+    # Compute the union of all date ranges actually used for retrieval.
+    all_starts: list[str] = [s for s, _ in used_date_ranges if s]
+    all_ends: list[str] = [e for _, e in used_date_ranges if e]
+    if forced_start:
+        all_starts.append(forced_start)
+    if forced_end:
+        all_ends.append(forced_end)
+
+    if all_starts or all_ends:
+        cov_start = min(all_starts) if all_starts else "unknown"
+        cov_end = max(all_ends) if all_ends else "unknown"
+        lines.append(f"  Coverage    : {cov_start} to {cov_end}")
+
+    return "\n".join(lines)
 
 
 def dedupe_chunks_for_summary(chunks: list[dict], max_per_article: int = 2) -> list[dict]:
@@ -1237,6 +1293,21 @@ def decompose_query(query: str, gen_client: Any) -> list[dict]:
                 {"query": query, "time_start": ls, "time_end": le},
                 {"query": query, "time_start": ts, "time_end": te},
             ]
+
+    _TODAY_RE = re.compile(r"\btoday(?:'?s)?\b", re.IGNORECASE)
+    _YESTERDAY_RE = re.compile(r"\byesterday(?:'?s)?\b", re.IGNORECASE)
+
+    if (
+        _TODAY_RE.search(query)
+        and _YESTERDAY_RE.search(query)
+        and not MULTI_TIME_WORDS.search(query)
+    ):
+        ys, ye = _resolve_time_phrase("yesterday")
+        ts, te = _resolve_time_phrase("today")
+        return [
+            {"query": query, "time_start": ys, "time_end": ye},
+            {"query": query, "time_start": ts, "time_end": te},
+        ]
 
     if not MULTI_TIME_WORDS.search(query):
         return [_extract_single_time_range(query)]
@@ -1978,6 +2049,158 @@ def retrieve_semantic_chunks(
     return scored[:top_k]
 
 
+def retrieve_summary_chunks(
+    sqlite_conn: sqlite3.Connection,
+    embed_model: SentenceTransformer,
+    query: str,
+    period_keys: list[str] | None = None,
+    date_start: str | None = None,
+    date_end: str | None = None,
+    source_filter: str | None = None,
+    top_k: int = SUMMARY_TOP_K,
+    expanded_k: int = SUMMARY_EXPANDED_K,
+    recency_half_life_days: float = SUMMARY_RECENCY_HALF_LIFE_DAYS,
+    reranker=None,
+    candidate_limit: int = SUMMARY_CANDIDATE_LIMIT,
+) -> list[dict]:
+    """
+    Summary-mode retrieval: broad SQLite recency + semantic pass.
+
+    Deliberately avoids MacroEvent-heavy Neo4j paths that collapse results
+    onto a few macro-style chunks.  Instead it:
+
+      1. Fetches up to ``candidate_limit`` recent chunks with embeddings
+         from the requested date window (all sources unless filtered).
+      2. Scores each chunk as a weighted combination of semantic similarity
+         to the query and exponential recency decay.
+      3. Runs a per-source diversity sweep so that at least one chunk from
+         every ingested source appears near the top of the ranking, labelled
+         ``summary_diverse_source``.
+      4. Returns ``expanded_k`` candidates to the caller; the global
+         summary post-processing pipeline (article dedup, near-dup filter,
+         per-source cap, min-unique-sources guard) is applied downstream.
+
+    retrieval_kind values produced:
+      - ``summary_recency_semantic``  – scored by recency + semantic sim
+      - ``summary_diverse_source``    – first chunk per distinct source
+        (same scoring, distinguished for debug logs only)
+    """
+    # ------------------------------------------------------------------
+    # 1. Broad recency pass from SQLite
+    #    Date filtering exclusively uses c.published_date (ISO format).
+    #    articles is joined only for metadata (source, title, url).
+    # ------------------------------------------------------------------
+    sql = """
+        SELECT
+            c.chunk_id,
+            c.article_id,
+            c.text,
+            c.published_date,
+            c.period_key,
+            c.embedding_json,
+            a.title,
+            a.url,
+            a.source
+        FROM chunks c
+        JOIN articles a ON a.article_id = c.article_id
+        WHERE 1=1
+    """
+    params: list[Any] = []
+    if period_keys:
+        placeholders = ",".join("?" for _ in period_keys)
+        sql += f" AND c.period_key IN ({placeholders})"
+        params.extend(period_keys)
+    if date_start:
+        sql += " AND c.published_date >= ?"
+        params.append(date_start)
+    if date_end:
+        sql += " AND c.published_date <= ?"
+        params.append(date_end)
+    if source_filter:
+        sql += " AND a.source = ?"
+        params.append(source_filter)
+    sql += " ORDER BY c.published_date DESC LIMIT ?"
+    params.append(max(candidate_limit, expanded_k))
+
+    print(
+        f"  [retrieve_summary_chunks] SQL date field=c.published_date "
+        f"date_start={date_start}, date_end={date_end}, "
+        f"period_keys={period_keys}, source_filter={source_filter}"
+    )
+
+    rows = sqlite_conn.execute(sql, params).fetchall()
+    if not rows:
+        print(
+            f"  [retrieve_summary_chunks] no rows returned "
+            f"(date_start={date_start}, date_end={date_end}, source_filter={source_filter})"
+        )
+        return []
+
+    # ------------------------------------------------------------------
+    # 2. Score: semantic similarity + exponential recency decay.
+    #    Chunks without embeddings fall back to recency-only scoring
+    #    (sem_score=0.0) so that recently ingested but not-yet-embedded
+    #    articles still surface in summary results.
+    # ------------------------------------------------------------------
+    qvec = embed_model.encode([query], normalize_embeddings=True)[0]
+    now_ts = int(datetime.now(timezone.utc).timestamp())
+    half_life_s = max(recency_half_life_days, 0.1) * 86400.0
+
+    scored: list[dict] = []
+    no_emb_count = 0
+    for row in rows:
+        item = _sqlite_row_to_chunk_dict(row)
+        emb = item.get("embedding")
+        if emb is None:
+            no_emb_count += 1
+            sem_score = 0.0
+        else:
+            sem_score = cosine_sim(qvec, np.array(emb, dtype=np.float32))
+        pub_date = item.get("published_date")
+        pub_ts = _published_date_to_ts(pub_date) if pub_date else None
+        if pub_ts is not None:
+            age_s = max(0.0, float(now_ts - pub_ts))
+            rec_score = float(np.exp(-age_s / half_life_s))
+        else:
+            rec_score = 0.0
+        item["semantic_score"] = sem_score
+        item["recency_score"] = rec_score
+        item["candidate_score"] = 0.70 * sem_score + 0.30 * rec_score
+        item["retrieval_kind"] = "summary_recency_semantic"
+        scored.append(item)
+
+    if no_emb_count:
+        print(
+            f"  [retrieve_summary_chunks] {no_emb_count}/{len(rows)} chunks "
+            f"have no embedding — scored by recency only"
+        )
+
+    scored.sort(key=lambda x: x["candidate_score"], reverse=True)
+
+    # ------------------------------------------------------------------
+    # 3. Per-source diversity sweep
+    #    Mark the first occurrence of each source so the downstream
+    #    dedup/cap pipeline can see that diversity was considered.
+    # ------------------------------------------------------------------
+    seen_sources: set[str] = set()
+    source_debug: list[str] = []
+    for item in scored:
+        src = (item.get("source") or "unknown").strip().lower()
+        if src not in seen_sources:
+            seen_sources.add(src)
+            item["retrieval_kind"] = "summary_diverse_source"
+            source_debug.append(src)
+
+    print(
+        f"  [retrieve_summary_chunks] "
+        f"candidates={len(scored)}, "
+        f"unique_sources={sorted(seen_sources)}, "
+        f"returning={min(expanded_k, len(scored))}"
+    )
+
+    return scored[:expanded_k]
+
+
 # ---------------------------------------------------------------------------
 # Scoring and ranking
 # ---------------------------------------------------------------------------
@@ -2428,6 +2651,7 @@ def run_query_once(
     primary_date_end = None
     all_chunks: list[dict] = []
     summary_raw_candidates: list[dict] = []  # merged pool across sub-queries (summary_mode only)
+    _summary_used_date_ranges: list[tuple[str | None, str | None]] = []  # tracks resolved dates per sub-query
     market_ctx = ""
     logs: list[str] = []
 
@@ -2444,6 +2668,8 @@ def run_query_once(
         if summary_mode and forced_summary_start and forced_summary_end:
             date_start = forced_summary_start
             date_end = forced_summary_end
+        if summary_mode:
+            _summary_used_date_ranges.append((date_start, date_end))
         if date_start or date_end:
             logs.append(f"  [time filter: {date_start} -> {date_end}]")
 
@@ -2490,6 +2716,38 @@ def run_query_once(
                     date_start=date_start,
                     date_end=date_end,
                 )
+        elif summary_mode:
+            # Summary-specific retrieval: broad SQLite recency + semantic pass.
+            # Avoids MacroEvent-heavy Neo4j paths that collapse results onto
+            # a few macro-style chunks instead of broadly covering recent news.
+            _sum_period_keys = _date_range_to_period_keys(date_start, date_end) or None
+            chunks = retrieve_summary_chunks(
+                sqlite_conn=sqlite_conn,
+                embed_model=embed_model,
+                query=sq["query"],
+                period_keys=_sum_period_keys,
+                date_start=date_start,
+                date_end=date_end,
+                source_filter=source_filter,
+                top_k=SUMMARY_TOP_K,
+                expanded_k=SUMMARY_EXPANDED_K,
+                recency_half_life_days=SUMMARY_RECENCY_HALF_LIFE_DAYS,
+                reranker=reranker,
+            )
+            target = QueryTarget(
+                query_type=QUERY_TYPE_GENERAL,
+                canonical_name=None,
+                display_name="general news",
+                ticker=None,
+                entity_type=None,
+                confidence=0.0,
+            )
+            _sum_kinds = sorted({ch.get("retrieval_kind", "?") for ch in chunks})
+            _sum_srcs = sorted({(ch.get("source") or "?").lower() for ch in chunks})
+            logs.append(
+                f"  [summary-retrieve] sub-query chunks={len(chunks)}, "
+                f"sources={_sum_srcs}, kinds={_sum_kinds}"
+            )
         else:
             chunks, target = retrieve(
                 query=sq["query"],
@@ -2500,11 +2758,9 @@ def run_query_once(
                 alias_to_ticker=alias_to_ticker,
                 ticker_to_canonical=ticker_to_canonical,
                 alias_to_fin_entity=alias_to_fin_entity,
-                top_k=SUMMARY_TOP_K if summary_mode else TOP_K,
-                expanded_k=SUMMARY_EXPANDED_K if summary_mode else EXPANDED_K,
-                recency_half_life_days=(
-                    SUMMARY_RECENCY_HALF_LIFE_DAYS if summary_mode else RECENCY_HALF_LIFE_DAYS
-                ),
+                top_k=TOP_K,
+                expanded_k=EXPANDED_K,
+                recency_half_life_days=RECENCY_HALF_LIFE_DAYS,
                 source_filter=source_filter,
                 date_start=date_start,
                 date_end=date_end,
@@ -2573,10 +2829,10 @@ def run_query_once(
             reranker=reranker,
         )
 
-        # 2. Article-level dedup (existing helper, unchanged)
+        # 2. Article-level dedup
         deduped = dedupe_chunks_for_summary(globally_ranked, max_per_article=2)
 
-        # 3. Source cap + near-duplicate removal applied once to merged pool
+        # 3. Source cap + near-duplicate removal
         all_chunks = _filter_summary_chunks(deduped)
 
         # 4. Min-unique-sources guard
@@ -2611,12 +2867,22 @@ def run_query_once(
                 "date_end": primary_date_end,
             }
 
-        # 5. Build urls and a single merged context for generation
+        # 5. Build urls and a single merged context for generation.
+        #    Prepend a DATE RESOLUTION block so the LLM knows exactly which
+        #    calendar dates "today"/"yesterday" map to in this query, preventing
+        #    it from guessing those labels from training-data priors.
         for ch in all_chunks:
             url = ch.get("url")
             if url and url not in all_urls:
                 all_urls.append(url)
         ctx = build_context(query, primary_target, all_chunks)
+        date_resolution_block = _build_summary_date_resolution_block(
+            query,
+            forced_summary_start,
+            forced_summary_end,
+            _summary_used_date_ranges,
+        )
+        ctx = date_resolution_block + "\n\n" + ctx
         if market_ctx:
             ctx = ctx + "\n\n" + market_ctx
         all_contexts = [ctx]
