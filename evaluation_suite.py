@@ -409,6 +409,10 @@ def build_runtime(*, enable_reranker: bool, need_generation: bool) -> dict[str, 
     date_min, date_max = chatter._get_sqlite_date_range(sqlite_conn)
     base_system_prompt = chatter.SYSTEM_PROMPT_TEMPLATE.format(date_min=date_min, date_max=date_max)
     base_causal_system_prompt = chatter.CAUSAL_SYSTEM_PROMPT_TEMPLATE.format(date_min=date_min, date_max=date_max)
+    base_daily_summary_prompt = chatter.DAILY_SUMMARY_PROMPT_TEMPLATE.format(
+        date_min=date_min,
+        date_max=date_max,
+    )
 
     gen_client = None
     if need_generation:
@@ -428,6 +432,7 @@ def build_runtime(*, enable_reranker: bool, need_generation: bool) -> dict[str, 
         "alias_to_fin_entity": alias_to_fin_entity,
         "base_system_prompt": base_system_prompt,
         "base_causal_system_prompt": base_causal_system_prompt,
+        "base_daily_summary_prompt": base_daily_summary_prompt,
         "gen_client": gen_client,
     }
 
@@ -514,6 +519,7 @@ def evaluate_case(case: dict[str, Any], runtime: dict[str, Any], *, skip_generat
         alias_to_fin_entity=runtime["alias_to_fin_entity"],
         base_system_prompt=runtime["base_system_prompt"],
         base_causal_system_prompt=runtime["base_causal_system_prompt"],
+        base_daily_summary_prompt=runtime["base_daily_summary_prompt"],
         memory=ConversationMemory(),
         skip_generation=skip_generation,
     )
@@ -658,6 +664,7 @@ def bootstrap_case(gold_path: Path, case_id: str, query: str, *, skip_generation
             alias_to_fin_entity=runtime["alias_to_fin_entity"],
             base_system_prompt=runtime["base_system_prompt"],
             base_causal_system_prompt=runtime["base_causal_system_prompt"],
+            base_daily_summary_prompt=runtime["base_daily_summary_prompt"],
             memory=ConversationMemory(),
             skip_generation=skip_generation,
         )

@@ -932,18 +932,6 @@ def run_extraction(
                 was_hard_include=bool(sk.get("_was_hard_include")),
                 review_reasons=["article_level_redundancy_skip"],
             )
-        dedup_surviving.extend(kept)
-        for sk in dropped:
-            article_dedup_skipped += 1
-            _write_processing_audit(
-                conn,
-                chunk=sk,
-                stage="article_dedup",
-                status="article_dedup_skipped",
-                chunk_macro_score=sk.get("_macro_score"),
-                was_hard_include=bool(sk.get("_was_hard_include")),
-                review_reasons=["article_level_redundancy_skip"],
-            )
     surviving = dedup_surviving
 
     print(

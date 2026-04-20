@@ -81,6 +81,7 @@ CHUNK_OVERLAP_TOKENS = int(os.getenv("CHUNK_OVERLAP_TOKENS", "50"))
 # Embedding model - must match PERIOD_GRANULARITY vector index dim
 EMBED_MODEL_NAME = os.getenv("EMBED_MODEL_NAME", "dunzhang/stella_en_1.5B_v5")
 EMBED_BATCH_SIZE = int(os.getenv("EMBED_BATCH_SIZE", "32"))
+SQLITE_EMBED_BACKFILL_BATCH_ROWS = int(os.getenv("SQLITE_EMBED_BACKFILL_BATCH_ROWS", "256"))
 
 # NER / extraction model
 NER_MODEL_NAME = os.getenv("NER_MODEL_NAME", "dbmdz/bert-large-cased-finetuned-conll03-english")
@@ -1141,14 +1142,15 @@ def run_sqlite_pass(
     reset: bool = False,
     skip_entities: bool = False,
     keep_per_singletons: bool = False,
+    skip_embeddings: bool = False,
     db_path: str = SQLITE_DB,
 ) -> None:
     """
     SQLite-only pipeline pass. No Neo4j connection is opened.
 
     Reads articles from SQLite, chunks them, extracts entity mentions,
-    and writes everything back to SQLite. Skips articles whose chunks
-    are already present (unless reset=True).
+    embeds chunk text, and writes everything back to SQLite. Skips
+    articles whose chunks are already present (unless reset=True).
 
     keep_per_singletons: if True, skips the PER singleton filter so all
     extracted person entities are written regardless of chunk frequency.
@@ -1169,7 +1171,16 @@ def run_sqlite_pass(
     print(f"[sqlite_pass] {len(articles)} new articles after filtering")
 
     if not articles:
-        print("[sqlite_pass] Nothing new to process. Done.")
+        print("[sqlite_pass] Nothing new to process.")
+        if skip_embeddings:
+            print("[sqlite_pass] Skipping embedding backfill (--skip-embeddings)")
+        else:
+            print("[sqlite_pass] Backfilling missing chunk embeddings ...")
+            backfilled = backfill_chunk_embeddings_sqlite(db_path=db_path)
+            print(f"[sqlite_pass] Backfilled {backfilled} chunk embedding(s)")
+        print("[sqlite_pass] Running integrity checks ...")
+        run_integrity_check(db_path)
+        print("[sqlite_pass] Done.")
         return
 
     # Chunk
@@ -1177,6 +1188,13 @@ def run_sqlite_pass(
     chunks = build_chunks(articles)
     print(f"[sqlite_pass] {len(chunks)} chunks produced")
     _upsert_chunks_sqlite(chunks, db_path)
+
+    if skip_embeddings:
+        print("[sqlite_pass] Skipping chunk embeddings (--skip-embeddings)")
+    else:
+        print("[sqlite_pass] Backfilling missing chunk embeddings ...")
+        backfilled = backfill_chunk_embeddings_sqlite(db_path=db_path)
+        print(f"[sqlite_pass] Backfilled {backfilled} chunk embedding(s)")
 
     # Entity extraction
     if not skip_entities:
@@ -1263,6 +1281,82 @@ def _upsert_entity_mentions_sqlite(mentions: list[dict], db_path: str = SQLITE_D
     conn.commit()
     conn.close()
     print(f"[sqlite] entity_mentions: {inserted} inserted, {len(mentions) - inserted} already present")
+
+
+def _load_unembedded_chunks_sqlite(
+    db_path: str = SQLITE_DB,
+    limit: int | None = None,
+) -> list[dict]:
+    """Return chunks that still need embeddings."""
+    from create_sql_db import connect_sqlite
+    conn = connect_sqlite(db_path, fk=False)
+    conn.row_factory = sqlite3.Row
+    sql = """
+        SELECT chunk_id, text
+        FROM chunks
+        WHERE (embedding_json IS NULL OR embedding_json = '')
+          AND text IS NOT NULL
+          AND text <> ''
+        ORDER BY published_date DESC, chunk_index ASC
+    """
+    params: list[Any] = []
+    if limit is not None and limit > 0:
+        sql += " LIMIT ?"
+        params.append(limit)
+    rows = conn.execute(sql, params).fetchall()
+    conn.close()
+    return [{"chunk_id": row["chunk_id"], "text": row["text"]} for row in rows]
+
+
+def _write_chunk_embeddings_sqlite(
+    rows: list[tuple[str, str]],
+    db_path: str = SQLITE_DB,
+) -> None:
+    """Persist (embedding_json, chunk_id) rows."""
+    if not rows:
+        return
+    from create_sql_db import connect_sqlite
+    conn = connect_sqlite(db_path)
+    conn.executemany(
+        "UPDATE chunks SET embedding_json = ? WHERE chunk_id = ?",
+        rows,
+    )
+    conn.commit()
+    conn.close()
+
+
+def backfill_chunk_embeddings_sqlite(
+    db_path: str = SQLITE_DB,
+    limit: int | None = None,
+    batch_rows: int = SQLITE_EMBED_BACKFILL_BATCH_ROWS,
+) -> int:
+    """
+    Compute and persist embeddings for chunks missing embedding_json.
+    Returns number of chunk rows updated.
+    """
+    pending = _load_unembedded_chunks_sqlite(db_path=db_path, limit=limit)
+    if not pending:
+        print("[embed] No missing chunk embeddings found.")
+        return 0
+
+    batch_size = max(1, int(batch_rows))
+    total = len(pending)
+    updated = 0
+    print(f"[embed] Backfilling {total} chunk embedding(s) ...")
+
+    for batch in _batched(pending, batch_size):
+        texts = [item["text"] for item in batch]
+        chunk_ids = [item["chunk_id"] for item in batch]
+        embeddings = embed_texts(texts, batch_size=EMBED_BATCH_SIZE)
+        payload = [
+            (json.dumps(emb, separators=(",", ":")), chunk_id)
+            for emb, chunk_id in zip(embeddings, chunk_ids)
+        ]
+        _write_chunk_embeddings_sqlite(payload, db_path=db_path)
+        updated += len(payload)
+        print(f"[embed] Backfill progress: {updated}/{total}")
+
+    return updated
 
 
 def run_setup(

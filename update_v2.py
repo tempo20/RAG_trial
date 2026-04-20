@@ -34,6 +34,11 @@ def main():
         help="Skip NER entity extraction in the SQLite pass",
     )
     parser.add_argument(
+        "--skip-embeddings",
+        action="store_true",
+        help="Skip chunk embedding generation/backfill in the SQLite pass",
+    )
+    parser.add_argument(
         "--no-macro",
         action="store_true",
         help="Skip macro extraction (Step 3)",
@@ -103,6 +108,7 @@ def main():
         reset=args.reset,
         skip_entities=args.skip_entities,
         keep_per_singletons=args.keep_per_singletons,
+        skip_embeddings=args.skip_embeddings,
     )
 
     # ── Step 3: Macro extraction ─────────────────────────────────────────────
