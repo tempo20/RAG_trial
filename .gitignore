@@ -1,4 +1,5 @@
 venv/
+notebooks/
 .env
 *.txt 
 *.json
@@ -16,3 +17,4 @@ test*.py
 !prompt_templates.json
 !ticker_company_map.csv
 my_database_snapshot.db
+!notebooks/test.py
