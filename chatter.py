@@ -25,16 +25,17 @@ from __future__ import annotations
 
 import json
 import importlib
+import uuid
 import os
 import re
 import sqlite3
 import time
 import warnings
+from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Any, Optional
-from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 from dotenv import load_dotenv
 load_dotenv()
@@ -82,8 +83,9 @@ FIN_ENTITY_MAP_PATH = Path(os.getenv("FIN_ENTITY_MAP_PATH", "financial_entity_ma
 SQLITE_DB = os.getenv("SQLITE_DB", "my_database.db")
 PROMPT_TEMPLATES_PATH = Path(os.getenv("PROMPT_TEMPLATES_PATH", "prompt_templates.json"))
 
-TOP_K = int(os.getenv("TOP_K", "4"))
-EXPANDED_K = int(os.getenv("EXPANDED_K", "8"))
+SHOW_PROVENANCE = os.getenv("SHOW_PROVENANCE", "0").strip().lower() in {"1", "true", "yes", "on"}
+TOP_K = int(os.getenv("TOP_K", "3"))
+EXPANDED_K = int(os.getenv("EXPANDED_K", "6"))
 RECENCY_HALF_LIFE_DAYS = float(os.getenv("RECENCY_HALF_LIFE_DAYS", "5"))
 
 SUMMARY_TOP_K = int(os.getenv("SUMMARY_TOP_K", "12"))
@@ -119,34 +121,11 @@ SUMMARY_DOMAIN_TERMS = (
 )
 SQLITE_SEMANTIC_CANDIDATE_LIMIT = int(os.getenv("SQLITE_SEMANTIC_CANDIDATE_LIMIT", "0"))
 MACRO_EVENT_CANDIDATE_LIMIT = int(os.getenv("MACRO_EVENT_CANDIDATE_LIMIT", "600"))
-GEN_MAX_TOKENS = int(os.getenv("GEN_MAX_TOKENS", "1024"))
+GEN_MAX_TOKENS = int(os.getenv("GEN_MAX_TOKENS", "650"))
 RERANKER_MODEL_NAME = os.getenv("RERANKER_MODEL_NAME", "cross-encoder/ms-marco-MiniLM-L-6-v2")
 ENABLE_CROSS_ENCODER_RERANK = os.getenv("ENABLE_CROSS_ENCODER_RERANK", "1").strip().lower() in {"1", "true", "yes", "on"}
-RERANK_CANDIDATE_LIMIT = int(os.getenv("RERANK_CANDIDATE_LIMIT", "18"))
+RERANK_CANDIDATE_LIMIT = int(os.getenv("RERANK_CANDIDATE_LIMIT", "10"))
 RERANK_WEIGHT = float(os.getenv("RERANK_WEIGHT", "0.85"))
-ALPHA_VANTAGE_API_KEY = os.getenv("ALPHA_VANTAGE_API_KEY", "").strip()
-ALPHA_VANTAGE_MCP_URL = os.getenv("ALPHA_VANTAGE_MCP_URL", "https://mcp.alphavantage.co/mcp").strip()
-_alpha_mcp_remote_flag = os.getenv("ENABLE_ALPHA_MCP_REMOTE")
-ENABLE_ALPHA_MCP_REMOTE = (
-    _alpha_mcp_remote_flag.strip().lower() in {"1", "true", "yes", "on"}
-    if _alpha_mcp_remote_flag is not None
-    else bool(ALPHA_VANTAGE_API_KEY)
-)
-
-ALPHA_MCP_BETA = "mcp-client-2025-11-20"
-ALPHA_MCP_SERVER_NAME = "alphavantage"
-ALPHA_MCP_ALLOWED_TOOLS = (
-    "TOOL_CALL",
-    "GLOBAL_QUOTE",
-    "TIME_SERIES_DAILY",
-    "COMPANY_OVERVIEW",
-)
-ALPHA_MCP_FALLBACK_NOTE = "Live market data is temporarily unavailable; answer is based on retrieved news context."
-try:
-    ALPHA_MCP_TIMEOUT_SECONDS = float(os.getenv("ALPHA_MCP_TIMEOUT_SECONDS", "25"))
-except ValueError:
-    ALPHA_MCP_TIMEOUT_SECONDS = 25.0
-
 SOURCE_KEYWORDS = {
     "bbc": "BBC",
     "bloomberg": "Bloomberg",
@@ -154,6 +133,214 @@ SOURCE_KEYWORDS = {
     "marketwatch": "MarketWatch",
     "nasdaq": "Nasdaq",
     "cbs": "CBS MoneyWatch",
+}
+
+ROUTE_TYPES = (
+    "latest_news",
+    "daily_summary",
+    "macro_causal",
+    "entity_profile",
+    "live_market_data",
+    "broad_exploration",
+    "ambiguous",
+)
+
+SCORING_COMPONENT_ORDER = (
+    "semantic_score",
+    "cross_encoder_score",
+    "keyword_overlap_score",
+    "target_match_score",
+    "source_quality_score",
+    "recency_score",
+    "graph_relevance_score",
+    "event_support_score",
+    "duplicate_penalty",
+    "ambiguity_penalty",
+)
+
+UNIFIED_SCORING_WEIGHTS: dict[str, float] = {
+    "semantic_score": float(os.getenv("W1_SEMANTIC_SCORE", "0.24")),
+    "cross_encoder_score": float(os.getenv("W2_CROSS_ENCODER_SCORE", "0.16")),
+    "keyword_overlap_score": float(os.getenv("W3_KEYWORD_OVERLAP_SCORE", "0.08")),
+    "target_match_score": float(os.getenv("W4_TARGET_MATCH_SCORE", "0.12")),
+    "source_quality_score": float(os.getenv("W5_SOURCE_QUALITY_SCORE", "0.10")),
+    "recency_score": float(os.getenv("W6_RECENCY_SCORE", "0.10")),
+    "graph_relevance_score": float(os.getenv("W7_GRAPH_RELEVANCE_SCORE", "0.08")),
+    "event_support_score": float(os.getenv("W8_EVENT_SUPPORT_SCORE", "0.12")),
+    "duplicate_penalty": float(os.getenv("W9_DUPLICATE_PENALTY", "0.07")),
+    "ambiguity_penalty": float(os.getenv("W10_AMBIGUITY_PENALTY", "0.07")),
+}
+
+ROUTE_WEIGHT_MULTIPLIERS: dict[str, dict[str, float]] = {
+    "latest_news": {"recency_score": 1.35, "source_quality_score": 1.15},
+    "daily_summary": {"source_quality_score": 1.15, "duplicate_penalty": 1.25},
+    "macro_causal": {"event_support_score": 1.35, "graph_relevance_score": 1.25},
+    "entity_profile": {"target_match_score": 1.35, "recency_score": 0.85},
+    "live_market_data": {"recency_score": 1.25, "target_match_score": 1.20},
+    "broad_exploration": {"semantic_score": 1.10, "keyword_overlap_score": 1.10},
+    "ambiguous": {"ambiguity_penalty": 1.50, "target_match_score": 0.85},
+}
+
+ROUTE_PROFILES: dict[str, dict[str, Any]] = {
+    "latest_news": {
+        "top_k": max(4, TOP_K),
+        "expanded_k": max(EXPANDED_K, TOP_K + 4),
+        "recency_half_life_days": max(1.0, RECENCY_HALF_LIFE_DAYS * 0.8),
+        "candidate_cap": max(30, EXPANDED_K * 8),
+        "answer_strictness": "high",
+        "allowed_content_classes": ("news_report", "analysis", "official_release"),
+    },
+    "daily_summary": {
+        "top_k": SUMMARY_TOP_K,
+        "expanded_k": SUMMARY_EXPANDED_K,
+        "recency_half_life_days": SUMMARY_RECENCY_HALF_LIFE_DAYS,
+        "candidate_cap": max(SUMMARY_CANDIDATE_LIMIT, SUMMARY_EXPANDED_K * 4),
+        "answer_strictness": "high",
+        "allowed_content_classes": ("news_report", "analysis", "official_release"),
+    },
+    "macro_causal": {
+        "top_k": max(6, TOP_K),
+        "expanded_k": max(EXPANDED_K + 4, TOP_K + 8),
+        "recency_half_life_days": max(1.0, RECENCY_HALF_LIFE_DAYS),
+        "candidate_cap": max(48, EXPANDED_K * 10),
+        "answer_strictness": "high",
+        "allowed_content_classes": ("news_report", "analysis", "official_release"),
+    },
+    "entity_profile": {
+        "top_k": max(5, TOP_K),
+        "expanded_k": max(EXPANDED_K, TOP_K + 6),
+        "recency_half_life_days": max(2.0, RECENCY_HALF_LIFE_DAYS * 1.2),
+        "candidate_cap": max(36, EXPANDED_K * 8),
+        "answer_strictness": "medium",
+        "allowed_content_classes": ("news_report", "analysis", "official_release", "evergreen_explainer"),
+    },
+    "live_market_data": {
+        "top_k": max(4, TOP_K),
+        "expanded_k": max(EXPANDED_K, TOP_K + 4),
+        "recency_half_life_days": max(1.0, RECENCY_HALF_LIFE_DAYS * 0.7),
+        "candidate_cap": max(28, EXPANDED_K * 6),
+        "answer_strictness": "high",
+        "allowed_content_classes": ("news_report", "analysis", "official_release", "ticker_page"),
+    },
+    "broad_exploration": {
+        "top_k": max(6, TOP_K),
+        "expanded_k": max(EXPANDED_K + 4, TOP_K + 8),
+        "recency_half_life_days": max(2.0, RECENCY_HALF_LIFE_DAYS * 1.1),
+        "candidate_cap": max(60, EXPANDED_K * 12),
+        "answer_strictness": "medium",
+        "allowed_content_classes": ("news_report", "analysis", "official_release", "evergreen_explainer"),
+    },
+    "ambiguous": {
+        "top_k": max(5, TOP_K),
+        "expanded_k": max(EXPANDED_K, TOP_K + 6),
+        "recency_half_life_days": max(1.5, RECENCY_HALF_LIFE_DAYS),
+        "candidate_cap": max(40, EXPANDED_K * 8),
+        "answer_strictness": "very_high",
+        "allowed_content_classes": ("news_report", "analysis", "official_release"),
+    },
+}
+
+SOURCE_TRUST_SCORES = {
+    "tier_1": 1.0,
+    "tier_2": 0.82,
+    "tier_3": 0.62,
+    "blocked": 0.0,
+}
+
+CONTENT_CLASS_SCORES = {
+    "news_report": 1.0,
+    "analysis": 0.9,
+    "official_release": 0.95,
+    "evergreen_explainer": 0.68,
+    "ticker_page": 0.45,
+    "navigation_page": 0.2,
+    "video_stub": 0.25,
+    "quote_page": 0.22,
+    "junk": 0.0,
+}
+
+SOURCE_QUALITY_FALLBACK = {
+    "reuters": 0.95,
+    "bloomberg": 0.93,
+    "wsj": 0.91,
+    "ft": 0.91,
+    "cnbc": 0.80,
+    "bbc": 0.80,
+    "marketwatch": 0.72,
+    "nasdaq": 0.70,
+}
+
+AMBIGUITY_ROUTE_TERMS = (
+    "which",
+    "what about",
+    "is it",
+    "they",
+    "them",
+    "this company",
+    "that company",
+    "or",
+    "vs",
+    "versus",
+)
+
+ROUTE_HINTS = {
+    "latest_news": ("latest", "recent", "new", "update", "today", "yesterday"),
+    "daily_summary": SUMMARY_TERMS + SUMMARY_TIME_TERMS,
+    "macro_causal": (
+        "affect", "impact", "effect", "influence", "cause", "drive",
+        "mean for", "implication", "what does", "how does", "why is",
+        "because of", "result of", "due to", "respond to", "reaction",
+        "stronger", "weaker", "rise", "fall", "rally", "selloff",
+    ),
+    "entity_profile": ("profile", "overview", "who is", "what is", "background", "exposure"),
+    "live_market_data": ("price", "quote", "trading", "market", "valuation", "live", "real-time", "intraday"),
+    "broad_exploration": ("explain", "landscape", "themes", "broad", "overview", "drivers"),
+}
+
+SUMMARY_THEME_KEYWORDS: dict[str, tuple[str, tuple[str, ...]]] = {
+    "geopolitics": ("Geopolitics", ("war", "sanction", "geopolit", "conflict", "election", "diplomatic", "tariff")),
+    "energy": ("Energy", ("oil", "gas", "lng", "energy", "opec", "refinery", "brent", "wti")),
+    "central_banks": ("Central Banks", ("fed", "fomc", "ecb", "boj", "rate", "hike", "cut", "monetary")),
+    "equities": ("Equities", ("equity", "stock", "shares", "index", "earnings", "valuation", "sp500", "nasdaq")),
+    "inflation_growth": ("Inflation/Growth", ("inflation", "cpi", "gdp", "growth", "recession", "employment", "labor")),
+    "fx_rates": ("FX/Rates", ("usd", "dollar", "fx", "currency", "yield", "treasury", "bond")),
+    "commodities": ("Commodities", ("gold", "silver", "copper", "commodity", "wheat", "corn")),
+}
+
+ANSWER_CONFIDENCE_WEIGHTS = {
+    "relevant_chunks": 0.22,
+    "source_diversity": 0.15,
+    "retrieval_margin": 0.15,
+    "verifier_support": 0.16,
+    "recency_coverage": 0.12,
+    "ambiguity_penalty": 0.10,
+    "contradiction_penalty": 0.10,
+}
+
+RESOLUTION_DISAMBIGUATION_THRESHOLD = float(os.getenv("RESOLUTION_DISAMBIGUATION_THRESHOLD", "0.55"))
+
+DOMAIN_CANONICAL_ALIASES: dict[str, dict[str, Any]] = {
+    "united states": {"canonical_name": "country:united_states", "display_name": "United States", "entity_type": "COUNTRY", "category": "countries"},
+    "us": {"canonical_name": "country:united_states", "display_name": "United States", "entity_type": "COUNTRY", "category": "countries"},
+    "china": {"canonical_name": "country:china", "display_name": "China", "entity_type": "COUNTRY", "category": "countries"},
+    "japan": {"canonical_name": "country:japan", "display_name": "Japan", "entity_type": "COUNTRY", "category": "countries"},
+    "eurozone": {"canonical_name": "region:eurozone", "display_name": "Eurozone", "entity_type": "REGION", "category": "countries"},
+    "fed": {"canonical_name": "cb:fed", "display_name": "Federal Reserve", "entity_type": "CENTRAL_BANK", "category": "central_banks"},
+    "federal reserve": {"canonical_name": "cb:fed", "display_name": "Federal Reserve", "entity_type": "CENTRAL_BANK", "category": "central_banks"},
+    "ecb": {"canonical_name": "cb:ecb", "display_name": "European Central Bank", "entity_type": "CENTRAL_BANK", "category": "central_banks"},
+    "boj": {"canonical_name": "cb:boj", "display_name": "Bank of Japan", "entity_type": "CENTRAL_BANK", "category": "central_banks"},
+    "gold": {"canonical_name": "commodity:gold", "display_name": "Gold", "entity_type": "COMMODITY", "category": "commodities"},
+    "oil": {"canonical_name": "commodity:oil", "display_name": "Crude Oil", "entity_type": "COMMODITY", "category": "commodities"},
+    "brent": {"canonical_name": "commodity:brent", "display_name": "Brent Crude", "entity_type": "COMMODITY", "category": "commodities"},
+    "wti": {"canonical_name": "commodity:wti", "display_name": "WTI Crude", "entity_type": "COMMODITY", "category": "commodities"},
+    "sp500": {"canonical_name": "index:sp500", "display_name": "S&P 500", "entity_type": "INDEX", "category": "indices"},
+    "s&p 500": {"canonical_name": "index:sp500", "display_name": "S&P 500", "entity_type": "INDEX", "category": "indices"},
+    "nasdaq": {"canonical_name": "index:nasdaq", "display_name": "NASDAQ Composite", "entity_type": "INDEX", "category": "indices"},
+    "qqq": {"canonical_name": "etf:qqq", "display_name": "Invesco QQQ Trust", "entity_type": "ETF", "category": "etfs", "ticker": "QQQ"},
+    "spy": {"canonical_name": "etf:spy", "display_name": "SPDR S&P 500 ETF", "entity_type": "ETF", "category": "etfs", "ticker": "SPY"},
+    "inflation": {"canonical_name": "macro:inflation", "display_name": "Inflation", "entity_type": "MACRO_CONCEPT", "category": "macro_concepts"},
+    "growth": {"canonical_name": "macro:growth", "display_name": "Economic Growth", "entity_type": "MACRO_CONCEPT", "category": "macro_concepts"},
+    "yield curve": {"canonical_name": "macro:yield_curve", "display_name": "Yield Curve", "entity_type": "MACRO_CONCEPT", "category": "macro_concepts"},
 }
 
 _RERANKER = None
@@ -414,6 +601,7 @@ def _parse_embedding_json(raw: str | None) -> list[float] | None:
 
 
 def _sqlite_row_to_chunk_dict(row: sqlite3.Row) -> dict:
+    keys = set(row.keys())
     return {
         "chunk_uid": row["chunk_id"],
         "text": row["text"],
@@ -424,6 +612,10 @@ def _sqlite_row_to_chunk_dict(row: sqlite3.Row) -> dict:
         "url": row["url"],
         "source": row["source"],
         "article_id": row["article_id"],
+        "source_trust_tier": row["source_trust_tier"] if "source_trust_tier" in keys else None,
+        "content_class": row["content_class"] if "content_class" in keys else None,
+        "article_quality_score": row["article_quality_score"] if "article_quality_score" in keys else None,
+        "quality_flags_json": row["quality_flags_json"] if "quality_flags_json" in keys else None,
     }
 
 
@@ -439,6 +631,460 @@ def _keyword_overlap_score(query: str, text: str) -> float:
     if not text_terms:
         return 0.0
     return len(query_terms & text_terms) / max(len(query_terms), 1)
+
+
+def _safe_float(value: Any, default: float = 0.0) -> float:
+    try:
+        if value is None:
+            return float(default)
+        return float(value)
+    except (TypeError, ValueError):
+        return float(default)
+
+
+def _clamp01(value: float) -> float:
+    return max(0.0, min(1.0, float(value)))
+
+
+def _sigmoid(value: float) -> float:
+    return 1.0 / (1.0 + float(np.exp(-value)))
+
+
+def _resolve_route_profile(route_type: str | None) -> dict[str, Any]:
+    route = route_type if route_type in ROUTE_PROFILES else "broad_exploration"
+    profile = ROUTE_PROFILES[route]
+    return {
+        "route_type": route,
+        "top_k": int(profile["top_k"]),
+        "expanded_k": int(profile["expanded_k"]),
+        "recency_half_life_days": float(profile["recency_half_life_days"]),
+        "candidate_cap": int(profile["candidate_cap"]),
+        "answer_strictness": str(profile["answer_strictness"]),
+        "allowed_content_classes": tuple(profile.get("allowed_content_classes") or ()),
+    }
+
+
+def _resolve_scoring_weights(route_type: str | None) -> dict[str, float]:
+    weights = dict(UNIFIED_SCORING_WEIGHTS)
+    route = route_type if route_type in ROUTE_WEIGHT_MULTIPLIERS else None
+    if route:
+        for component, multiplier in ROUTE_WEIGHT_MULTIPLIERS[route].items():
+            if component in weights:
+                weights[component] = float(weights[component]) * float(multiplier)
+    return weights
+
+
+def classify_query_route(
+    *,
+    query: str,
+    summary_mode: bool,
+    causal_intent: bool,
+    market_data_intent: bool,
+    target: QueryTarget | None = None,
+) -> str:
+    q = (query or "").strip().lower()
+    if summary_mode:
+        return "daily_summary"
+    if market_data_intent:
+        return "live_market_data"
+    if causal_intent:
+        return "macro_causal"
+    if target and target.needs_disambiguation:
+        return "ambiguous"
+    if any(h in q for h in ROUTE_HINTS["latest_news"]):
+        return "latest_news"
+    if target and target.canonical_name and any(h in q for h in ROUTE_HINTS["entity_profile"]):
+        return "entity_profile"
+    if any(h in q for h in AMBIGUITY_ROUTE_TERMS):
+        return "ambiguous"
+    return "broad_exploration"
+
+
+def _route_allows_content_class(route_profile: dict[str, Any], content_class: str | None) -> bool:
+    allowed = route_profile.get("allowed_content_classes") or ()
+    if not allowed:
+        return True
+    if not content_class:
+        return True
+    return str(content_class).strip().lower() in {c.lower() for c in allowed}
+
+
+def _source_quality_component(row: dict[str, Any]) -> float:
+    trust_tier = (row.get("source_trust_tier") or "").strip().lower()
+    trust_score = SOURCE_TRUST_SCORES.get(trust_tier, 0.65)
+    content_class = (row.get("content_class") or "").strip().lower()
+    class_score = CONTENT_CLASS_SCORES.get(content_class, 0.60)
+    quality_raw = _safe_float(row.get("article_quality_score"), 60.0)
+    quality_score = _clamp01(quality_raw / 100.0 if quality_raw > 1.0 else quality_raw)
+    source_name = (row.get("source") or "").strip().lower()
+    source_fallback = SOURCE_QUALITY_FALLBACK.get(source_name, 0.68)
+    return _clamp01(0.35 * trust_score + 0.25 * class_score + 0.25 * quality_score + 0.15 * source_fallback)
+
+
+def _target_match_component(row: dict[str, Any], target: QueryTarget | None) -> float:
+    if target is None or not target.canonical_name:
+        return 0.40
+    kind = str(row.get("retrieval_kind") or "")
+    score = 0.35
+    if kind in {"entity_mentions", "macro_event_entity"}:
+        score += 0.35
+    if kind in {"macro_event_asset"} and target.ticker:
+        score += 0.20
+    text = (row.get("text") or "").lower()
+    display_name = (target.display_name or "").lower()
+    canonical = (target.canonical_name or "").lower()
+    ticker = (target.ticker or "").lower()
+    if display_name and display_name in text:
+        score += 0.18
+    if canonical and canonical in text:
+        score += 0.16
+    if ticker and ticker in text:
+        score += 0.10
+    return _clamp01(score)
+
+
+def _graph_relevance_component(row: dict[str, Any]) -> float:
+    kind = str(row.get("retrieval_kind") or "")
+    if kind.startswith("macro_event"):
+        return 0.90
+    if kind == "entity_mentions":
+        return 0.62
+    if kind == "summary_diverse_source":
+        return 0.52
+    if kind == "sqlite_semantic":
+        return 0.40
+    return 0.35
+
+
+def _event_support_component(row: dict[str, Any]) -> float:
+    support = _safe_float(row.get("support_score"), -1.0)
+    if support >= 0.0:
+        return _clamp01(support)
+    verification_status = (row.get("verification_status") or "").strip().lower()
+    if verification_status == "verified":
+        return 0.92
+    if verification_status == "weak":
+        return 0.52
+    if verification_status == "rejected":
+        return 0.12
+    return _clamp01(_safe_float(row.get("macro_confidence"), 0.45))
+
+
+def _compute_contradiction_signal(chunks: list[dict[str, Any]]) -> float:
+    directions = set()
+    for chunk in chunks:
+        direction = (chunk.get("impact_direction") or "").strip().lower()
+        if direction in {"up", "down", "positive", "negative"}:
+            directions.add(direction)
+    if {"up", "down"} <= directions or {"positive", "negative"} <= directions:
+        return 1.0
+    return 0.0
+
+
+def _apply_unified_scoring(
+    *,
+    query: str,
+    rows: list[dict],
+    query_vec: np.ndarray,
+    target: QueryTarget | None,
+    route_type: str,
+    recency_half_life_days: float,
+) -> list[dict]:
+    now_ts = int(datetime.now(timezone.utc).timestamp())
+    half_life_s = max(0.1, recency_half_life_days) * 86400.0
+    weights = _resolve_scoring_weights(route_type)
+    seen_uid: set[str] = set()
+    seen_text_fingerprints: set[str] = set()
+    scored: list[dict] = []
+
+    for row in rows:
+        uid = row.get("chunk_uid")
+        if not uid:
+            continue
+
+        emb = row.get("embedding")
+        if emb is None:
+            semantic_score = _clamp01(_safe_float(row.get("semantic_score"), _safe_float(row.get("candidate_score"), 0.45)))
+        else:
+            semantic_score = _clamp01(cosine_sim(query_vec, np.array(emb, dtype=np.float32)))
+        keyword_overlap = _clamp01(_keyword_overlap_score(query, row.get("text", "")))
+        target_match = _target_match_component(row, target)
+        source_quality = _source_quality_component(row)
+
+        ts = _published_date_to_ts(row.get("published_date"))
+        recency_score = float(np.exp(-max(0.0, float(now_ts - ts)) / half_life_s)) if ts is not None else 0.0
+        recency_score = _clamp01(recency_score)
+
+        graph_relevance = _graph_relevance_component(row)
+        event_support = _event_support_component(row)
+
+        text_fingerprint = re.sub(r"\s+", " ", (row.get("text") or "").strip().lower())[:280]
+        duplicate_penalty = 1.0 if (uid in seen_uid or text_fingerprint in seen_text_fingerprints) else 0.0
+        ambiguity_penalty = _clamp01(target.ambiguity_score if target else 0.0)
+
+        cross_encoder_score = _clamp01(_safe_float(row.get("cross_encoder_score"), 0.0))
+        final_score = (
+            weights["semantic_score"] * semantic_score
+            + weights["cross_encoder_score"] * cross_encoder_score
+            + weights["keyword_overlap_score"] * keyword_overlap
+            + weights["target_match_score"] * target_match
+            + weights["source_quality_score"] * source_quality
+            + weights["recency_score"] * recency_score
+            + weights["graph_relevance_score"] * graph_relevance
+            + weights["event_support_score"] * event_support
+            - weights["duplicate_penalty"] * duplicate_penalty
+            - weights["ambiguity_penalty"] * ambiguity_penalty
+        )
+
+        scored_row = {
+            **row,
+            "semantic_score": semantic_score,
+            "cross_encoder_score": cross_encoder_score,
+            "keyword_overlap_score": keyword_overlap,
+            "target_match_score": target_match,
+            "source_quality_score": source_quality,
+            "recency_score": recency_score,
+            "graph_relevance_score": graph_relevance,
+            "event_support_score": event_support,
+            "duplicate_penalty": duplicate_penalty,
+            "ambiguity_penalty": ambiguity_penalty,
+            "final_score": float(final_score),
+            "score": float(final_score),
+            "score_components": {
+                "semantic_score": semantic_score,
+                "cross_encoder_score": cross_encoder_score,
+                "keyword_overlap_score": keyword_overlap,
+                "target_match_score": target_match,
+                "source_quality_score": source_quality,
+                "recency_score": recency_score,
+                "graph_relevance_score": graph_relevance,
+                "event_support_score": event_support,
+                "duplicate_penalty": duplicate_penalty,
+                "ambiguity_penalty": ambiguity_penalty,
+            },
+            "scoring_weights": dict(weights),
+        }
+        scored.append(scored_row)
+        seen_uid.add(uid)
+        if text_fingerprint:
+            seen_text_fingerprints.add(text_fingerprint)
+
+    scored.sort(key=lambda item: item.get("final_score", item.get("score", 0.0)), reverse=True)
+    return scored
+
+
+def _cluster_summary_themes(chunks: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    themed: list[dict[str, Any]] = []
+    theme_counts: dict[str, int] = defaultdict(int)
+    for chunk in chunks:
+        text = f"{chunk.get('title', '')} {chunk.get('text', '')}".lower()
+        best_theme = "general"
+        best_label = "General"
+        best_hits = 0
+        for theme_id, (label, keywords) in SUMMARY_THEME_KEYWORDS.items():
+            hits = sum(1 for keyword in keywords if keyword in text)
+            if hits > best_hits:
+                best_hits = hits
+                best_theme = theme_id
+                best_label = label
+        confidence = _clamp01(0.35 + 0.12 * best_hits) if best_hits > 0 else 0.30
+        theme_counts[best_theme] += 1
+        themed.append(
+            {
+                **chunk,
+                "theme_id": best_theme,
+                "theme_label": best_label,
+                "theme_confidence": confidence,
+            }
+        )
+    themed.sort(
+        key=lambda item: (
+            theme_counts.get(str(item.get("theme_id") or "general"), 0),
+            _safe_float(item.get("theme_confidence"), 0.0),
+            _safe_float(item.get("final_score"), _safe_float(item.get("score"), 0.0)),
+        ),
+        reverse=True,
+    )
+    return themed
+
+
+def _compute_answer_confidence(chunks: list[dict], target: QueryTarget | None, decision_hint: str | None = None) -> tuple[float, dict[str, Any]]:
+    relevant_chunks = _clamp01(len(chunks) / 8.0)
+    unique_sources = len({(chunk.get("source") or "").lower() for chunk in chunks if chunk.get("source")})
+    source_diversity = _clamp01(unique_sources / 4.0)
+
+    top_score = _safe_float(chunks[0].get("final_score"), _safe_float(chunks[0].get("score"), 0.0)) if chunks else 0.0
+    second_score = _safe_float(chunks[1].get("final_score"), _safe_float(chunks[1].get("score"), 0.0)) if len(chunks) > 1 else 0.0
+    retrieval_margin = _clamp01(max(0.0, top_score - second_score))
+
+    verifier_support_vals = [_safe_float(chunk.get("event_support_score"), -1.0) for chunk in chunks]
+    verifier_support_vals = [value for value in verifier_support_vals if value >= 0.0]
+    verifier_support = _clamp01(sum(verifier_support_vals) / len(verifier_support_vals)) if verifier_support_vals else 0.45
+
+    recency_vals = [_safe_float(chunk.get("recency_score"), -1.0) for chunk in chunks]
+    recency_vals = [value for value in recency_vals if value >= 0.0]
+    recency_coverage = _clamp01(sum(recency_vals) / len(recency_vals)) if recency_vals else 0.0
+
+    ambiguity_penalty = _clamp01(target.ambiguity_score if target else 0.0)
+    contradiction_penalty = _compute_contradiction_signal(chunks)
+
+    score_0_1 = (
+        ANSWER_CONFIDENCE_WEIGHTS["relevant_chunks"] * relevant_chunks
+        + ANSWER_CONFIDENCE_WEIGHTS["source_diversity"] * source_diversity
+        + ANSWER_CONFIDENCE_WEIGHTS["retrieval_margin"] * retrieval_margin
+        + ANSWER_CONFIDENCE_WEIGHTS["verifier_support"] * verifier_support
+        + ANSWER_CONFIDENCE_WEIGHTS["recency_coverage"] * recency_coverage
+        - ANSWER_CONFIDENCE_WEIGHTS["ambiguity_penalty"] * ambiguity_penalty
+        - ANSWER_CONFIDENCE_WEIGHTS["contradiction_penalty"] * contradiction_penalty
+    )
+    confidence = max(0.0, min(100.0, round(100.0 * score_0_1, 1)))
+    if decision_hint == "ambiguous":
+        confidence = min(confidence, 55.0)
+
+    signals = {
+        "relevant_chunks": relevant_chunks,
+        "source_diversity": source_diversity,
+        "retrieval_margin": retrieval_margin,
+        "verifier_support": verifier_support,
+        "recency_coverage": recency_coverage,
+        "ambiguity_score": ambiguity_penalty,
+        "contradiction_signals": contradiction_penalty,
+    }
+    return confidence, signals
+
+
+def _decide_answer_mode(answer_confidence: float) -> str:
+    if answer_confidence < 35.0:
+        return "abstain"
+    if answer_confidence <= 60.0:
+        return "cautious_answer"
+    return "answer"
+
+
+def _db_columns(conn: sqlite3.Connection, table: str) -> set[str]:
+    try:
+        rows = conn.execute(f"PRAGMA table_info({table})").fetchall()
+    except sqlite3.Error:
+        return set()
+    return {str(row["name"] if isinstance(row, sqlite3.Row) else row[1]) for row in rows}
+
+
+def _insert_row_if_columns_exist(conn: sqlite3.Connection, table: str, payload: dict[str, Any]) -> None:
+    cols = _db_columns(conn, table)
+    if not cols:
+        return
+    row = {k: v for k, v in payload.items() if k in cols}
+    if not row:
+        return
+    keys = ", ".join(row.keys())
+    placeholders = ", ".join("?" for _ in row)
+    conn.execute(f"INSERT OR REPLACE INTO {table} ({keys}) VALUES ({placeholders})", tuple(row.values()))
+
+
+def _log_observability(
+    *,
+    conn: sqlite3.Connection,
+    run_id: str,
+    query: str,
+    route_type: str,
+    target: QueryTarget | None,
+    candidates: list[dict[str, Any]],
+    selected_chunks: list[dict[str, Any]],
+    answer_confidence: float,
+    decision: str,
+    latency_ms: float,
+    retrieval_trace: dict[str, Any],
+) -> None:
+    created_at = datetime.now(timezone.utc).isoformat()
+    selected_uids = {chunk.get("chunk_uid") for chunk in selected_chunks}
+
+    for index, candidate in enumerate(candidates):
+        chunk_uid = candidate.get("chunk_uid")
+        candidate_id = str(candidate.get("candidate_id") or f"{run_id}::{chunk_uid or 'candidate'}::{index}")
+        _insert_row_if_columns_exist(
+            conn,
+            "retrieval_candidates",
+            {
+                "run_id": run_id,
+                "candidate_id": candidate_id,
+                "candidate_kind": candidate.get("retrieval_kind") or "chunk",
+                "article_id": candidate.get("article_id"),
+                "chunk_id": chunk_uid,
+                "macro_event_id": candidate.get("macro_event_id"),
+                "semantic_score": candidate.get("semantic_score"),
+                "cross_encoder_score": candidate.get("cross_encoder_score"),
+                "keyword_overlap_score": candidate.get("keyword_overlap_score"),
+                "target_match_score": candidate.get("target_match_score"),
+                "source_quality_score": candidate.get("source_quality_score"),
+                "recency_score": candidate.get("recency_score"),
+                "graph_relevance_score": candidate.get("graph_relevance_score"),
+                "event_support_score": candidate.get("event_support_score"),
+                "duplicate_penalty": candidate.get("duplicate_penalty"),
+                "ambiguity_penalty": candidate.get("ambiguity_penalty"),
+                "final_score": candidate.get("final_score"),
+                "score_trace_json": json.dumps(candidate.get("score_components", {}), ensure_ascii=False),
+                "selected": 1 if chunk_uid in selected_uids else 0,
+                "created_at": created_at,
+            },
+        )
+
+    _insert_row_if_columns_exist(
+        conn,
+        "qa_runs",
+        {
+            "run_id": run_id,
+            "query": query,
+            "route_type": route_type,
+            "resolved_target_json": json.dumps(
+                {
+                    "canonical_name": target.canonical_name if target else None,
+                    "display_name": target.display_name if target else None,
+                    "ticker": target.ticker if target else None,
+                    "entity_type": target.entity_type if target else None,
+                    "best_candidate": target.best_candidate if target else None,
+                    "candidates": target.candidates if target else [],
+                    "ambiguity_score": target.ambiguity_score if target else None,
+                    "resolution_mode": target.resolution_mode if target else None,
+                    "needs_disambiguation": target.needs_disambiguation if target else None,
+                },
+                ensure_ascii=False,
+            ),
+            "retrieval_trace_json": json.dumps(retrieval_trace, ensure_ascii=False),
+            "selected_chunks_json": json.dumps(
+                [
+                    {
+                        "chunk_uid": chunk.get("chunk_uid"),
+                        "article_id": chunk.get("article_id"),
+                        "source": chunk.get("source"),
+                        "title": chunk.get("title"),
+                        "theme_id": chunk.get("theme_id"),
+                        "theme_label": chunk.get("theme_label"),
+                        "score": chunk.get("final_score", chunk.get("score")),
+                    }
+                    for chunk in selected_chunks
+                ],
+                ensure_ascii=False,
+            ),
+            "selected_macro_events_json": json.dumps(
+                [
+                    {
+                        "macro_event_id": chunk.get("macro_event_id"),
+                        "verification_status": chunk.get("verification_status"),
+                        "support_score": chunk.get("support_score"),
+                        "confidence_calibrated": chunk.get("confidence_calibrated"),
+                    }
+                    for chunk in selected_chunks
+                    if chunk.get("macro_event_id")
+                ],
+                ensure_ascii=False,
+            ),
+            "answer_confidence": answer_confidence,
+            "decision": decision,
+            "latency": latency_ms,
+            "created_at": created_at,
+        },
+    )
+    conn.commit()
 
 
 def load_reranker():
@@ -481,9 +1127,18 @@ def apply_reranker(query: str, ranked_rows: list[dict], reranker=None) -> list[d
         scores = active_reranker.predict([(query, row.get("text", "")) for row in pool])
     reranked = []
     for row, rerank_score in zip(pool, scores):
-        combined_score = (1.0 - RERANK_WEIGHT) * float(row.get("score") or 0.0) + RERANK_WEIGHT * float(rerank_score)
-        reranked.append({**row, "rerank_score": float(rerank_score), "score": combined_score})
-    reranked.sort(key=lambda item: item["score"], reverse=True)
+        raw = float(rerank_score)
+        cross_score = _clamp01(_sigmoid(raw / 8.0))
+        combined_score = (1.0 - RERANK_WEIGHT) * float(row.get("score") or 0.0) + RERANK_WEIGHT * cross_score
+        reranked.append(
+            {
+                **row,
+                "rerank_score_raw": raw,
+                "cross_encoder_score": cross_score,
+                "score": combined_score,
+            }
+        )
+    reranked.sort(key=lambda item: item.get("score", 0.0), reverse=True)
     return reranked + ranked_rows[pool_size:]
 
 
@@ -524,9 +1179,98 @@ def format_provenance(chunks: list[dict]) -> str:
 
 def ensure_structured_answer(answer: str, chunks: list[dict]) -> str:
     answer = (answer or "").strip()
+    citation_map = build_citation_map(chunks)
+
     if not answer:
-        return "The retrieved articles do not contain sufficient information to answer this."
-    return answer
+        answer = "The retrieved evidence is insufficient to answer confidently."
+
+    has_answer = bool(re.search(r"(?im)^\s*answer\s*:", answer))
+    has_evidence = bool(re.search(r"(?im)^\s*evidence\s*:", answer))
+    has_theory = bool(re.search(r"(?im)^\s*theory\s*:", answer))
+    if has_answer and has_evidence and has_theory:
+        return answer
+
+    def _extract_section(label: str) -> str:
+        pattern = rf"(?is)^\s*{label}\s*:(.*?)(?=^\s*(?:Answer|Evidence|Theory)\s*:|\Z)"
+        match = re.search(pattern, answer, flags=re.MULTILINE)
+        return (match.group(1).strip() if match else "")
+
+    def _cap_sentences(text: str, max_sentences: int) -> str:
+        text = re.sub(r"\s+", " ", (text or "").strip())
+        if not text:
+            return ""
+        sentences = re.split(r"(?<=[.!?])\s+", text)
+        return " ".join(sentences[:max_sentences]).strip()
+
+    def _compress_number_heavy_text(text: str) -> str:
+        text = re.sub(r"\s+", " ", (text or "").strip())
+        number_count = len(re.findall(r"(?:\b\d+(?:\.\d+)?%?|\$[\d,.]+)", text))
+        if number_count >= 5:
+            clauses = re.split(r"(?<=[.!?])\s+|;\s+", text)
+            text = " ".join(clauses[:2]).strip()
+        return text
+
+    def _chunk_citation_line(chunk: dict[str, Any]) -> str | None:
+        chunk_uid = chunk.get("chunk_uid")
+        if not chunk_uid:
+            return None
+        citation = citation_map.get(chunk_uid)
+        if not citation:
+            return None
+        source = (chunk.get("source") or "unknown source").strip()
+        text = re.sub(r"\s+", " ", (chunk.get("text") or "").strip())
+        snippet = _cap_sentences(_compress_number_heavy_text(text), 2)
+        snippet = snippet[:180].rstrip()
+        if snippet and len(text) > len(snippet):
+            snippet += "..."
+        if not snippet:
+            snippet = (chunk.get("title") or "no snippet available").strip()
+        return f"- [{citation}] {source}: {snippet}"
+
+    evidence_lines = [line for line in (_chunk_citation_line(chunk) for chunk in chunks[:3]) if line]
+    inline_refs = " ".join(f"[{ref}]" for ref in list(citation_map.values())[:3])
+
+    answer_section = _extract_section("Answer")
+    evidence_section = _extract_section("Evidence")
+    theory_section = _extract_section("Theory")
+
+    if not (has_answer or has_evidence or has_theory):
+        answer_section = answer
+    if not answer_section:
+        answer_section = "The retrieved evidence does not support a confident conclusion."
+    answer_section = _cap_sentences(answer_section, 4)
+    if inline_refs and inline_refs not in answer_section:
+        answer_section = f"{answer_section} {inline_refs}".strip()
+
+    if not evidence_section:
+        if evidence_lines:
+            evidence_section = "\n".join(evidence_lines)
+        else:
+            evidence_section = "No concrete evidence snippets were retrieved."
+    else:
+        evidence_lines_existing = [line for line in evidence_section.splitlines() if line.strip()]
+        if evidence_lines_existing:
+            if len(evidence_lines_existing) == 1:
+                evidence_section = _cap_sentences(evidence_lines_existing[0], 3)
+            else:
+                evidence_section = "\n".join(evidence_lines_existing[:3])
+
+    if not theory_section:
+        if chunks:
+            theory_section = (
+                "The conclusion is constrained by the cited evidence; causal interpretation remains tentative."
+            )
+        else:
+            theory_section = "No grounded mechanism can be stated without additional evidence."
+    theory_section = _cap_sentences(theory_section, 3)
+    if re.sub(r"\W+", " ", theory_section).strip().lower() == re.sub(r"\W+", " ", answer_section).strip().lower():
+        theory_section = "No additional inference is needed beyond the cited answer."
+
+    return (
+        f"Answer: {answer_section}\n"
+        f"Evidence: {evidence_section}\n"
+        f"Theory: {theory_section}"
+    )
 
 
 def _fetch_chunk_rows_by_ids(
@@ -550,7 +1294,11 @@ def _fetch_chunk_rows_by_ids(
             c.embedding_json,
             a.title,
             a.url,
-            a.source
+            a.source,
+            a.source_trust_tier,
+            a.content_class,
+            a.article_quality_score,
+            a.quality_flags_json
         FROM chunks c
         JOIN articles a ON a.article_id = c.article_id
         WHERE c.chunk_id IN ({placeholders})
@@ -908,7 +1656,7 @@ def retrieve_causal_chain(
     for hop in normalized_hops:
         try:
             # Reuse the full retrieve() stack — entity resolution + 3-layer retrieval
-            hop_chunks, hop_target = retrieve(
+            hop_chunks, hop_target, _ = retrieve(
                 query=hop,          # retrieve by canonical entity name, not the full query
                 embed_model=embed_model,
                 reranker=reranker,
@@ -946,7 +1694,7 @@ def retrieve_causal_chain(
     # in case hop-entity retrieval returned nothing useful
     if not all_chunks:
         try:
-            sem_chunks, sem_target = retrieve(
+            sem_chunks, sem_target, _ = retrieve(
                 query=query,
                 embed_model=embed_model,
                 reranker=reranker,
@@ -1087,90 +1835,6 @@ def fetch_market_context(
         return ""
 
     return "\n".join(lines)
-
-def build_alpha_mcp_url(base_url: str, api_key: str) -> str:
-    parsed = urlparse(base_url)
-    query_params = dict(parse_qsl(parsed.query, keep_blank_values=True))
-    query_params["apikey"] = api_key
-    return urlunparse(parsed._replace(query=urlencode(query_params)))
-
-
-def _mcp_result_text(content: Any) -> str:
-    if isinstance(content, str):
-        return content
-    if content is None:
-        return ""
-
-    texts: list[str] = []
-    if isinstance(content, list):
-        blocks = content
-    else:
-        try:
-            blocks = list(content)
-        except TypeError:
-            blocks = []
-
-    for block in blocks:
-        if isinstance(block, dict):
-            if block.get("type") == "text" and block.get("text"):
-                texts.append(str(block["text"]))
-            continue
-        text = getattr(block, "text", None)
-        if text:
-            texts.append(str(text))
-    return "\n".join(texts).strip()
-
-
-def inspect_mcp_response(response: Any) -> dict[str, Any]:
-    """
-    FIX 1: Only check for rate limits in tool_result blocks marked as errors,
-    not in all result text (which may include API documentation).
-    """
-    tool_calls: list[str] = []
-    has_result_block = False
-    has_error = False
-    rate_limited = False
- 
-    for block in getattr(response, "content", []) or []:
-        block_type = getattr(block, "type", None)
-        if block_type == "mcp_tool_use":
-            name = getattr(block, "name", None)
-            if name:
-                tool_calls.append(str(name))
-        elif block_type == "mcp_tool_result":
-            has_result_block = True
-            # FIX: Only check is_error flag first
-            if bool(getattr(block, "is_error", False)):
-                has_error = True
-                # FIX: Only check rate limit text if there's an actual error
-                result_text = _mcp_result_text(getattr(block, "content", None)).lower()
-                if any(marker in result_text for marker in (
-                    "rate limit",
-                    "limit reached",
-                    "too many requests",
-                    "call frequency",
-                    "quota exceeded",
-                )):
-                    rate_limited = True
- 
-    unique_tool_calls = list(dict.fromkeys(tool_calls))
-    return {
-        "tool_calls": unique_tool_calls,
-        "has_result_block": has_result_block,
-        "has_error": has_error,
-        "rate_limited": rate_limited,
-    }
-
-
-def _has_market_tool_execution(tool_calls: list[str]) -> bool:
-    """
-    FIX 2: Accept TOOL_CALL as a valid market tool execution,
-    since it's used for discovery and may precede actual data tools.
-    """
-    # TOOL_CALL is the discovery tool and is legitimate
-    market_tools = {"TOOL_CALL", "GLOBAL_QUOTE", "TIME_SERIES_DAILY", "COMPANY_OVERVIEW"}
-    return any(call in market_tools for call in tool_calls)
-
 
 def _is_planning_only_text(text: str) -> bool:
     t = text.lower().strip()
@@ -1395,7 +2059,11 @@ class QueryTarget:
     ticker: Optional[str]           # non-None only for ORG entities
     entity_type: Optional[str]      # ORG / PER / LOC
     confidence: float
-    candidates: list[tuple[str, str]] = field(default_factory=list)  # (canonical, display)
+    best_candidate: dict[str, Any] | None = None
+    candidates: list[dict[str, Any]] = field(default_factory=list)
+    ambiguity_score: float = 0.0
+    resolution_mode: str = "unresolved"
+    needs_disambiguation: bool = False
 
 
 def _normalize_for_matching(query: str) -> str:
@@ -1431,6 +2099,33 @@ def _lookup_entity_in_sqlite(conn: sqlite3.Connection, q_norm: str) -> dict | No
         (q_norm, q_norm),
     ).fetchall()
     return dict(rows[0]) if rows else None
+
+
+def _lookup_entity_candidates_in_sqlite(conn: sqlite3.Connection, q_norm: str, limit: int = 8) -> list[dict[str, Any]]:
+    rows = conn.execute(
+        """
+        SELECT
+            canonical_entity_id,
+            MAX(NULLIF(display_name, '')) AS display_name,
+            MAX(NULLIF(entity_type, '')) AS entity_type,
+            MAX(NULLIF(ticker, '')) AS ticker,
+            MAX(COALESCE(confidence, 0)) AS confidence
+        FROM entity_mentions
+        WHERE canonical_entity_id IS NOT NULL
+          AND canonical_entity_id <> ''
+          AND (
+            canonical_entity_id = ?
+            OR lower(display_name) = lower(?)
+            OR instr(lower(display_name), lower(?)) > 0
+            OR instr(?, canonical_entity_id) > 0
+          )
+        GROUP BY canonical_entity_id
+        ORDER BY confidence DESC, canonical_entity_id
+        LIMIT ?
+        """,
+        (q_norm, q_norm, q_norm, q_norm, max(limit, 1)),
+    ).fetchall()
+    return [dict(row) for row in rows]
 
 
 def _resolve_asset_target(
@@ -1491,6 +2186,95 @@ def _resolve_asset_target(
     }
 
 
+def _build_resolution_candidate(
+    *,
+    canonical_name: str,
+    display_name: str,
+    ticker: str | None,
+    entity_type: str | None,
+    confidence: float,
+    match_source: str,
+    matched_alias: str | None = None,
+    category: str | None = None,
+) -> dict[str, Any]:
+    return {
+        "canonical_name": canonical_name,
+        "display_name": display_name,
+        "ticker": ticker,
+        "entity_type": entity_type,
+        "confidence": _clamp01(confidence),
+        "match_source": match_source,
+        "matched_alias": matched_alias,
+        "category": category,
+    }
+
+
+def _dedupe_resolution_candidates(candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    if not candidates:
+        return []
+    merged: dict[str, dict[str, Any]] = {}
+    for cand in candidates:
+        canonical = str(cand.get("canonical_name") or "").strip()
+        if not canonical:
+            continue
+        prev = merged.get(canonical)
+        if prev is None or _safe_float(cand.get("confidence")) > _safe_float(prev.get("confidence")):
+            merged[canonical] = cand
+    sorted_cands = sorted(
+        merged.values(),
+        key=lambda c: (
+            _safe_float(c.get("confidence")),
+            len(str(c.get("matched_alias") or "")),
+            len(str(c.get("display_name") or "")),
+        ),
+        reverse=True,
+    )
+    return sorted_cands
+
+
+def _compute_ambiguity_score(candidates: list[dict[str, Any]], query: str) -> float:
+    if not candidates:
+        return 0.0
+    if len(candidates) == 1:
+        only = _safe_float(candidates[0].get("confidence"))
+        return _clamp01(max(0.0, 1.0 - only) * 0.35)
+
+    top_1 = _safe_float(candidates[0].get("confidence"))
+    top_2 = _safe_float(candidates[1].get("confidence"))
+    margin = max(0.0, top_1 - top_2)
+    base_ambiguity = _clamp01(1.0 - margin)
+    compare_boost = 0.12 if COMPARE_WORDS.search(query or "") else 0.0
+    many_candidates_boost = 0.10 if len(candidates) >= 4 else 0.0
+    return _clamp01(base_ambiguity + compare_boost + many_candidates_boost)
+
+
+def _domain_alias_candidates(q_norm: str) -> list[dict[str, Any]]:
+    hits: list[dict[str, Any]] = []
+    for alias, spec in DOMAIN_CANONICAL_ALIASES.items():
+        alias_norm = _canonicalize(alias)
+        if not alias_norm:
+            continue
+        if q_norm == alias_norm:
+            conf = 0.94
+        elif re.search(r"\b" + re.escape(alias_norm) + r"\b", q_norm):
+            conf = min(0.90, 0.72 + 0.02 * len(alias_norm.split()))
+        else:
+            continue
+        hits.append(
+            _build_resolution_candidate(
+                canonical_name=str(spec["canonical_name"]),
+                display_name=str(spec.get("display_name") or spec["canonical_name"]),
+                ticker=spec.get("ticker"),
+                entity_type=spec.get("entity_type"),
+                confidence=conf,
+                match_source="domain_map",
+                matched_alias=alias_norm,
+                category=spec.get("category"),
+            )
+        )
+    return hits
+
+
 def resolve_query_target(
     query: str,
     alias_to_ticker: dict[str, str],
@@ -1510,117 +2294,139 @@ def resolve_query_target(
       Tier 5 — general (no entity resolved)
     """
     q_norm = _normalize_for_matching(query)
+    collected: list[dict[str, Any]] = []
 
-    # Tier 1: explicit ticker tokens (1-5 uppercase letters)
-    ticker_candidates = re.findall(r"\b([A-Z]{1,5})\b", query)
-    for tok in ticker_candidates:
-        if tok in ticker_to_canonical:
-            display = ticker_to_canonical[tok]
-            return QueryTarget(
-                query_type=QUERY_TYPE_SINGLE,
-                canonical_name=tok,        # canonical_name IS the ticker for ORG
-                display_name=display,
-                ticker=tok,
-                entity_type="ORG",
-                confidence=0.99,
-                candidates=[(tok, display)],
+    # Tier 1: explicit ticker tokens (1-5 uppercase letters).
+    ticker_tokens = re.findall(r"\b([A-Z]{1,5})\b", query)
+    for token in ticker_tokens:
+        if token in ticker_to_canonical:
+            collected.append(
+                _build_resolution_candidate(
+                    canonical_name=token,
+                    display_name=ticker_to_canonical[token],
+                    ticker=token,
+                    entity_type="ORG",
+                    confidence=0.99,
+                    match_source="ticker_token",
+                    matched_alias=token.lower(),
+                    category="etfs" if token in {"QQQ", "SPY", "IWM", "DIA"} else "equities",
+                )
             )
 
-    # Tier 2: exact alias match
+    # Tier 2: direct alias map exact match.
     if q_norm in alias_to_ticker:
         ticker = alias_to_ticker[q_norm]
-        display = ticker_to_canonical.get(ticker, q_norm)
-        return QueryTarget(
-            query_type=QUERY_TYPE_SINGLE,
-            canonical_name=ticker,
-            display_name=display,
-            ticker=ticker,
-            entity_type="ORG",
-            confidence=0.98,
-            candidates=[(ticker, display)],
-        )
-    # Tier 2b: financial entity map — catches Fed, ECB, FOMC, indices, etc.
-    if alias_to_fin_entity:
-        from tgrag_setup import link_financial_entity
-        linked = link_financial_entity(q_norm, "ORG", alias_to_fin_entity)
-        if linked:
-            return QueryTarget(
-                query_type=QUERY_TYPE_SINGLE,
-                canonical_name=linked["canonical_name"],
-                display_name=linked["display_name"],
-                ticker=linked.get("ticker"),
-                entity_type=linked["entity_type"],
-                confidence=0.97,
-                candidates=[(linked["canonical_name"], linked["display_name"])],
+        collected.append(
+            _build_resolution_candidate(
+                canonical_name=ticker,
+                display_name=ticker_to_canonical.get(ticker, ticker),
+                ticker=ticker,
+                entity_type="ORG",
+                confidence=0.98,
+                match_source="ticker_alias_exact",
+                matched_alias=q_norm,
+                category="equities",
             )
+        )
 
-    # Tier 3: longest alias phrase found inside normalized query
-    phrase_hits: list[tuple[str, str, str]] = []  # (alias, ticker, display)
+    # Tier 2b: deterministic domain alias map (countries/central banks/etc).
+    collected.extend(_domain_alias_candidates(q_norm))
+
+    # Tier 3: longest ticker alias phrase in query.
+    phrase_hits: list[tuple[str, str]] = []
     for alias, ticker in alias_to_ticker.items():
-        if re.search(r"\b" + re.escape(alias) + r"\b", q_norm):
-            display = ticker_to_canonical.get(ticker, alias)
-            phrase_hits.append((alias, ticker, display))
-
-    if phrase_hits:
-        # Longest alias wins (most specific)
-        phrase_hits.sort(key=lambda x: len(x[0]), reverse=True)
-        alias, ticker, display = phrase_hits[0]
-        return QueryTarget(
-            query_type=QUERY_TYPE_SINGLE,
-            canonical_name=ticker,
-            display_name=display,
-            ticker=ticker,
-            entity_type="ORG",
-            confidence=0.95,
-            candidates=[(ticker, display)],
+        if alias and re.search(r"\b" + re.escape(alias) + r"\b", q_norm):
+            phrase_hits.append((alias, ticker))
+    phrase_hits.sort(key=lambda item: len(item[0]), reverse=True)
+    for alias, ticker in phrase_hits[:3]:
+        collected.append(
+            _build_resolution_candidate(
+                canonical_name=ticker,
+                display_name=ticker_to_canonical.get(ticker, alias),
+                ticker=ticker,
+                entity_type="ORG",
+                confidence=min(0.96, 0.86 + 0.02 * len(alias.split())),
+                match_source="ticker_alias_phrase",
+                matched_alias=alias,
+                category="equities",
+            )
         )
 
+    # Tier 4: financial entity map for central banks/macro institutions.
     if alias_to_fin_entity:
-        fin_phrase_hits: list[tuple[str, dict[str, Any]]] = []
         for alias, entity in alias_to_fin_entity.items():
-            if re.search(r"\b" + re.escape(alias) + r"\b", q_norm):
-                fin_phrase_hits.append((alias, entity))
-
-        if fin_phrase_hits:
-            fin_phrase_hits.sort(key=lambda x: len(x[0]), reverse=True)
-            _, entity = fin_phrase_hits[0]
-            canonical_name = str(entity["canonical_name"])
+            if not alias:
+                continue
+            if q_norm == alias:
+                confidence = 0.97
+            elif re.search(r"\b" + re.escape(alias) + r"\b", q_norm):
+                confidence = min(0.95, 0.80 + 0.02 * len(alias.split()))
+            else:
+                continue
+            canonical_name = str(entity.get("canonical_name") or alias)
             display_name = str(entity.get("display_name") or canonical_name)
-            return QueryTarget(
-                query_type=QUERY_TYPE_SINGLE,
-                canonical_name=canonical_name,
-                display_name=display_name,
-                ticker=entity.get("ticker"),
-                entity_type=entity.get("entity_type") or "ORG",
-                confidence=0.94,
-                candidates=[(canonical_name, display_name)],
+            collected.append(
+                _build_resolution_candidate(
+                    canonical_name=canonical_name,
+                    display_name=display_name,
+                    ticker=entity.get("ticker"),
+                    entity_type=entity.get("entity_type") or "ORG",
+                    confidence=confidence,
+                    match_source="financial_entity_map",
+                    matched_alias=alias,
+                    category="central_banks" if "bank" in display_name.lower() else "macro_concepts",
+                )
             )
 
-    # Tier 4: SQLite entity_mentions for PER/LOC/ORG fallback
+    # Tier 5: SQLite fallback candidates.
     if sqlite_conn is not None:
-        r = _lookup_entity_in_sqlite(sqlite_conn, q_norm)
-    else:
-        r = None
+        sqlite_candidates = _lookup_entity_candidates_in_sqlite(sqlite_conn, q_norm, limit=8)
+        for row in sqlite_candidates:
+            collected.append(
+                _build_resolution_candidate(
+                    canonical_name=str(row["canonical_entity_id"]),
+                    display_name=str(row.get("display_name") or row["canonical_entity_id"]),
+                    ticker=row.get("ticker"),
+                    entity_type=row.get("entity_type"),
+                    confidence=max(0.75, _safe_float(row.get("confidence"), 0.0)),
+                    match_source="sqlite_mentions",
+                    matched_alias=q_norm,
+                    category="entities",
+                )
+            )
 
-    if r:
+    deduped = _dedupe_resolution_candidates(collected)
+    if not deduped:
         return QueryTarget(
-            query_type=QUERY_TYPE_SINGLE,
-            canonical_name=r["canonical_entity_id"],
-            display_name=r.get("display_name") or r["canonical_entity_id"],
-            ticker=r.get("ticker"),
-            entity_type=r.get("entity_type"),
-            confidence=max(0.75, float(r.get("confidence") or 0.0)),
-            candidates=[(r["canonical_entity_id"], r.get("display_name") or r["canonical_entity_id"])],
+            query_type=QUERY_TYPE_GENERAL,
+            canonical_name=None,
+            display_name=None,
+            ticker=None,
+            entity_type=None,
+            confidence=0.0,
+            best_candidate=None,
+            candidates=[],
+            ambiguity_score=0.0,
+            resolution_mode="unresolved",
+            needs_disambiguation=False,
         )
 
-    # Tier 5: no entity resolved
+    best = deduped[0]
+    ambiguity_score = _compute_ambiguity_score(deduped, query)
+    confidence = _clamp01(_safe_float(best.get("confidence"), 0.0) * (1.0 - 0.25 * ambiguity_score))
+
     return QueryTarget(
-        query_type=QUERY_TYPE_GENERAL,
-        canonical_name=None,
-        display_name=None,
-        ticker=None,
-        entity_type=None,
-        confidence=0.0,
+        query_type=QUERY_TYPE_SINGLE,
+        canonical_name=str(best.get("canonical_name") or ""),
+        display_name=str(best.get("display_name") or best.get("canonical_name") or ""),
+        ticker=best.get("ticker"),
+        entity_type=best.get("entity_type"),
+        confidence=confidence,
+        best_candidate=best,
+        candidates=deduped,
+        ambiguity_score=ambiguity_score,
+        resolution_mode=str(best.get("match_source") or "unknown"),
+        needs_disambiguation=bool(ambiguity_score >= RESOLUTION_DISAMBIGUATION_THRESHOLD and len(deduped) > 1),
     )
 
 
@@ -1648,6 +2454,10 @@ def retrieve_entity_chunks(
             a.title,
             a.url,
             a.source,
+            a.source_trust_tier,
+            a.content_class,
+            a.article_quality_score,
+            a.quality_flags_json,
             em.display_name AS entity_display,
             em.confidence AS mention_confidence
         FROM entity_mentions em
@@ -1948,6 +2758,10 @@ def retrieve_cooccurrence_chunks(
             a.title,
             a.url,
             a.source,
+            a.source_trust_tier,
+            a.content_class,
+            a.article_quality_score,
+            a.quality_flags_json,
             em.canonical_entity_id AS neighbor_id,
             em.display_name AS neighbor_display
         FROM entity_mentions em
@@ -2003,7 +2817,11 @@ def retrieve_semantic_chunks(
             c.embedding_json,
             a.title,
             a.url,
-            a.source
+            a.source,
+            a.source_trust_tier,
+            a.content_class,
+            a.article_quality_score,
+            a.quality_flags_json
         FROM chunks c
         JOIN articles a ON a.article_id = c.article_id
         WHERE c.embedding_json IS NOT NULL
@@ -2100,7 +2918,11 @@ def retrieve_summary_chunks(
             c.embedding_json,
             a.title,
             a.url,
-            a.source
+            a.source,
+            a.source_trust_tier,
+            a.content_class,
+            a.article_quality_score,
+            a.quality_flags_json
         FROM chunks c
         JOIN articles a ON a.article_id = c.article_id
         WHERE 1=1
@@ -2222,45 +3044,30 @@ def _published_date_to_ts(published_date) -> int | None:
 
 
 def score_and_rank(
+    *,
+    query: str,
     rows: list[dict],
     query_vec: np.ndarray,
+    target: QueryTarget | None,
+    route_type: str,
     recency_half_life_days: float = RECENCY_HALF_LIFE_DAYS,
-    semantic_weight: float = 0.75,
-    recency_weight: float = 0.25,
 ) -> list[dict]:
-    """
-    Score each chunk: weighted combination of cosine similarity and recency decay.
-    Deduplicates by chunk_uid, keeping highest score.
-    """
-    now_ts = int(datetime.now(timezone.utc).timestamp())
-    half_life_s = recency_half_life_days * 86400.0
-
-    seen: dict[str, dict] = {}
-    for r in rows:
-        uid = r.get("chunk_uid")
-        if not uid:
-            continue
-
-        emb = r.get("embedding")
-        if emb is None:
-            sim = float(r.get("semantic_score") or r.get("knowledge_score") or 0.5)
-        else:
-            sim = cosine_sim(query_vec, np.array(emb, dtype=np.float32))
-
-        ts = _published_date_to_ts(r.get("published_date"))
-        if ts is None:
-            decay = 0.8
-        else:
-            age = max(0, now_ts - ts)
-            decay = float(np.exp(-np.log(2) * age / half_life_s))
-
-        score = semantic_weight * sim + recency_weight * decay
-        r = {**r, "score": score}
-
-        if uid not in seen or score > seen[uid]["score"]:
-            seen[uid] = r
-
-    return sorted(seen.values(), key=lambda x: x["score"], reverse=True)
+    profile = _resolve_route_profile(route_type)
+    allowed_classes = profile.get("allowed_content_classes") or ()
+    filtered = [
+        row
+        for row in rows
+        if _route_allows_content_class(profile, row.get("content_class"))
+    ]
+    scored = _apply_unified_scoring(
+        query=query,
+        rows=filtered,
+        query_vec=query_vec,
+        target=target,
+        route_type=route_type,
+        recency_half_life_days=recency_half_life_days,
+    )
+    return scored[: max(int(profile.get("candidate_cap", len(scored))), 1)]
 
 
 def rank_candidates(
@@ -2268,11 +3075,28 @@ def rank_candidates(
     query: str,
     rows: list[dict],
     query_vec: np.ndarray,
+    target: QueryTarget | None,
+    route_type: str,
     recency_half_life_days: float,
     reranker=None,
 ) -> list[dict]:
-    baseline = score_and_rank(rows, query_vec, recency_half_life_days)
-    return apply_reranker(query, baseline, reranker=reranker)
+    baseline = score_and_rank(
+        query=query,
+        rows=rows,
+        query_vec=query_vec,
+        target=target,
+        route_type=route_type,
+        recency_half_life_days=recency_half_life_days,
+    )
+    reranked = apply_reranker(query, baseline, reranker=reranker)
+    return _apply_unified_scoring(
+        query=query,
+        rows=reranked,
+        query_vec=query_vec,
+        target=target,
+        route_type=route_type,
+        recency_half_life_days=recency_half_life_days,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -2293,11 +3117,12 @@ def retrieve(
     source_filter: str | None = None,
     date_start: str | None = None,
     date_end: str | None = None,
+    route_type: str | None = None,
     reranker=None,
-) -> tuple[list[dict], QueryTarget]:
+) -> tuple[list[dict], QueryTarget, dict[str, Any]]:
     """
     Hybrid retrieval for one sub-query.
-    Returns (ranked_chunks, target).
+    Returns (ranked_chunks, target, retrieval_trace).
     """
     target = resolve_query_target(
         query,
@@ -2307,9 +3132,23 @@ def retrieve(
         sqlite_conn=sqlite_conn,
         alias_to_fin_entity=alias_to_fin_entity,
     )
+    resolved_route = route_type if route_type in ROUTE_TYPES else classify_query_route(
+        query=query,
+        summary_mode=False,
+        causal_intent=False,
+        market_data_intent=False,
+        target=target,
+    )
+    if target.needs_disambiguation:
+        resolved_route = "ambiguous"
+    route_profile = _resolve_route_profile(resolved_route)
+    top_k = max(top_k, int(route_profile["top_k"]))
+    expanded_k = max(expanded_k, int(route_profile["expanded_k"]))
+    recency_half_life_days = float(route_profile["recency_half_life_days"])
     period_keys = _date_range_to_period_keys(date_start, date_end) or None
 
     query_vec = embed_model.encode([query], normalize_embeddings=True)[0]
+    all_rows: list[dict] = []
 
     if target.canonical_name:
         entity_rows = retrieve_entity_chunks(
@@ -2344,6 +3183,8 @@ def retrieve(
             query=query,
             rows=all_rows,
             query_vec=query_vec,
+            target=target,
+            route_type=resolved_route,
             recency_half_life_days=recency_half_life_days,
             reranker=reranker,
         )
@@ -2364,6 +3205,8 @@ def retrieve(
                 query=query,
                 rows=all_rows,
                 query_vec=query_vec,
+                target=target,
+                route_type=resolved_route,
                 recency_half_life_days=recency_half_life_days,
                 reranker=reranker,
             )
@@ -2384,6 +3227,8 @@ def retrieve(
                 query=query,
                 rows=all_rows,
                 query_vec=query_vec,
+                target=target,
+                route_type=resolved_route,
                 recency_half_life_days=recency_half_life_days,
                 reranker=reranker,
             )
@@ -2421,15 +3266,39 @@ def retrieve(
             source_filter=source_filter,
             top_k=expanded_k,
         )
+        all_rows = asset_rows + macro_rows + sem_rows
         ranked = rank_candidates(
             query=query,
-            rows=asset_rows + macro_rows + sem_rows,
+            rows=all_rows,
             query_vec=query_vec,
+            target=target,
+            route_type=resolved_route,
             recency_half_life_days=recency_half_life_days,
             reranker=reranker,
         )
 
-    return ranked[:expanded_k], target
+    for row in ranked:
+        row["route_type"] = resolved_route
+
+    retrieval_trace = {
+        "route_type": resolved_route,
+        "candidate_count": len(all_rows),
+        "ranked_count": len(ranked),
+        "expanded_k": expanded_k,
+        "source_filter": source_filter,
+        "date_start": date_start,
+        "date_end": date_end,
+        "target": {
+            "canonical_name": target.canonical_name,
+            "display_name": target.display_name,
+            "ticker": target.ticker,
+            "ambiguity_score": target.ambiguity_score,
+            "needs_disambiguation": target.needs_disambiguation,
+            "resolution_mode": target.resolution_mode,
+        },
+        "ranked_candidates": ranked,
+    }
+    return ranked[:expanded_k], target, retrieval_trace
 
 
 # ---------------------------------------------------------------------------
@@ -2529,96 +3398,6 @@ def generate_answer(query: str, context: str, gen_client: Any, system_prompt: st
     return cleaned or "I could not generate a grounded answer from the retrieved context."
 
 
-def generate_answer_with_remote_mcp(
-    query: str,
-    context: str,
-    ticker: str,
-    gen_client: Any,
-    system_prompt: str,
-) -> tuple[str | None, dict[str, Any]]:
-    """
-    FIX 3: Remove timeout parameter and relax validation logic.
-    """
-    if not ENABLE_ALPHA_MCP_REMOTE:
-        return None, {"failed": True, "reason": "remote mcp disabled"}
-    if not ALPHA_VANTAGE_API_KEY:
-        return None, {"failed": True, "reason": "alpha vantage api key missing"}
- 
-    mcp_url = build_alpha_mcp_url(ALPHA_VANTAGE_MCP_URL, ALPHA_VANTAGE_API_KEY)
-    mcp_system_prompt = (
-        system_prompt
-        + "\n\nFor this turn, you may use Alpha Vantage MCP tool results as grounded evidence in addition to "
-          "the retrieved news context. Do not use outside knowledge."
-    )
- 
-    toolset_config = {
-        "type": "mcp_toolset",
-        "mcp_server_name": ALPHA_MCP_SERVER_NAME,
-        "default_config": {"enabled": False},
-        "configs": {tool_name: {"enabled": True} for tool_name in ALPHA_MCP_ALLOWED_TOOLS},
-    }
- 
-    mcp_servers = [
-        {
-            "type": "url",
-            "name": ALPHA_MCP_SERVER_NAME,
-            "url": mcp_url,
-        }
-    ]
- 
-    # FIX: More direct prompt that doesn't force specific tool order
-    primary_prompt = (
-        f"Context:\n{context}\n\n"
-        f"Question: {query}\n\n"
-        f"Resolved ticker: {ticker}\n\n"
-        "Use the available Alpha Vantage tools to get current market data for this ticker. "
-        "Then answer the question using both the retrieved news context and the live market data."
-    )
- 
-    def _run_once(prompt: str) -> tuple[str | None, dict[str, Any]]:
-        try:
-            # FIX 3a: Remove timeout parameter - let the SDK handle it
-            out = gen_client.beta.messages.create(
-                model=GEN_MODEL_NAME,
-                max_tokens=GEN_MAX_TOKENS,
-                temperature=0,
-                system=mcp_system_prompt,
-                messages=[{"role": "user", "content": prompt}],
-                betas=[ALPHA_MCP_BETA],
-                mcp_servers=mcp_servers,
-                tools=[toolset_config],
-                # timeout parameter removed
-            )
-        except Exception as exc:
-            return None, {"failed": True, "reason": f"mcp request failed: {exc}"}
- 
-        text = strip_think_tags(anthropic_text(out)).strip()
-        mcp_meta = inspect_mcp_response(out)
- 
-        # FIX 3b: Simplified validation - only fail on actual errors
-        if mcp_meta["has_error"]:
-            return None, {"failed": True, "reason": "mcp tool returned an error", **mcp_meta}
-        if mcp_meta["rate_limited"]:
-            return None, {"failed": True, "reason": "mcp tool appears rate-limited", **mcp_meta}
-        
-        # FIX 3c: Accept response if we got ANY tool execution with results
-        if mcp_meta["has_result_block"] and text:
-            return text, {"failed": False, **mcp_meta}
-        
-        # Only fail if we got nothing useful
-        if not mcp_meta["tool_calls"]:
-            return None, {"failed": True, "reason": "no tools called", **mcp_meta}
-        if not text:
-            return None, {"failed": True, "reason": "empty assistant text after mcp call", **mcp_meta}
-        
-        # Still got something - accept it
-        return text, {"failed": False, **mcp_meta}
- 
-    # FIX 3d: Single attempt instead of retry logic
-    # The retry was trying to force a specific tool pattern that may not be optimal
-    return _run_once(primary_prompt)
-
-
 def run_query_once(
     *,
     query: str,
@@ -2636,6 +3415,8 @@ def run_query_once(
     memory: ConversationMemory,
     skip_generation: bool = False,
 ) -> dict[str, Any]:
+    started_at = time.perf_counter()
+    run_id = str(uuid.uuid4())
     query, was_rewritten = resolve_coreference(query, memory)
     market_data_intent = is_market_data_intent(query)
     causal_intent = is_causal_analysis_intent(query)
@@ -2643,17 +3424,26 @@ def run_query_once(
     forced_summary_start, forced_summary_end = infer_summary_date_range(query)
     source_filter = extract_source_filter(query)
     sub_queries = resolve_temporal_carryover(decompose_query(query, gen_client), memory)
+    route_seed = classify_query_route(
+        query=query,
+        summary_mode=summary_mode,
+        causal_intent=causal_intent,
+        market_data_intent=market_data_intent,
+        target=None,
+    )
 
     all_contexts: list[str] = []
     all_urls: list[str] = []
-    primary_target = None
-    primary_date_start = None
-    primary_date_end = None
-    all_chunks: list[dict] = []
-    summary_raw_candidates: list[dict] = []  # merged pool across sub-queries (summary_mode only)
-    _summary_used_date_ranges: list[tuple[str | None, str | None]] = []  # tracks resolved dates per sub-query
+    all_chunks: list[dict[str, Any]] = []
+    summary_raw_candidates: list[dict[str, Any]] = []
+    retrieval_traces: list[dict[str, Any]] = []
+    observability_candidates: list[dict[str, Any]] = []
+    summary_used_date_ranges: list[tuple[str | None, str | None]] = []
     market_ctx = ""
     logs: list[str] = []
+    primary_target: QueryTarget | None = None
+    primary_date_start: str | None = None
+    primary_date_end: str | None = None
 
     if was_rewritten:
         logs.append(f'  [memory] Coreference resolved -> "{query}"')
@@ -2662,23 +3452,105 @@ def run_query_once(
     if len(sub_queries) > 1:
         logs.append(f"  [decomposed into {len(sub_queries)} sub-queries]")
 
+    def _compact_candidate(candidate: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "chunk_uid": candidate.get("chunk_uid"),
+            "article_id": candidate.get("article_id"),
+            "macro_event_id": candidate.get("macro_event_id"),
+            "retrieval_kind": candidate.get("retrieval_kind"),
+            "source": candidate.get("source"),
+            "content_class": candidate.get("content_class"),
+            "source_trust_tier": candidate.get("source_trust_tier"),
+            "score": candidate.get("final_score", candidate.get("score")),
+            "semantic_score": candidate.get("semantic_score"),
+            "cross_encoder_score": candidate.get("cross_encoder_score"),
+            "keyword_overlap_score": candidate.get("keyword_overlap_score"),
+            "target_match_score": candidate.get("target_match_score"),
+            "source_quality_score": candidate.get("source_quality_score"),
+            "recency_score": candidate.get("recency_score"),
+            "graph_relevance_score": candidate.get("graph_relevance_score"),
+            "event_support_score": candidate.get("event_support_score"),
+            "duplicate_penalty": candidate.get("duplicate_penalty"),
+            "ambiguity_penalty": candidate.get("ambiguity_penalty"),
+        }
+
+    def _empty_result(message: str, route_type: str) -> dict[str, Any]:
+        resolved_target = {
+            "canonical_name": primary_target.canonical_name if primary_target else None,
+            "display_name": primary_target.display_name if primary_target else None,
+            "ticker": primary_target.ticker if primary_target else None,
+            "query_type": primary_target.query_type if primary_target else QUERY_TYPE_GENERAL,
+            "entity_type": primary_target.entity_type if primary_target else None,
+            "best_candidate": primary_target.best_candidate if primary_target else None,
+            "candidates": primary_target.candidates if primary_target else [],
+            "ambiguity_score": primary_target.ambiguity_score if primary_target else 0.0,
+            "resolution_mode": primary_target.resolution_mode if primary_target else "unresolved",
+            "needs_disambiguation": primary_target.needs_disambiguation if primary_target else False,
+        }
+        return {
+            "run_id": run_id,
+            "query": query,
+            "answer": ensure_structured_answer(message, []),
+            "chunks": [],
+            "urls": [],
+            "logs": logs,
+            "citation_map": {},
+            "provenance": "Why this answer: no retrieved evidence.",
+            "target": primary_target,
+            "resolved_target": resolved_target,
+            "resolved_target_json": resolved_target,
+            "route_type": route_type,
+            "retrieval_trace": {
+                "route_type": route_type,
+                "scoring_weights": _resolve_scoring_weights(route_type),
+                "sub_traces": retrieval_traces,
+            },
+            "answer_confidence": 0.0,
+            "decision": "abstain",
+            "answer_meta": {
+                "answer_confidence": 0.0,
+                "decision": "abstain",
+                "signals": {
+                    "relevant_chunks": 0.0,
+                    "source_diversity": 0.0,
+                    "retrieval_margin": 0.0,
+                    "verifier_support": 0.0,
+                    "recency_coverage": 0.0,
+                    "ambiguity_score": resolved_target["ambiguity_score"] or 0.0,
+                    "contradiction_signals": 0.0,
+                },
+            },
+            "selected_macro_events": [],
+            "contradiction_signals": False,
+            "date_start": primary_date_start,
+            "date_end": primary_date_end,
+        }
+
     for sq in sub_queries:
+        sub_query = sq["query"]
         date_start = sq.get("time_start")
         date_end = sq.get("time_end")
         if summary_mode and forced_summary_start and forced_summary_end:
             date_start = forced_summary_start
             date_end = forced_summary_end
         if summary_mode:
-            _summary_used_date_ranges.append((date_start, date_end))
+            summary_used_date_ranges.append((date_start, date_end))
         if date_start or date_end:
             logs.append(f"  [time filter: {date_start} -> {date_end}]")
 
+        chunks: list[dict[str, Any]] = []
+        trace: dict[str, Any] = {
+            "sub_query": sub_query,
+            "date_start": date_start,
+            "date_end": date_end,
+        }
+
         if causal_intent and not market_data_intent:
-            hops = decompose_causal_chain(sq["query"], gen_client)
+            hops = decompose_causal_chain(sub_query, gen_client)
             if hops:
                 logs.append(f"  [causal chain: {' -> '.join(hops)}]")
                 chunks, target = retrieve_causal_chain(
-                    query=sq["query"],
+                    query=sub_query,
                     hops=hops,
                     embed_model=embed_model,
                     reranker=reranker,
@@ -2691,6 +3563,15 @@ def run_query_once(
                     date_start=date_start,
                     date_end=date_end,
                 )
+                trace.update(
+                    {
+                        "route_type": "macro_causal",
+                        "causal_hops": hops,
+                        "candidate_count": len(chunks),
+                        "ranked_count": len(chunks),
+                        "ranked_candidates": chunks,
+                    }
+                )
                 market_ctx = fetch_market_context(
                     hops=hops,
                     date_start=date_start,
@@ -2698,8 +3579,8 @@ def run_query_once(
                 )
             else:
                 logs.append("  [causal chain] decomposition empty, falling back to standard retrieve")
-                chunks, target = retrieve(
-                    query=sq["query"],
+                chunks, target, retrieve_trace = retrieve(
+                    query=sub_query,
                     embed_model=embed_model,
                     reranker=reranker,
                     driver=driver,
@@ -2715,17 +3596,17 @@ def run_query_once(
                     source_filter=source_filter,
                     date_start=date_start,
                     date_end=date_end,
+                    route_type=route_seed,
                 )
+                trace.update(retrieve_trace)
+                trace["sub_query"] = sub_query
         elif summary_mode:
-            # Summary-specific retrieval: broad SQLite recency + semantic pass.
-            # Avoids MacroEvent-heavy Neo4j paths that collapse results onto
-            # a few macro-style chunks instead of broadly covering recent news.
-            _sum_period_keys = _date_range_to_period_keys(date_start, date_end) or None
+            sum_period_keys = _date_range_to_period_keys(date_start, date_end) or None
             chunks = retrieve_summary_chunks(
                 sqlite_conn=sqlite_conn,
                 embed_model=embed_model,
-                query=sq["query"],
-                period_keys=_sum_period_keys,
+                query=sub_query,
+                period_keys=sum_period_keys,
                 date_start=date_start,
                 date_end=date_end,
                 source_filter=source_filter,
@@ -2741,16 +3622,25 @@ def run_query_once(
                 ticker=None,
                 entity_type=None,
                 confidence=0.0,
+                resolution_mode="summary_general",
             )
-            _sum_kinds = sorted({ch.get("retrieval_kind", "?") for ch in chunks})
-            _sum_srcs = sorted({(ch.get("source") or "?").lower() for ch in chunks})
+            trace.update(
+                {
+                    "route_type": "daily_summary",
+                    "candidate_count": len(chunks),
+                    "ranked_count": len(chunks),
+                    "ranked_candidates": chunks,
+                }
+            )
+            sum_kinds = sorted({ch.get("retrieval_kind", "?") for ch in chunks})
+            sum_sources = sorted({(ch.get("source") or "?").lower() for ch in chunks})
             logs.append(
                 f"  [summary-retrieve] sub-query chunks={len(chunks)}, "
-                f"sources={_sum_srcs}, kinds={_sum_kinds}"
+                f"sources={sum_sources}, kinds={sum_kinds}"
             )
         else:
-            chunks, target = retrieve(
-                query=sq["query"],
+            chunks, target, retrieve_trace = retrieve(
+                query=sub_query,
                 embed_model=embed_model,
                 reranker=reranker,
                 driver=driver,
@@ -2764,28 +3654,33 @@ def run_query_once(
                 source_filter=source_filter,
                 date_start=date_start,
                 date_end=date_end,
+                route_type=route_seed,
             )
+            trace.update(retrieve_trace)
+            trace["sub_query"] = sub_query
 
         logs.append(
             f"  [entity: {target.display_name or 'general'} | canonical: {target.canonical_name or '-'} | "
             f"confidence: {target.confidence:.2f} | chunks: {len(chunks)}]"
         )
 
-        if primary_target is None or (target.canonical_name and not primary_target.canonical_name):
+        if primary_target is None:
+            primary_target = target
+            primary_date_start = date_start
+            primary_date_end = date_end
+        elif target.canonical_name and (not primary_target.canonical_name or target.confidence > primary_target.confidence):
             primary_target = target
             primary_date_start = date_start
             primary_date_end = date_end
 
+        retrieval_traces.append(trace)
         if summary_mode:
-            # Collect raw candidates; the source cap, near-dup filter, and
-            # global re-rank are applied once after all sub-queries complete
-            # so they operate on the full merged pool rather than each
-            # sub-query in isolation.
             summary_raw_candidates.extend(chunks)
         else:
             all_chunks.extend(chunks)
+            observability_candidates.extend(trace.get("ranked_candidates") or chunks)
             period_label = f"[{date_start} -> {date_end}] " if (date_start or date_end) else ""
-            ctx = build_context(sq["query"], target, chunks)
+            ctx = build_context(sub_query, target, chunks)
             if market_ctx:
                 ctx = ctx + "\n\n" + market_ctx
             all_contexts.append(period_label + ctx)
@@ -2794,48 +3689,41 @@ def run_query_once(
                 if url and url not in all_urls:
                     all_urls.append(url)
 
-    # -------------------------------------------------------------------------
-    # Summary path: global merge → rank → dedup → filter → context assembly
-    # All four steps operate on the combined candidate pool so the source cap
-    # and near-dup removal span across sub-query boundaries.
-    # -------------------------------------------------------------------------
+    if primary_target is None:
+        primary_target = QueryTarget(
+            query_type=QUERY_TYPE_GENERAL,
+            canonical_name=None,
+            display_name="general news",
+            ticker=None,
+            entity_type=None,
+            confidence=0.0,
+        )
+
     if summary_mode:
         if not summary_raw_candidates:
-            return {
-                "query": query,
-                "answer": "No relevant chunks found.",
-                "chunks": [],
-                "urls": [],
-                "logs": logs,
-                "citation_map": {},
-                "provenance": "Why this answer: no retrieved evidence.",
-                "target": primary_target,
-                "date_start": primary_date_start,
-                "date_end": primary_date_end,
-            }
+            return _empty_result("No relevant chunks found.", "daily_summary")
 
         logs.append(
             f"  [summary] merged candidate pool: {len(summary_raw_candidates)} chunks "
             f"from {len(sub_queries)} sub-query/ies"
         )
 
-        # 1. Global re-rank across the full merged candidate pool
         query_vec = embed_model.encode([query], normalize_embeddings=True)[0]
         globally_ranked = rank_candidates(
             query=query,
             rows=summary_raw_candidates,
             query_vec=query_vec,
+            target=primary_target,
+            route_type="daily_summary",
             recency_half_life_days=SUMMARY_RECENCY_HALF_LIFE_DAYS,
             reranker=reranker,
         )
+        observability_candidates.extend(globally_ranked)
 
-        # 2. Article-level dedup
         deduped = dedupe_chunks_for_summary(globally_ranked, max_per_article=2)
-
-        # 3. Source cap + near-duplicate removal
         all_chunks = _filter_summary_chunks(deduped)
+        all_chunks = _cluster_summary_themes(all_chunks)
 
-        # 4. Min-unique-sources guard
         unique_summary_sources = {
             (ch.get("source") or "unknown").strip().lower()
             for ch in all_chunks
@@ -2851,59 +3739,64 @@ def run_query_once(
                 "Try a broader date range or check that more sources have been ingested."
             )
             logs.append(
-                f"  [summary] skipped generation – only {len(unique_summary_sources)} "
+                f"  [summary] skipped generation - only {len(unique_summary_sources)} "
                 "unique source(s) found"
             )
-            return {
-                "query": query,
-                "answer": msg,
-                "chunks": all_chunks,
-                "urls": [ch.get("url") for ch in all_chunks if ch.get("url")],
-                "logs": logs,
-                "citation_map": build_citation_map(all_chunks),
-                "provenance": format_provenance(all_chunks),
-                "target": primary_target,
-                "date_start": primary_date_start,
-                "date_end": primary_date_end,
-            }
+            return _empty_result(msg, "daily_summary")
 
-        # 5. Build urls and a single merged context for generation.
-        #    Prepend a DATE RESOLUTION block so the LLM knows exactly which
-        #    calendar dates "today"/"yesterday" map to in this query, preventing
-        #    it from guessing those labels from training-data priors.
         for ch in all_chunks:
             url = ch.get("url")
             if url and url not in all_urls:
                 all_urls.append(url)
-        ctx = build_context(query, primary_target, all_chunks)
+
+        citation_map = build_citation_map(all_chunks)
+        theme_groups: dict[tuple[str, str], list[dict[str, Any]]] = defaultdict(list)
+        for chunk in all_chunks:
+            key = (
+                str(chunk.get("theme_id") or "general"),
+                str(chunk.get("theme_label") or "General"),
+            )
+            theme_groups[key].append(chunk)
+
+        theme_lines = ["SUMMARY THEMES:"]
+        ordered_theme_groups = sorted(theme_groups.items(), key=lambda item: len(item[1]), reverse=True)
+        for idx, ((theme_id, theme_label), theme_chunks) in enumerate(ordered_theme_groups, start=1):
+            avg_conf = sum(_safe_float(ch.get("theme_confidence"), 0.0) for ch in theme_chunks) / max(len(theme_chunks), 1)
+            theme_lines.append(f"Theme {idx}: {theme_label} ({theme_id}) | confidence={avg_conf:.2f} | chunks={len(theme_chunks)}")
+            for chunk in theme_chunks[:3]:
+                chunk_uid = chunk.get("chunk_uid")
+                citation = citation_map.get(chunk_uid, "?")
+                source = (chunk.get("source") or "unknown").strip()
+                title = (chunk.get("title") or "untitled").strip()
+                theme_lines.append(f"  [{citation}] {source} | {title}")
+
         date_resolution_block = _build_summary_date_resolution_block(
             query,
             forced_summary_start,
             forced_summary_end,
-            _summary_used_date_ranges,
+            summary_used_date_ranges,
         )
-        ctx = date_resolution_block + "\n\n" + ctx
+        theme_context = "\n".join(theme_lines)
+        ctx = date_resolution_block + "\n\n" + theme_context + "\n\n" + build_context(query, primary_target, all_chunks)
         if market_ctx:
             ctx = ctx + "\n\n" + market_ctx
         all_contexts = [ctx]
 
-    # Non-summary path: all_contexts was populated per sub-query inside the loop.
     if not all_contexts:
-        return {
-            "query": query,
-            "answer": "No relevant chunks found.",
-            "chunks": [],
-            "urls": [],
-            "logs": logs,
-            "citation_map": {},
-            "provenance": "Why this answer: no retrieved evidence.",
-            "target": primary_target,
-            "date_start": primary_date_start,
-            "date_end": primary_date_end,
-        }
+        return _empty_result("No relevant chunks found.", route_seed)
+
+    final_route = classify_query_route(
+        query=query,
+        summary_mode=summary_mode,
+        causal_intent=causal_intent,
+        market_data_intent=market_data_intent,
+        target=primary_target,
+    )
+    if primary_target.needs_disambiguation:
+        final_route = "ambiguous"
+    route_profile = _resolve_route_profile(final_route)
 
     active_base_system_prompt = base_daily_summary_prompt if summary_mode else base_system_prompt
-
     system_prompt = build_system_prompt(active_base_system_prompt, memory)
     causal_system_prompt = (
         build_system_prompt(base_causal_system_prompt, memory)
@@ -2914,39 +3807,111 @@ def run_query_once(
 
     final = ""
     market_data_note: str | None = None
-    should_try_mcp = (
-        market_data_intent
-        and ENABLE_ALPHA_MCP_REMOTE
-        and bool(ALPHA_VANTAGE_API_KEY)
-        and primary_target is not None
-        and bool(primary_target.ticker)
-    )
 
     if skip_generation or DEBUG_SKIP_GENERATION:
         final = "Generation skipped because DEBUG_SKIP_GENERATION is enabled."
-    elif should_try_mcp:
-        mcp_answer, mcp_meta = generate_answer_with_remote_mcp(
-            query=query,
-            context=merged_context,
-            ticker=primary_target.ticker or "",
-            gen_client=gen_client,
-            system_prompt=system_prompt,
-        )
-        if mcp_answer is not None:
-            final = mcp_answer
-        else:
-            active_prompt = causal_system_prompt if causal_system_prompt else system_prompt
-            final = generate_answer(query, merged_context, gen_client, active_prompt)
-            market_data_note = ALPHA_MCP_FALLBACK_NOTE
     else:
         active_prompt = causal_system_prompt if causal_system_prompt else system_prompt
         final = generate_answer(query, merged_context, gen_client, active_prompt)
 
     if market_data_note:
         final = f"{final}\n\nNote: {market_data_note}"
+
+    answer_confidence, confidence_signals = _compute_answer_confidence(
+        all_chunks,
+        primary_target,
+        decision_hint="ambiguous" if final_route == "ambiguous" else None,
+    )
+    decision = _decide_answer_mode(answer_confidence)
+
+    if decision == "abstain" and not (skip_generation or DEBUG_SKIP_GENERATION):
+        final = (
+            "Answer: I cannot answer this confidently from the retrieved evidence.\n"
+            "Evidence: Retrieved support is limited, ambiguous, contradictory, or too weak for a reliable conclusion.\n"
+            "Theory: The query likely needs tighter target disambiguation and/or stronger corroborated sources."
+        )
     final = ensure_structured_answer(final, all_chunks)
 
+    resolved_target = {
+        "canonical_name": primary_target.canonical_name,
+        "display_name": primary_target.display_name,
+        "ticker": primary_target.ticker,
+        "query_type": primary_target.query_type,
+        "entity_type": primary_target.entity_type,
+        "best_candidate": primary_target.best_candidate,
+        "candidates": primary_target.candidates,
+        "ambiguity_score": primary_target.ambiguity_score,
+        "resolution_mode": primary_target.resolution_mode,
+        "needs_disambiguation": primary_target.needs_disambiguation,
+    }
+
+    selected_macro_events: list[dict[str, Any]] = []
+    seen_macro_ids: set[str] = set()
+    for chunk in all_chunks:
+        macro_event_id = chunk.get("macro_event_id")
+        if not macro_event_id or macro_event_id in seen_macro_ids:
+            continue
+        seen_macro_ids.add(macro_event_id)
+        selected_macro_events.append(
+            {
+                "macro_event_id": macro_event_id,
+                "verification_status": chunk.get("verification_status") or "unknown",
+                "support_score": chunk.get("support_score"),
+                "confidence_calibrated": chunk.get("confidence_calibrated"),
+            }
+        )
+
+    sub_trace_payloads: list[dict[str, Any]] = []
+    for trace in retrieval_traces:
+        ranked_candidates = trace.get("ranked_candidates") or []
+        sub_trace_payloads.append(
+            {
+                "sub_query": trace.get("sub_query"),
+                "route_type": trace.get("route_type"),
+                "candidate_count": trace.get("candidate_count"),
+                "ranked_count": trace.get("ranked_count"),
+                "date_start": trace.get("date_start"),
+                "date_end": trace.get("date_end"),
+                "top_candidates": [_compact_candidate(candidate) for candidate in ranked_candidates[:10]],
+            }
+        )
+    retrieval_trace_payload = {
+        "route_type": final_route,
+        "route_profile": route_profile,
+        "scoring_weights": _resolve_scoring_weights(final_route),
+        "sub_trace_count": len(sub_trace_payloads),
+        "sub_traces": sub_trace_payloads,
+    }
+
+    deduped_obs_candidates: list[dict[str, Any]] = []
+    seen_obs_keys: set[str] = set()
+    for candidate in observability_candidates or all_chunks:
+        key = str(candidate.get("chunk_uid") or candidate.get("macro_event_id") or candidate.get("article_id") or uuid.uuid4())
+        if key in seen_obs_keys:
+            continue
+        seen_obs_keys.add(key)
+        deduped_obs_candidates.append(candidate)
+
+    latency_ms = (time.perf_counter() - started_at) * 1000.0
+    try:
+        _log_observability(
+            conn=sqlite_conn,
+            run_id=run_id,
+            query=query,
+            route_type=final_route,
+            target=primary_target,
+            candidates=deduped_obs_candidates,
+            selected_chunks=all_chunks,
+            answer_confidence=answer_confidence,
+            decision=decision,
+            latency_ms=latency_ms,
+            retrieval_trace=retrieval_trace_payload,
+        )
+    except Exception as exc:
+        logs.append(f"  [observability] logging skipped: {exc}")
+
     return {
+        "run_id": run_id,
         "query": query,
         "answer": final,
         "chunks": all_chunks,
@@ -2955,6 +3920,21 @@ def run_query_once(
         "citation_map": build_citation_map(all_chunks),
         "provenance": format_provenance(all_chunks),
         "target": primary_target,
+        "resolved_target": resolved_target,
+        "resolved_target_json": resolved_target,
+        "route_type": final_route,
+        "retrieval_trace": retrieval_trace_payload,
+        "answer_confidence": answer_confidence,
+        "decision": decision,
+        "answer_meta": {
+            "answer_confidence": answer_confidence,
+            "decision": decision,
+            "route_type": final_route,
+            "signals": confidence_signals,
+            "contradiction_signals": bool(confidence_signals.get("contradiction_signals")),
+        },
+        "selected_macro_events": selected_macro_events,
+        "contradiction_signals": bool(confidence_signals.get("contradiction_signals")),
         "date_start": primary_date_start,
         "date_end": primary_date_end,
     }
@@ -3040,8 +4020,9 @@ def main():
 
         elapsed = time.perf_counter() - t0
         print(f"\nAssistant: {result['answer']}")
-        print()
-        print(result["provenance"])
+        if SHOW_PROVENANCE:
+            print()
+            print(result["provenance"])
         print(f"  [{elapsed:.1f}s]\n")
 
         # ── Hook 5: Record turn to memory ─────────────────────────────────────
