@@ -12,3 +12,4 @@ test_simple_scraper_v2.py
 create_sql_db.py
 my_database.db
 test*.py
+my_database_snapshot.db
