@@ -26,6 +26,7 @@ import re
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from typing import Any
+from urllib.parse import urlparse
 
 try:
     import aiohttp
@@ -778,6 +779,219 @@ def _content_hash(text: str) -> str:
     return hashlib.sha256(normalised.encode()).hexdigest()[:16]
 
 
+_TRUST_TIER_1_DOMAINS = (
+    "federalreserve.gov",
+    "bls.gov",
+    "treasury.gov",
+    "imf.org",
+    "worldbank.org",
+    "cnbc.com",
+    "bbc.com",
+    "reuters.com",
+)
+
+_TRUST_TIER_2_DOMAINS = (
+    "nasdaq.com",
+    "cbsnews.com",
+    "oilprice.com",
+    "marketwatch.com",
+)
+
+_BLOCKED_SOURCE_DOMAINS = (
+    "youtube.com",
+    "facebook.com",
+    "instagram.com",
+    "tiktok.com",
+    "x.com",
+    "twitter.com",
+)
+
+_OFFICIAL_SOURCE_HINTS = (
+    "federal reserve",
+    "us treasury",
+    "bureau of labor statistics",
+    "bls",
+)
+
+
+def _host_from_url(url: str) -> str:
+    host = urlparse(url or "").netloc.lower().strip()
+    if host.startswith("www."):
+        host = host[4:]
+    return host
+
+
+def _domain_matches(host: str, domains: tuple[str, ...]) -> bool:
+    return any(host == dom or host.endswith(f".{dom}") for dom in domains)
+
+
+def _classify_source_trust_tier(source_name: str | None, url: str) -> str:
+    host = _host_from_url(url)
+    source_lower = (source_name or "").strip().lower()
+
+    if _domain_matches(host, _BLOCKED_SOURCE_DOMAINS):
+        return "blocked"
+
+    if (
+        _domain_matches(host, _TRUST_TIER_1_DOMAINS)
+        or host.endswith(".gov")
+        or any(hint in source_lower for hint in _OFFICIAL_SOURCE_HINTS)
+    ):
+        return "tier_1"
+
+    if _domain_matches(host, _TRUST_TIER_2_DOMAINS):
+        return "tier_2"
+
+    return "tier_3"
+
+
+def _classify_content_class(
+    *,
+    title: str | None,
+    text: str,
+    url: str,
+    source_name: str | None,
+) -> tuple[str, list[str]]:
+    """Deterministic, inspectable content classification."""
+    clean_text = " ".join((text or "").split())
+    lower_text = clean_text.lower()
+    lower_title = (title or "").strip().lower()
+    lower_url = (url or "").strip().lower()
+    source_lower = (source_name or "").strip().lower()
+    word_count = len(lower_text.split())
+    flags: list[str] = []
+
+    if word_count < 25:
+        flags.append("very_short_text")
+        return "junk", flags
+
+    video_markers = ("video", "/video/", "/videos/", "watch:")
+    if any(marker in lower_url for marker in video_markers) or (
+        "video" in lower_title and word_count < 220
+    ):
+        flags.append("video_like_page")
+        return "video_stub", flags
+
+    if any(marker in lower_url for marker in ("/quote/", "/quotes/", "quote.aspx")):
+        flags.append("quote_url_pattern")
+        return "quote_page", flags
+
+    if any(marker in lower_url for marker in ("/symbol/", "/stocks/", "/stock/", "ticker=", "symbol=")):
+        flags.append("ticker_url_pattern")
+        return "ticker_page", flags
+
+    nav_markers = ("/search", "/topic/", "/topics/", "/tag/", "/categories/", "/section/")
+    if _is_boilerplate_article(clean_text, lower_url) or any(marker in lower_url for marker in nav_markers):
+        flags.append("navigation_or_boilerplate")
+        return "navigation_page", flags
+
+    official_markers = (
+        "for immediate release",
+        "press release",
+        "statement by",
+        "minutes of the federal open market committee",
+        "news release",
+    )
+    if (
+        _host_from_url(lower_url).endswith(".gov")
+        or "federal reserve" in source_lower
+        or "treasury" in source_lower
+        or any(marker in lower_text[:1200] for marker in official_markers)
+    ):
+        flags.append("official_source_or_release_language")
+        return "official_release", flags
+
+    evergreen_markers = (
+        "what is ",
+        "explainer",
+        "how to ",
+        "guide to ",
+        "why it matters",
+    )
+    if any(marker in lower_title for marker in evergreen_markers):
+        flags.append("evergreen_title_pattern")
+        return "evergreen_explainer", flags
+
+    analysis_markers = ("analysis", "opinion", "column", "outlook", "forecast")
+    if any(marker in lower_title for marker in analysis_markers):
+        flags.append("analysis_title_pattern")
+        return "analysis", flags
+
+    return "news_report", flags
+
+
+def _score_article_quality(
+    *,
+    title: str | None,
+    text: str,
+    published: str | None,
+    url: str,
+    source_tier: str,
+    content_class: str,
+) -> tuple[float, list[str]]:
+    """
+    Deterministic quality scoring in [0, 100].
+    Rules are intentionally simple so rows remain easy to audit.
+    """
+    words = len((text or "").split())
+    flags: list[str] = []
+    score = 50.0
+
+    if words < MIN_ARTICLE_WORDS:
+        score -= 20.0
+        flags.append("short_article")
+    else:
+        score += 12.0
+    if words >= 350:
+        score += 8.0
+    if words >= 800:
+        score += 5.0
+
+    if not (title or "").strip():
+        score -= 8.0
+        flags.append("missing_title")
+    else:
+        score += 4.0
+
+    if not (published or "").strip():
+        score -= 5.0
+        flags.append("missing_published_at")
+    else:
+        score += 3.0
+
+    tier_delta = {
+        "tier_1": 15.0,
+        "tier_2": 8.0,
+        "tier_3": 0.0,
+        "blocked": -40.0,
+    }.get(source_tier, 0.0)
+    score += tier_delta
+    if source_tier == "blocked":
+        flags.append("blocked_source")
+
+    class_delta = {
+        "news_report": 8.0,
+        "analysis": 6.0,
+        "official_release": 8.0,
+        "evergreen_explainer": 2.0,
+        "ticker_page": -15.0,
+        "navigation_page": -35.0,
+        "video_stub": -25.0,
+        "quote_page": -18.0,
+        "junk": -40.0,
+    }.get(content_class, 0.0)
+    score += class_delta
+    if content_class in {"ticker_page", "navigation_page", "video_stub", "quote_page", "junk"}:
+        flags.append(f"low_signal_class:{content_class}")
+
+    if _is_boilerplate_article(text, url):
+        score -= 15.0
+        flags.append("boilerplate_detected")
+
+    score = max(0.0, min(100.0, score))
+    return round(score, 2), sorted(set(flags))
+
+
 def _is_boilerplate_article(text: str, url: str = "") -> bool:
     """
     Heuristic filter for navigation-heavy pages (menus, video index pages).
@@ -818,21 +1032,51 @@ def _is_boilerplate_article(text: str, url: str = "") -> bool:
 
 
 def _save_to_sqlite(articles: list[dict], scraped_at_utc: str) -> None:
-    """Persist ok articles to SQLite, silently skipping duplicates."""
-    from create_sql_db import create_database, connect_sqlite
+    """Persist ok articles to SQLite and keep raw rows for audit."""
+    from create_sql_db import create_database, connect_sqlite, ensure_migrations
     create_database(SQLITE_DB)
+    ensure_migrations(SQLITE_DB)
     conn = connect_sqlite(SQLITE_DB)
-    inserted = skipped = skipped_boilerplate = 0
+    existing_ids = {
+        row[0]
+        for row in conn.execute("SELECT article_id FROM articles").fetchall()
+    }
+    inserted = updated = skipped = 0
     for art in articles:
         if art.get("status") != "ok" or not art.get("text"):
             continue
-        if _is_boilerplate_article(art["text"], art.get("url", "")):
-            skipped_boilerplate += 1
-            continue
+
+        url = art.get("url", "")
         aid = _article_id(art.get("url", ""), art.get("published"))
+        content_class, class_flags = _classify_content_class(
+            title=art.get("title"),
+            text=art["text"],
+            url=url,
+            source_name=art.get("source"),
+        )
+        source_trust_tier = _classify_source_trust_tier(art.get("source"), url)
+        article_quality_score, score_flags = _score_article_quality(
+            title=art.get("title"),
+            text=art["text"],
+            published=art.get("published"),
+            url=url,
+            source_tier=source_trust_tier,
+            content_class=content_class,
+        )
+        quality_flags = sorted(set(class_flags + score_flags))
+        quality_flags_json = json.dumps(
+            {
+                "flags": quality_flags,
+                "word_count": len(art["text"].split()),
+                "source_provider": art.get("source_provider"),
+            },
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+
         row = (
             aid,
-            art.get("url", ""),
+            url,
             art.get("title"),
             art.get("source"),
             art.get("source_rss"),
@@ -841,23 +1085,49 @@ def _save_to_sqlite(articles: list[dict], scraped_at_utc: str) -> None:
             _content_hash(art["text"]),
             art.get("status"),
             art["text"],
+            source_trust_tier,
+            content_class,
+            article_quality_score,
+            quality_flags_json,
         )
-        cur = conn.execute(
-            "INSERT OR IGNORE INTO articles "
-            "(article_id,url,title,source,source_rss,published_at,"
-            "scraped_at_utc,content_hash,status,raw_text) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?)",
-            row,
-        )
-        if cur.rowcount:
-            inserted += 1
+        if aid in existing_ids:
+            conn.execute(
+                "UPDATE articles SET "
+                "source_trust_tier = ?, "
+                "content_class = ?, "
+                "article_quality_score = ?, "
+                "quality_flags_json = ?, "
+                "processing_state = CASE "
+                "  WHEN processing_state IS NULL OR processing_state = 'ingested' THEN 'classified' "
+                "  ELSE processing_state "
+                "END "
+                "WHERE article_id = ?",
+                (
+                    source_trust_tier,
+                    content_class,
+                    article_quality_score,
+                    quality_flags_json,
+                    aid,
+                ),
+            )
+            updated += 1
         else:
-            skipped += 1
+            conn.execute(
+                "INSERT INTO articles "
+                "(article_id,url,title,source,source_rss,published_at,"
+                "scraped_at_utc,content_hash,status,raw_text,"
+                "source_trust_tier,content_class,article_quality_score,quality_flags_json,processing_state) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                row + ("classified",),
+            )
+            existing_ids.add(aid)
+            inserted += 1
     conn.commit()
     conn.close()
-    print(f"  SQLite ({SQLITE_DB}): {inserted} new articles saved, {skipped} duplicates skipped")
-    if skipped_boilerplate:
-        print(f"  SQLite ({SQLITE_DB}): {skipped_boilerplate} boilerplate/nav-heavy articles skipped")
+    print(
+        f"  SQLite ({SQLITE_DB}): {inserted} new articles saved, "
+        f"{updated} existing articles refreshed, {skipped} skipped"
+    )
 
 
 # ---------------------------------------------------------------------------
