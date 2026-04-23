@@ -36,6 +36,7 @@ import hashlib
 import json
 import os
 import re
+import sqlite3
 import uuid
 import csv
 from datetime import datetime, timezone
@@ -57,14 +58,12 @@ except ImportError:
     fuzz = None
 
 from graph_schema import (
-    NEO4J_URI, NEO4J_USER, NEO4J_PASSWORD,
+    NEO4J_URI,
+    NEO4J_PASSWORD,
+    NEO4J_USER,
     PERIOD_GRANULARITY,
-    period_key_for, knowledge_node_uid,
-    ensure_schema, wipe_tgrag_graph,
-    UPSERT_PERIOD, UPSERT_ARTICLE, UPSERT_CHUNK, UPSERT_CHUNK_EMBEDDING,
-    UPSERT_KNOWLEDGE_NODE, UPSERT_KNOWLEDGE_NODE_EMBEDDING,
-    UPSERT_KNOWLEDGE, UPSERT_KNOWLEDGE_EMBEDDING,
-    UPSERT_CHUNK_TO_KN_EDGE, UPSERT_RELATION, LINK_SAME_ENTITY,
+    knowledge_node_uid,
+    period_key_for,
 )
 
 load_dotenv()
@@ -82,6 +81,7 @@ CHUNK_OVERLAP_TOKENS = int(os.getenv("CHUNK_OVERLAP_TOKENS", "50"))
 # Embedding model - must match PERIOD_GRANULARITY vector index dim
 EMBED_MODEL_NAME = os.getenv("EMBED_MODEL_NAME", "dunzhang/stella_en_1.5B_v5")
 EMBED_BATCH_SIZE = int(os.getenv("EMBED_BATCH_SIZE", "32"))
+SQLITE_EMBED_BACKFILL_BATCH_ROWS = int(os.getenv("SQLITE_EMBED_BACKFILL_BATCH_ROWS", "256"))
 
 # NER / extraction model
 NER_MODEL_NAME = os.getenv("NER_MODEL_NAME", "dbmdz/bert-large-cased-finetuned-conll03-english")
@@ -100,6 +100,9 @@ MINHASH_SHINGLE_SIZE = int(os.getenv("MINHASH_SHINGLE_SIZE", "5"))
 
 # Neo4j write batch size
 NEO4J_BATCH_SIZE = int(os.getenv("NEO4J_BATCH_SIZE", "200"))
+
+# SQLite store
+SQLITE_DB = os.getenv("SQLITE_DB", "my_database.db")
 
 
 # Helpers
@@ -169,6 +172,48 @@ def load_articles(json_path: Path = ARTICLES_JSON) -> list[dict]:
     return payload.get("articles", [])
 
 
+def load_articles_from_sqlite(db_path: str = SQLITE_DB) -> list[dict]:
+    """
+    Load all articles from SQLite and return them in the same shape
+    that filter_articles() expects (matching the JSON scraper output).
+    """
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    rows = conn.execute(
+        "SELECT article_id, url, title, source, source_rss, "
+        "published_at, scraped_at_utc, content_hash, status, raw_text "
+        "FROM articles"
+    ).fetchall()
+    conn.close()
+    return [
+        {
+            "article_id":    r["article_id"],
+            "url":           r["url"],
+            "title":         r["title"],
+            "source":        r["source"],
+            "source_rss":    r["source_rss"],
+            "published":     r["published_at"],
+            "scraped_at_utc": r["scraped_at_utc"],
+            "content_hash":  r["content_hash"],
+            "status":        r["status"] or "ok",
+            "text":          r["raw_text"],
+        }
+        for r in rows
+    ]
+
+
+def get_chunked_article_ids_sqlite(db_path: str = SQLITE_DB) -> set[str]:
+    """
+    Return the set of article_ids that already have chunks in SQLite.
+    Used in run_sqlite_pass() to skip already-processed articles without
+    touching Neo4j.
+    """
+    conn = sqlite3.connect(db_path)
+    rows = conn.execute("SELECT DISTINCT article_id FROM chunks").fetchall()
+    conn.close()
+    return {r[0] for r in rows}
+
+
 def filter_articles(
     articles: list[dict],
     skip_ids: set[str],
@@ -209,7 +254,10 @@ def filter_articles(
         if published_dt is None:
             published_dt = datetime.now(timezone.utc)
 
-        article_id = _article_id(art.get("url", ""), published_dt)
+        # Trust the article_id already stored in SQLite (authoritative source).
+        # Only recompute as a fallback for JSON-only paths that lack a stored ID.
+        existing_id = art.get("article_id")
+        article_id = existing_id if existing_id else _article_id(art.get("url", ""), published_dt)
 
         if article_id in skip_ids:
             continue
@@ -648,6 +696,10 @@ _MACRO_REGIONS: frozenset[str] = frozenset({
 # Filters out single-word names that are rarely prominent figures.
 _MIN_PER_TOKENS = 2
 
+# Minimum number of distinct chunks a PER entity must appear in to be kept.
+# One-off people mentioned in only a single chunk are almost always noise.
+MIN_PER_CHUNK_COUNT = int(os.getenv("MIN_PER_CHUNK_COUNT", "2"))
+
 
 def _is_country(canonical: str) -> bool:
     return canonical in _COUNTRIES
@@ -662,6 +714,35 @@ def _is_prominent_person(canonical: str) -> bool:
     that the NER model mis-tagged.
     """
     return len(canonical.split()) >= _MIN_PER_TOKENS
+
+
+def _drop_per_singletons(
+    mentions: list[dict],
+    min_chunk_count: int = MIN_PER_CHUNK_COUNT,
+) -> list[dict]:
+    """
+    Drop PER entities that appear in fewer than min_chunk_count distinct chunks.
+    Non-PER entities (ORG, LOC, MISC) are always kept.
+    Each mention dict is already deduped per (chunk_uid, canonical_name) by
+    extract_entities_from_chunks, so counting occurrences = counting chunks.
+    """
+    from collections import Counter
+    per_counts: Counter = Counter(
+        m["canonical_name"]
+        for m in mentions
+        if m.get("entity_type") == "PER"
+    )
+    dropped = sum(1 for v in per_counts.values() if v < min_chunk_count)
+    if dropped:
+        print(
+            f"[entity_filter] dropped {dropped} PER entities appearing in "
+            f"< {min_chunk_count} chunk(s)"
+        )
+    return [
+        m for m in mentions
+        if m.get("entity_type") != "PER"
+        or per_counts[m["canonical_name"]] >= min_chunk_count
+    ]
 
 
 def extract_entities_from_chunks(
@@ -989,220 +1070,304 @@ def populate_neo4j(
     reset: bool = False,
     embedding_dim: int = 768,
 ) -> None:
-    driver = GraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASSWORD))
-    driver.verify_connectivity()
+    raise RuntimeError(
+        "populate_neo4j() targets the retired KnowledgeNode/Knowledge schema. "
+        "Use neo4j_sync.py to rebuild the lean MacroEvent/Entity/Asset graph."
+    )
 
-    with driver.session() as session:
-        if reset:
-            print("[neo4j] Wiping existing graph ...")
-            wipe_tgrag_graph(session)
 
-        ensure_schema(session, embedding_dim=embedding_dim)
+# ---------------------------------------------------------------------------
+# Integrity checks
+# ---------------------------------------------------------------------------
 
-        # Periods 
-        period_keys = sorted({a["period_key"] for a in articles})
-        print(f"[neo4j] Upserting {len(period_keys)} Period nodes ...")
-        for pk in period_keys:
-            session.run(UPSERT_PERIOD, {
-                "key":         pk,
-                "granularity": PERIOD_GRANULARITY,
-                "label":       pk,
-            })
+def run_integrity_check(db_path: str = SQLITE_DB) -> None:
+    """
+    Lightweight post-write consistency checks. Raises RuntimeError on failure.
 
-        # Articles 
-        print(f"[neo4j] Upserting {len(articles)} Article nodes ...")
-        for art in articles:
-            session.run(UPSERT_ARTICLE, {
-                "article_id":    art["article_id"],
-                "url":           art.get("url", ""),
-                "title":         art.get("title", ""),
-                "source":        art.get("source", ""),
-                "published_date": art["published_dt"].strftime("%Y-%m-%d"),
-                "scraped_at":    datetime.now(timezone.utc).isoformat(),
-                "period_key":    art["period_key"],
-                "content_hash":  art["content_hash"],
-            })
+    Checks:
+    - PRAGMA foreign_key_check  (any FK violation → immediate failure)
+    - orphan chunks             (chunks.article_id not in articles)
+    - orphan entity_mentions    (mentions referencing missing chunk or article)
+    """
+    from create_sql_db import connect_sqlite
+    conn = connect_sqlite(db_path)
+    try:
+        # Foreign key violations across all tables
+        fk_errors = conn.execute("PRAGMA foreign_key_check").fetchall()
+        if fk_errors:
+            detail = "; ".join(
+                f"table={r[0]} rowid={r[1]} parent={r[2]}" for r in fk_errors[:5]
+            )
+            raise RuntimeError(
+                f"[integrity] PRAGMA foreign_key_check found {len(fk_errors)} "
+                f"violation(s): {detail}"
+            )
 
-        # Chunks 
-        print(f"[neo4j] Upserting {len(chunks)} Chunk nodes ...")
-        for batch in _batched(chunks, NEO4J_BATCH_SIZE):
-            for c in batch:
-                session.run(UPSERT_CHUNK, {
-                    "chunk_uid":      c["chunk_uid"],
-                    "text":           c["text"],
-                    "chunk_index":    c["chunk_index"],
-                    "article_id":     c["article_id"],
-                    "published_date": c["published_date"],
-                    "period_key":     c["period_key"],
-                    "token_count":    c["token_count"],
-                })
+        # Orphan chunks: article_id not in articles
+        orphan_chunks = conn.execute(
+            """
+            SELECT COUNT(*) FROM chunks c
+            LEFT JOIN articles a ON a.article_id = c.article_id
+            WHERE a.article_id IS NULL
+            """
+        ).fetchone()[0]
+        if orphan_chunks:
+            raise RuntimeError(
+                f"[integrity] {orphan_chunks} chunk row(s) reference a missing articles.article_id"
+            )
 
-        print(f"[neo4j] Writing Chunk embeddings ...")
-        for batch in _batched(chunks, NEO4J_BATCH_SIZE):
-            for c in batch:
-                if c.get("embedding"):
-                    session.run(UPSERT_CHUNK_EMBEDDING, {
-                        "chunk_uid": c["chunk_uid"],
-                        "embedding": c["embedding"],
-                    })
+        # Orphan entity_mentions: chunk_id not in chunks
+        orphan_mentions = conn.execute(
+            """
+            SELECT COUNT(*) FROM entity_mentions em
+            LEFT JOIN chunks c ON c.chunk_id = em.chunk_id
+            WHERE c.chunk_id IS NULL
+            """
+        ).fetchone()[0]
+        if orphan_mentions:
+            raise RuntimeError(
+                f"[integrity] {orphan_mentions} entity_mention row(s) reference a missing chunks.chunk_id"
+            )
 
-        # KnowledgeNodes 
-        kn_list = list(knowledge_nodes.values())
-        print(f"[neo4j] Upserting {len(kn_list)} KnowledgeNode nodes ...")
-        for batch in _batched(kn_list, NEO4J_BATCH_SIZE):
-            for kn in batch:
-                session.run(UPSERT_KNOWLEDGE_NODE, {
-                    "kn_uid":         kn["kn_uid"],
-                    "canonical_name": kn["canonical_name"],
-                    "display_name":   kn.get("display_name", kn["canonical_name"]),
-                    "entity_type":    kn["entity_type"],
-                    "period_key":     kn["period_key"],
-                    "description":    kn["description"],
-                })
-
-        print(f"[neo4j] Writing KnowledgeNode embeddings ...")
-        for batch in _batched(kn_list, NEO4J_BATCH_SIZE):
-            for kn in batch:
-                if kn.get("embedding"):
-                    session.run(UPSERT_KNOWLEDGE_NODE_EMBEDDING, {
-                        "kn_uid":    kn["kn_uid"],
-                        "embedding": kn["embedding"],
-                    })
-
-        # Chunk -> KnowledgeNode edges (SOURCED_FROM) 
-        print(f"[neo4j] Writing Chunk->KnowledgeNode edges ...")
-        for kn in kn_list:
-            for chunk_uid in kn.get("source_chunks", []):
-                session.run(UPSERT_CHUNK_TO_KN_EDGE, {
-                    "chunk_uid": chunk_uid,
-                    "kn_uid":    kn["kn_uid"],
-                })
-
-        # Knowledge units 
-        print(f"[neo4j] Upserting {len(knowledge_units)} Knowledge nodes ...")
-        for batch in _batched(knowledge_units, NEO4J_BATCH_SIZE):
-            for k in batch:
-                session.run(UPSERT_KNOWLEDGE, {
-                    "knowledge_uid": k["knowledge_uid"],
-                    "text":          k["text"],
-                    "kn_uid":        k["kn_uid"],
-                    "chunk_uid":     k["chunk_uid"],
-                    "period_key":    k["period_key"],
-                    "fact_type":     k["fact_type"],
-                })
-
-        print(f"[neo4j] Writing Knowledge embeddings ...")
-        for batch in _batched(knowledge_units, NEO4J_BATCH_SIZE):
-            for k in batch:
-                if k.get("embedding"):
-                    session.run(UPSERT_KNOWLEDGE_EMBEDDING, {
-                        "knowledge_uid": k["knowledge_uid"],
-                        "embedding":     k["embedding"],
-                    })
-
-        # Relations 
-        print(f"[neo4j] Upserting {len(relations)} RELATED_TO edges ...")
-        for batch in _batched(relations, NEO4J_BATCH_SIZE):
-            for r in batch:
-                session.run(UPSERT_RELATION, {
-                    "src_uid":     r["src_uid"],
-                    "tgt_uid":     r["tgt_uid"],
-                    "rel_type":    r["rel_type"],
-                    "period_key":  r["period_key"],
-                    "description": r["description"],
-
-                })
-
-        # SAME_ENTITY_AS cross-period chains 
-        print("[neo4j] Linking SAME_ENTITY_AS chains across periods ...")
-        result = session.run(LINK_SAME_ENTITY).single()
-        linked = result["linked"] if result else 0
-        print(f"  Linked {linked} cross-period entity pairs")
-
-    driver.close()
-    print("[neo4j] Write complete.")
+        print("[integrity] All checks passed.")
+    finally:
+        conn.close()
 
 
 # ---------------------------------------------------------------------------
 # Top-level orchestration
 # ---------------------------------------------------------------------------
 
-def run_setup(
+def run_sqlite_pass(
     reset: bool = False,
     skip_entities: bool = False,
+    keep_per_singletons: bool = False,
+    skip_embeddings: bool = False,
+    db_path: str = SQLITE_DB,
 ) -> None:
     """
-    Full T-GRAG setup pipeline. Called by update.py.
-    """
-    # 1. Load and filter articles
-    print("[setup] Loading articles ...")
-    raw_articles = load_articles()
+    SQLite-only pipeline pass. No Neo4j connection is opened.
 
-    driver = GraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASSWORD))
-    driver.verify_connectivity()
-    skip_ids: set[str] = set() if reset else get_existing_article_ids(driver)
-    driver.close()
+    Reads articles from SQLite, chunks them, extracts entity mentions,
+    embeds chunk text, and writes everything back to SQLite. Skips
+    articles whose chunks are already present (unless reset=True).
+
+    keep_per_singletons: if True, skips the PER singleton filter so all
+    extracted person entities are written regardless of chunk frequency.
+    """
+    from create_sql_db import create_database, connect_sqlite, ensure_migrations
+    create_database(db_path)
+    ensure_migrations(db_path)
+
+    print("[sqlite_pass] Loading articles from SQLite ...")
+    raw_articles = load_articles_from_sqlite(db_path)
+    print(f"[sqlite_pass] {len(raw_articles)} articles in store")
+
+    skip_ids: set[str] = set() if reset else get_chunked_article_ids_sqlite(db_path)
+    if skip_ids:
+        print(f"[sqlite_pass] Skipping {len(skip_ids)} articles already chunked")
 
     articles = filter_articles(raw_articles, skip_ids)
-    print(f"[setup] {len(articles)} new articles after filtering (skipped {len(skip_ids)} existing)")
+    print(f"[sqlite_pass] {len(articles)} new articles after filtering")
 
     if not articles:
-        print("[setup] No new articles to process. Done.")
+        print("[sqlite_pass] Nothing new to process.")
+        if skip_embeddings:
+            print("[sqlite_pass] Skipping embedding backfill (--skip-embeddings)")
+        else:
+            print("[sqlite_pass] Backfilling missing chunk embeddings ...")
+            backfilled = backfill_chunk_embeddings_sqlite(db_path=db_path)
+            print(f"[sqlite_pass] Backfilled {backfilled} chunk embedding(s)")
+        print("[sqlite_pass] Running integrity checks ...")
+        run_integrity_check(db_path)
+        print("[sqlite_pass] Done.")
         return
 
-    # 2. Chunk
-    print("[setup] Chunking articles ...")
+    # Chunk
+    print("[sqlite_pass] Chunking ...")
     chunks = build_chunks(articles)
-    print(f"[setup] Produced {len(chunks)} chunks")
+    print(f"[sqlite_pass] {len(chunks)} chunks produced")
+    _upsert_chunks_sqlite(chunks, db_path)
 
-    # 3. Entity extraction
-    knowledge_nodes: dict[str, dict] = {}
-    knowledge_units: list[dict] = []
-    relations: list[dict] = []
-    mentions: list[dict] = []
+    if skip_embeddings:
+        print("[sqlite_pass] Skipping chunk embeddings (--skip-embeddings)")
+    else:
+        print("[sqlite_pass] Backfilling missing chunk embeddings ...")
+        backfilled = backfill_chunk_embeddings_sqlite(db_path=db_path)
+        print(f"[sqlite_pass] Backfilled {backfilled} chunk embedding(s)")
 
+    # Entity extraction
     if not skip_entities:
         pipe = load_extraction_model()
         alias_to_fin_entity = load_financial_entity_map()
 
-        print("[setup] Extracting entities ...")
+        print("[sqlite_pass] Extracting entities ...")
         mentions = extract_entities_from_chunks(chunks, pipe, alias_to_fin_entity)
-        print(f"[setup] {len(mentions)} entity mentions extracted")
-
-        knowledge_nodes = build_knowledge_nodes(mentions)
-        print(f"[setup] {len(knowledge_nodes)} KnowledgeNodes (entity - period)")
-
-        knowledge_units = build_knowledge_units(chunks, mentions, knowledge_nodes)
-        print(f"[setup] {len(knowledge_units)} Knowledge units")
-
-        relations = build_relations(mentions, knowledge_nodes)
-        print(f"[setup] {len(relations)} RELATED_TO edges")
+        print(f"[sqlite_pass] {len(mentions)} entity mentions extracted")
+        if keep_per_singletons:
+            print("[sqlite_pass] PER singleton filter disabled (--keep-per-singletons)")
+        else:
+            mentions = _drop_per_singletons(mentions)
+            print(f"[sqlite_pass] {len(mentions)} mentions after PER singleton filter")
+        _upsert_entity_mentions_sqlite(mentions, db_path)
 
         del pipe
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
+    else:
+        print("[sqlite_pass] Skipping entity extraction (--skip-entities)")
 
-    # 4. Embed
-    chunks = embed_chunks(chunks)
-    if knowledge_nodes:
-        knowledge_nodes = embed_knowledge_nodes(knowledge_nodes)
-    if knowledge_units:
-        knowledge_units = embed_knowledge_units(knowledge_units)
+    # Fail loudly if the DB is inconsistent before downstream steps consume it.
+    print("[sqlite_pass] Running integrity checks ...")
+    run_integrity_check(db_path)
 
-    # Infer embedding dim from first chunk
-    embedding_dim = len(chunks[0]["embedding"]) if chunks and chunks[0].get("embedding") else 768
+    print("[sqlite_pass] Done.")
 
-    # 5. Write to Neo4j
-    populate_neo4j(
-        articles=articles,
-        chunks=chunks,
-        knowledge_nodes=knowledge_nodes,
-        knowledge_units=knowledge_units,
-        relations=relations,
-        mentions=mentions,
-        reset=reset,
-        embedding_dim=embedding_dim,
+
+def _upsert_chunks_sqlite(chunks: list[dict], db_path: str = SQLITE_DB) -> None:
+    """Write chunk dicts to SQLite chunks table. Skips already-present rows."""
+    from create_sql_db import connect_sqlite
+    conn = connect_sqlite(db_path)
+    inserted = 0
+    for c in chunks:
+        cur = conn.execute(
+            "INSERT OR IGNORE INTO chunks "
+            "(chunk_id, article_id, chunk_index, text, token_count, published_date, period_key, embedding_json) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, NULL)",
+            (
+                c["chunk_uid"],
+                c["article_id"],
+                c["chunk_index"],
+                c["text"],
+                c.get("token_count"),
+                c.get("published_date"),
+                c.get("period_key"),
+            ),
+        )
+        inserted += cur.rowcount
+    conn.commit()
+    conn.close()
+    print(f"[sqlite] chunks: {inserted} inserted, {len(chunks) - inserted} already present")
+
+
+def _upsert_entity_mentions_sqlite(mentions: list[dict], db_path: str = SQLITE_DB) -> None:
+    """Write entity mention dicts to SQLite entity_mentions table."""
+    from create_sql_db import connect_sqlite
+    conn = connect_sqlite(db_path)
+    inserted = 0
+    for m in mentions:
+        mention_id = hashlib.md5(
+            f"{m['chunk_uid']}::{m['canonical_name']}".encode()
+        ).hexdigest()
+        cur = conn.execute(
+            "INSERT OR IGNORE INTO entity_mentions "
+            "(mention_id, chunk_id, article_id, canonical_entity_id, display_name, "
+            "entity_type, ticker, mention_text, confidence) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                mention_id,
+                m["chunk_uid"],
+                m.get("article_id"),
+                m["canonical_name"],
+                m.get("display_name"),
+                m.get("entity_type"),
+                m.get("ticker"),
+                m.get("raw_name"),
+                m.get("link_score"),
+            ),
+        )
+        inserted += cur.rowcount
+    conn.commit()
+    conn.close()
+    print(f"[sqlite] entity_mentions: {inserted} inserted, {len(mentions) - inserted} already present")
+
+
+def _load_unembedded_chunks_sqlite(
+    db_path: str = SQLITE_DB,
+    limit: int | None = None,
+) -> list[dict]:
+    """Return chunks that still need embeddings."""
+    from create_sql_db import connect_sqlite
+    conn = connect_sqlite(db_path, fk=False)
+    conn.row_factory = sqlite3.Row
+    sql = """
+        SELECT chunk_id, text
+        FROM chunks
+        WHERE (embedding_json IS NULL OR embedding_json = '')
+          AND text IS NOT NULL
+          AND text <> ''
+        ORDER BY published_date DESC, chunk_index ASC
+    """
+    params: list[Any] = []
+    if limit is not None and limit > 0:
+        sql += " LIMIT ?"
+        params.append(limit)
+    rows = conn.execute(sql, params).fetchall()
+    conn.close()
+    return [{"chunk_id": row["chunk_id"], "text": row["text"]} for row in rows]
+
+
+def _write_chunk_embeddings_sqlite(
+    rows: list[tuple[str, str]],
+    db_path: str = SQLITE_DB,
+) -> None:
+    """Persist (embedding_json, chunk_id) rows."""
+    if not rows:
+        return
+    from create_sql_db import connect_sqlite
+    conn = connect_sqlite(db_path)
+    conn.executemany(
+        "UPDATE chunks SET embedding_json = ? WHERE chunk_id = ?",
+        rows,
     )
+    conn.commit()
+    conn.close()
 
-    print("[setup] Pipeline complete.")
+
+def backfill_chunk_embeddings_sqlite(
+    db_path: str = SQLITE_DB,
+    limit: int | None = None,
+    batch_rows: int = SQLITE_EMBED_BACKFILL_BATCH_ROWS,
+) -> int:
+    """
+    Compute and persist embeddings for chunks missing embedding_json.
+    Returns number of chunk rows updated.
+    """
+    pending = _load_unembedded_chunks_sqlite(db_path=db_path, limit=limit)
+    if not pending:
+        print("[embed] No missing chunk embeddings found.")
+        return 0
+
+    batch_size = max(1, int(batch_rows))
+    total = len(pending)
+    updated = 0
+    print(f"[embed] Backfilling {total} chunk embedding(s) ...")
+
+    for batch in _batched(pending, batch_size):
+        texts = [item["text"] for item in batch]
+        chunk_ids = [item["chunk_id"] for item in batch]
+        embeddings = embed_texts(texts, batch_size=EMBED_BATCH_SIZE)
+        payload = [
+            (json.dumps(emb, separators=(",", ":")), chunk_id)
+            for emb, chunk_id in zip(embeddings, chunk_ids)
+        ]
+        _write_chunk_embeddings_sqlite(payload, db_path=db_path)
+        updated += len(payload)
+        print(f"[embed] Backfill progress: {updated}/{total}")
+
+    return updated
+
+
+def run_setup(
+    reset: bool = False,
+    skip_entities: bool = False,
+) -> None:
+    """
+    Legacy Neo4j writer retained only for backwards compatibility.
+    """
+    raise RuntimeError(
+        "run_setup() targets the retired KnowledgeNode/Knowledge Neo4j schema. "
+        "Use run_sqlite_pass() for SQLite processing and neo4j_sync.py for the "
+        "lean MacroEvent/Entity/Asset Neo4j rebuild."
+    )

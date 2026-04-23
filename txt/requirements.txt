@@ -1,1 +1,26 @@
+# Graph + configuration
+neo4j>=5.14.0
+python-dotenv>=1.0.0
+
+# Embeddings / numerics (torch is pulled in by sentence-transformers)
+numpy>=1.24.0
+sentence-transformers>=2.2.0
+
+# Data + date parsing
+pandas>=2.0.0
+dateparser>=1.2.0
+
+# Scraping / HTTP (aiohttp is required for async paths in simple_scraper*.py)
+aiohttp>=3.9.0
+feedparser>=6.0.11
+requests>=2.31.0
+tqdm>=4.66.0
+
+# LLM client (chatter.py, macro_extract.py, evaluation_suite.py)
+anthropic>=0.25.0
+
+# Market data (chatter.py market block, hist_to_db.py — needs FMP_API_KEY)
+financetoolkit>=2.0.0
+
+# Entity fuzzy match (tgrag_setup.py)
 rapidfuzz>=3.0.0
