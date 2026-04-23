@@ -4,6 +4,7 @@ import argparse
 import importlib
 import json
 import re
+import sqlite3
 from pathlib import Path
 from typing import Any
 
@@ -18,6 +19,33 @@ from tgrag_setup import EMBED_MODEL_NAME, load_financial_entity_map, load_ticker
 
 
 DEFAULT_GOLD_PATH = Path("gold_eval_cases.json")
+DEFAULT_RELEASE_GATE_THRESHOLDS: dict[str, float] = {
+    "case_pass_rate_min": 0.8,
+    "target_resolution_accuracy_min": 0.8,
+    "abstention_correctness_min": 0.8,
+    "source_trust_compliance_min": 0.95,
+    "verifier_precision_min": 0.7,
+    "contradiction_rate_max": 0.15,
+    "unsupported_mechanism_rate_max": 0.2,
+}
+
+_ABSTAIN_PATTERNS: list[str] = [
+    r"\binsufficient\s+(evidence|information|context)\b",
+    r"\bnot\s+enough\s+(evidence|information|context)\b",
+    r"\bcannot\s+determine\b",
+    r"\bunable\s+to\s+determine\b",
+    r"\bno\s+relevant\s+chunks\s+found\b",
+]
+
+_RECENCY_SENSITIVE_TERMS: tuple[str, ...] = (
+    "latest",
+    "recent",
+    "today",
+    "yesterday",
+    "daily",
+    "now",
+    "newest",
+)
 
 # ---------------------------------------------------------------------------
 # Answer-quality parsing helpers (deterministic, no LLM judge)
@@ -185,6 +213,733 @@ def _has_dominance_language(text: str) -> bool:
         r"\b(dominates?|outweighs?|more\s+than\s+offsets?)\b",
         (text or "").lower()
     ))
+
+
+def _safe_ratio(numerator: int, denominator: int) -> float | None:
+    if denominator <= 0:
+        return None
+    return round(numerator / denominator, 4)
+
+
+def _to_float(value: Any) -> float | None:
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _normalized_text(value: Any) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip().lower()
+    return text or None
+
+
+def _target_attr(target: Any, key: str) -> Any:
+    if target is None:
+        return None
+    if isinstance(target, dict):
+        return target.get(key)
+    return getattr(target, key, None)
+
+
+def _extract_route_type(case: dict[str, Any], result: dict[str, Any]) -> str:
+    explicit = (
+        result.get("route_type")
+        or result.get("route")
+        or result.get("query_route")
+        or (result.get("routing") or {}).get("route_type")
+        or case.get("expected_route_type")
+    )
+    if explicit:
+        return str(explicit)
+
+    query = str(case.get("query", "")).lower()
+    if "summary" in query or "recap" in query:
+        return "daily_summary"
+    if any(term in query for term in ("latest", "recent", "today", "yesterday")):
+        return "latest_news"
+
+    target = result.get("target")
+    query_type = _target_attr(target, "query_type")
+    if query_type == "single_entity":
+        return "entity_profile"
+    if query_type == "general":
+        return "broad_exploration"
+    return "unknown"
+
+
+def _extract_answer_confidence(result: dict[str, Any], parsed: dict[str, Any] | None) -> float | None:
+    explicit = (
+        result.get("answer_confidence")
+        or result.get("confidence")
+        or (result.get("answer_meta") or {}).get("confidence")
+    )
+    score = _to_float(explicit)
+    if score is None and parsed is not None:
+        score = _to_float(parsed.get("confidence"))
+    if score is None:
+        return None
+    # Normalize either 0-1 or 0-100 into a 0-100 scale.
+    if 0.0 <= score <= 1.0:
+        score = score * 100.0
+    return max(0.0, min(100.0, score))
+
+
+def _extract_decision(result: dict[str, Any], answer: str, answer_confidence: float | None) -> str:
+    explicit = (
+        result.get("decision")
+        or result.get("answer_decision")
+        or (result.get("answer_meta") or {}).get("decision")
+    )
+    norm = _normalized_text(explicit)
+    if norm in {"abstain", "cautious_answer", "answer"}:
+        return norm
+
+    lower = (answer or "").lower()
+    if any(re.search(pattern, lower) for pattern in _ABSTAIN_PATTERNS):
+        return "abstain"
+    if answer_confidence is not None and answer_confidence < 35.0:
+        return "abstain"
+    if answer_confidence is not None and answer_confidence <= 60.0:
+        return "cautious_answer"
+    return "answer"
+
+
+def _extract_resolved_target(result: dict[str, Any]) -> dict[str, Any]:
+    explicit = result.get("resolved_target_json") or result.get("resolved_target")
+    if isinstance(explicit, dict):
+        canonical = explicit.get("canonical_name") or explicit.get("best_candidate")
+        candidates = explicit.get("candidates") or []
+        ambiguity_score = _to_float(explicit.get("ambiguity_score"))
+        needs_disambiguation = explicit.get("needs_disambiguation")
+        if needs_disambiguation is None and ambiguity_score is not None:
+            needs_disambiguation = ambiguity_score >= 0.66
+        return {
+            "canonical_name": canonical,
+            "ticker": explicit.get("ticker"),
+            "query_type": explicit.get("query_type"),
+            "candidates": candidates if isinstance(candidates, list) else [],
+            "ambiguity_score": ambiguity_score,
+            "resolution_mode": explicit.get("resolution_mode") or "explicit",
+            "needs_disambiguation": bool(needs_disambiguation),
+        }
+
+    target = result.get("target")
+    if target is None:
+        return {
+            "canonical_name": None,
+            "ticker": None,
+            "query_type": None,
+            "candidates": [],
+            "ambiguity_score": None,
+            "resolution_mode": "missing",
+            "needs_disambiguation": False,
+        }
+
+    candidates = _target_attr(target, "candidates") or []
+    confidence = _to_float(_target_attr(target, "confidence"))
+    ambiguity_score = None
+    if len(candidates) > 1 and confidence is not None:
+        ambiguity_score = max(0.0, min(1.0, 1.0 - confidence))
+    elif len(candidates) > 1:
+        ambiguity_score = min(1.0, (len(candidates) - 1) / 5.0)
+    elif confidence is not None:
+        ambiguity_score = max(0.0, min(1.0, 1.0 - confidence))
+
+    needs_disambiguation = bool(ambiguity_score is not None and ambiguity_score >= 0.66)
+    resolution_mode = "candidate_list" if len(candidates) > 1 else "direct"
+    return {
+        "canonical_name": _target_attr(target, "canonical_name"),
+        "ticker": _target_attr(target, "ticker"),
+        "query_type": _target_attr(target, "query_type"),
+        "candidates": candidates if isinstance(candidates, list) else [],
+        "ambiguity_score": ambiguity_score,
+        "resolution_mode": resolution_mode,
+        "needs_disambiguation": needs_disambiguation,
+    }
+
+
+def _resolve_expected_target(case: dict[str, Any]) -> dict[str, Any]:
+    expected = case.get("expected_target")
+    if isinstance(expected, str):
+        return {"canonical_name": expected}
+    if not isinstance(expected, dict):
+        expected = {}
+    if "canonical_name" not in expected and case.get("expected_target_canonical"):
+        expected["canonical_name"] = case.get("expected_target_canonical")
+    if "ticker" not in expected and case.get("expected_target_ticker"):
+        expected["ticker"] = case.get("expected_target_ticker")
+    if "query_type" not in expected and case.get("expected_query_type"):
+        expected["query_type"] = case.get("expected_query_type")
+    return expected
+
+
+def _evaluate_target_resolution(
+    case: dict[str, Any],
+    resolved_target: dict[str, Any],
+) -> dict[str, Any]:
+    expected = _resolve_expected_target(case)
+    if not expected:
+        return {"available": False, "skipped": True, "passed": True}
+
+    checks: list[tuple[str, bool, Any, Any]] = []
+    for key in ("canonical_name", "ticker", "query_type"):
+        exp_val = expected.get(key)
+        if exp_val is None:
+            continue
+        obs_val = resolved_target.get(key)
+        passed = _normalized_text(exp_val) == _normalized_text(obs_val)
+        checks.append((key, passed, exp_val, obs_val))
+
+    if not checks:
+        return {"available": False, "skipped": True, "passed": True}
+
+    passed = all(item[1] for item in checks)
+    return {
+        "available": True,
+        "passed": passed,
+        "checks": [
+            {"field": field, "passed": ok, "expected": exp, "observed": obs}
+            for field, ok, exp, obs in checks
+        ],
+    }
+
+
+def _is_abstain_decision(decision: str, answer: str) -> bool:
+    if _normalized_text(decision) == "abstain":
+        return True
+    lower = (answer or "").lower()
+    return any(re.search(pattern, lower) for pattern in _ABSTAIN_PATTERNS)
+
+
+def _evaluate_abstention(
+    case: dict[str, Any],
+    decision: str,
+    answer: str,
+) -> dict[str, Any]:
+    expected_abstain = case.get("expected_abstain")
+    if expected_abstain is None:
+        return {"available": False, "skipped": True, "passed": True}
+    observed_abstain = _is_abstain_decision(decision, answer)
+    passed = bool(observed_abstain == bool(expected_abstain))
+    return {
+        "available": True,
+        "passed": passed,
+        "expected_abstain": bool(expected_abstain),
+        "observed_abstain": observed_abstain,
+    }
+
+
+def _table_columns(sqlite_conn, table_name: str) -> set[str]:
+    rows = sqlite_conn.execute(f"PRAGMA table_info({table_name})").fetchall()
+    columns = set()
+    for row in rows:
+        if isinstance(row, sqlite3.Row):
+            columns.add(str(row["name"]))
+        else:
+            columns.add(str(row[1]))
+    return columns
+
+
+def _fetch_chunk_article_meta(sqlite_conn, chunk_ids: list[str]) -> dict[str, dict[str, Any]]:
+    if not chunk_ids:
+        return {}
+
+    article_cols = _table_columns(sqlite_conn, "articles")
+    select_fields = [
+        "c.chunk_id AS chunk_id",
+        "a.source AS source",
+    ]
+    if "source_trust_tier" in article_cols:
+        select_fields.append("a.source_trust_tier AS source_trust_tier")
+    if "content_class" in article_cols:
+        select_fields.append("a.content_class AS content_class")
+    if "article_quality_score" in article_cols:
+        select_fields.append("a.article_quality_score AS article_quality_score")
+
+    placeholders = ",".join("?" for _ in chunk_ids)
+    sql = f"""
+        SELECT {", ".join(select_fields)}
+        FROM chunks c
+        JOIN articles a ON a.article_id = c.article_id
+        WHERE c.chunk_id IN ({placeholders})
+    """
+    rows = sqlite_conn.execute(sql, chunk_ids).fetchall()
+    out: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        out[str(row["chunk_id"])] = {
+            "source": row["source"],
+            "source_trust_tier": row["source_trust_tier"] if "source_trust_tier" in row.keys() else None,
+            "content_class": row["content_class"] if "content_class" in row.keys() else None,
+            "article_quality_score": (
+                float(row["article_quality_score"])
+                if "article_quality_score" in row.keys() and row["article_quality_score"] is not None
+                else None
+            ),
+        }
+    return out
+
+
+def _evaluate_source_trust(
+    case: dict[str, Any],
+    source_meta_by_chunk: dict[str, dict[str, Any]],
+) -> dict[str, Any]:
+    policy = case.get("source_trust_policy", {}) or {}
+    disallow_tiers = set(
+        policy.get("disallow_tiers")
+        or case.get("disallow_source_trust_tiers")
+        or ["blocked"]
+    )
+    allow_tiers = set(policy.get("allow_tiers") or case.get("allow_source_trust_tiers") or [])
+    allowed_classes = set(
+        policy.get("allowed_content_classes")
+        or case.get("allowed_content_classes")
+        or []
+    )
+    min_quality = _to_float(
+        policy.get("min_article_quality_score")
+        if "min_article_quality_score" in policy
+        else case.get("min_article_quality_score")
+    )
+
+    tiers = [
+        str(item.get("source_trust_tier"))
+        for item in source_meta_by_chunk.values()
+        if item.get("source_trust_tier") not in (None, "")
+    ]
+    classes = [
+        str(item.get("content_class"))
+        for item in source_meta_by_chunk.values()
+        if item.get("content_class") not in (None, "")
+    ]
+    qualities = [
+        float(item["article_quality_score"])
+        for item in source_meta_by_chunk.values()
+        if item.get("article_quality_score") is not None
+    ]
+
+    has_signals = bool(tiers or classes or qualities)
+    if not has_signals:
+        return {"available": False, "skipped": True, "passed": True}
+
+    violations: list[str] = []
+    if disallow_tiers:
+        blocked_hits = [tier for tier in tiers if tier in disallow_tiers]
+        if blocked_hits:
+            violations.append(f"disallowed tiers present: {sorted(set(blocked_hits))}")
+    if allow_tiers:
+        outside = [tier for tier in tiers if tier not in allow_tiers]
+        if outside:
+            violations.append(f"tiers outside allow-list: {sorted(set(outside))}")
+    if allowed_classes:
+        bad_classes = [cls for cls in classes if cls not in allowed_classes]
+        if bad_classes:
+            violations.append(f"content classes outside allow-list: {sorted(set(bad_classes))}")
+    if min_quality is not None:
+        below = [score for score in qualities if score < min_quality]
+        if below:
+            violations.append(
+                f"article quality below min {min_quality}: count={len(below)}"
+            )
+
+    return {
+        "available": True,
+        "passed": not violations,
+        "violations": violations,
+        "tier_counts": {
+            tier: tiers.count(tier)
+            for tier in sorted(set(tiers))
+        },
+        "content_class_counts": {
+            cls: classes.count(cls)
+            for cls in sorted(set(classes))
+        },
+        "quality_count": len(qualities),
+    }
+
+
+def _extract_verifier_events(result: dict[str, Any]) -> list[dict[str, Any]]:
+    raw = (
+        result.get("selected_macro_events")
+        or result.get("macro_events")
+        or result.get("verifier_events")
+        or []
+    )
+    if not isinstance(raw, list):
+        return []
+    events: list[dict[str, Any]] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        event_id = (
+            item.get("macro_event_id")
+            or item.get("event_id")
+            or item.get("id")
+        )
+        if not event_id:
+            continue
+        events.append(
+            {
+                "macro_event_id": str(event_id),
+                "verification_status": _normalized_text(item.get("verification_status")) or "unknown",
+                "support_score": _to_float(item.get("support_score")),
+                "confidence_calibrated": _to_float(item.get("confidence_calibrated")),
+            }
+        )
+    return events
+
+
+def _evaluate_verifier_precision(
+    case: dict[str, Any],
+    verifier_events: list[dict[str, Any]],
+) -> dict[str, Any]:
+    verified_ids = {
+        event["macro_event_id"]
+        for event in verifier_events
+        if event.get("verification_status") == "verified"
+    }
+    if not verified_ids:
+        return {
+            "available": False,
+            "skipped": True,
+            "passed": True,
+            "hits": 0,
+            "predicted_verified": 0,
+            "precision": None,
+        }
+
+    expected = set(case.get("expected_macro_event_ids", []))
+    hits = sorted(verified_ids & expected)
+    precision = _safe_ratio(len(hits), len(verified_ids))
+    return {
+        "available": True,
+        "passed": True,
+        "hits": len(hits),
+        "predicted_verified": len(verified_ids),
+        "precision": precision,
+        "expected_macro_event_ids": sorted(expected),
+        "verified_macro_event_ids": sorted(verified_ids),
+    }
+
+
+def _detect_direction_contradiction(answer: str) -> bool:
+    sections = _split_sections(answer)
+    answer_section = (sections.get("answer") or answer or "").lower()
+    has_positive = bool(re.search(r"\b(positive|bullish|net\s+positive)\b", answer_section))
+    has_negative = bool(re.search(r"\b(negative|bearish|net\s+negative)\b", answer_section))
+    has_mixed = bool(re.search(r"\bmixed\b", answer_section))
+    return has_positive and has_negative and not has_mixed
+
+
+def _evaluate_contradiction(result: dict[str, Any]) -> dict[str, Any]:
+    explicit = (
+        result.get("contradiction_signals")
+        or (result.get("answer_meta") or {}).get("contradiction_signals")
+    )
+    if isinstance(explicit, bool):
+        has_contradiction = explicit
+        source = "explicit_bool"
+    elif isinstance(explicit, (list, tuple, set)):
+        has_contradiction = len(explicit) > 0
+        source = "explicit_list"
+    elif isinstance(explicit, dict):
+        has_contradiction = bool(explicit.get("has_contradiction"))
+        source = "explicit_dict"
+    else:
+        has_contradiction = _detect_direction_contradiction(result.get("answer", ""))
+        source = "deterministic_answer_parse"
+    return {
+        "available": True,
+        "has_contradiction": bool(has_contradiction),
+        "source": source,
+    }
+
+
+def _evaluate_unsupported_mechanisms(
+    case: dict[str, Any],
+    result: dict[str, Any],
+    parsed_answer: dict[str, Any] | None,
+) -> dict[str, Any]:
+    explicit = result.get("unsupported_mechanisms")
+    if isinstance(explicit, list):
+        unsupported = [str(item) for item in explicit if str(item).strip()]
+        return {
+            "available": True,
+            "unsupported_count": len(unsupported),
+            "mechanism_count": len(unsupported),
+            "unsupported_mechanisms": unsupported,
+        }
+
+    expected_quality = case.get("expected_answer_quality", {}) or {}
+    allowed = set(expected_quality.get("required_mechanisms", [])) | set(
+        expected_quality.get("optional_mechanisms", [])
+    ) | set(case.get("allowed_mechanisms", []))
+    if parsed_answer is None or not allowed:
+        return {
+            "available": False,
+            "skipped": True,
+            "unsupported_count": 0,
+            "mechanism_count": 0,
+            "unsupported_mechanisms": [],
+        }
+
+    observed = set(parsed_answer.get("mechanisms_found", []))
+    unsupported = sorted(observed - allowed)
+    return {
+        "available": True,
+        "unsupported_count": len(unsupported),
+        "mechanism_count": len(observed),
+        "unsupported_mechanisms": unsupported,
+        "observed_mechanisms": sorted(observed),
+        "allowed_mechanisms": sorted(allowed),
+    }
+
+
+def _ambiguity_slice(resolved_target: dict[str, Any]) -> str:
+    if resolved_target.get("needs_disambiguation"):
+        return "high"
+    score = _to_float(resolved_target.get("ambiguity_score"))
+    if score is None:
+        return "unknown"
+    if score >= 0.66:
+        return "high"
+    if score >= 0.33:
+        return "medium"
+    return "low"
+
+
+def _recency_sensitivity_slice(case: dict[str, Any]) -> str:
+    explicit = case.get("recency_sensitivity") or case.get("slice_recency_sensitivity")
+    if explicit:
+        return str(explicit)
+    query = str(case.get("query", "")).lower()
+    if any(term in query for term in _RECENCY_SENSITIVE_TERMS):
+        return "high"
+    return "low"
+
+
+def _source_quality_slice(source_meta_by_chunk: dict[str, dict[str, Any]], case: dict[str, Any]) -> str:
+    explicit = case.get("source_quality_slice")
+    if explicit:
+        return str(explicit)
+
+    tiers = [
+        str(item.get("source_trust_tier"))
+        for item in source_meta_by_chunk.values()
+        if item.get("source_trust_tier")
+    ]
+    qualities = [
+        float(item["article_quality_score"])
+        for item in source_meta_by_chunk.values()
+        if item.get("article_quality_score") is not None
+    ]
+
+    if "blocked" in tiers or "tier_3" in tiers:
+        return "low"
+    if qualities:
+        avg = sum(qualities) / len(qualities)
+        if avg >= 0.75:
+            return "high"
+        if avg >= 0.45:
+            return "medium"
+        return "low"
+    if "tier_1" in tiers and "tier_3" not in tiers:
+        return "high" if "tier_2" not in tiers else "medium"
+    if tiers:
+        return "medium"
+    return "unknown"
+
+
+def _aggregate_boolean_metric(results: list[dict[str, Any]], key: str) -> dict[str, Any]:
+    total = 0
+    hits = 0
+    case_ids: list[str] = []
+    for result in results:
+        metric = ((result.get("v2") or {}).get(key) or {})
+        if not metric.get("available"):
+            continue
+        total += 1
+        if metric.get("passed"):
+            hits += 1
+        case_ids.append(result.get("id", "unknown"))
+    return {
+        "value": _safe_ratio(hits, total),
+        "hits": hits,
+        "total": total,
+        "cases": case_ids,
+    }
+
+
+def _aggregate_verifier_precision(results: list[dict[str, Any]]) -> dict[str, Any]:
+    hits = 0
+    predicted = 0
+    for result in results:
+        metric = ((result.get("v2") or {}).get("verifier_precision_eval") or {})
+        if not metric.get("available"):
+            continue
+        hits += int(metric.get("hits", 0))
+        predicted += int(metric.get("predicted_verified", 0))
+    return {
+        "value": _safe_ratio(hits, predicted),
+        "hits": hits,
+        "predicted_verified": predicted,
+    }
+
+
+def _aggregate_contradiction_rate(results: list[dict[str, Any]]) -> dict[str, Any]:
+    contradictions = 0
+    total = 0
+    for result in results:
+        metric = ((result.get("v2") or {}).get("contradiction_eval") or {})
+        if not metric.get("available", False):
+            continue
+        total += 1
+        if metric.get("has_contradiction"):
+            contradictions += 1
+    return {
+        "value": _safe_ratio(contradictions, total),
+        "contradictions": contradictions,
+        "total": total,
+    }
+
+
+def _aggregate_unsupported_mechanism_rate(results: list[dict[str, Any]]) -> dict[str, Any]:
+    unsupported = 0
+    total = 0
+    for result in results:
+        metric = ((result.get("v2") or {}).get("unsupported_mechanism_eval") or {})
+        if not metric.get("available"):
+            continue
+        unsupported += int(metric.get("unsupported_count", 0))
+        total += int(metric.get("mechanism_count", 0))
+    return {
+        "value": _safe_ratio(unsupported, total),
+        "unsupported": unsupported,
+        "mechanisms_considered": total,
+    }
+
+
+def _compute_v2_metrics(results: list[dict[str, Any]]) -> dict[str, Any]:
+    return {
+        "target_resolution_accuracy": _aggregate_boolean_metric(results, "target_resolution_eval"),
+        "abstention_correctness": _aggregate_boolean_metric(results, "abstention_eval"),
+        "source_trust_compliance": _aggregate_boolean_metric(results, "source_trust_eval"),
+        "verifier_precision": _aggregate_verifier_precision(results),
+        "contradiction_rate": _aggregate_contradiction_rate(results),
+        "unsupported_mechanism_rate": _aggregate_unsupported_mechanism_rate(results),
+    }
+
+
+def _bucketize(results: list[dict[str, Any]], slice_key: str) -> dict[str, list[dict[str, Any]]]:
+    buckets: dict[str, list[dict[str, Any]]] = {}
+    for result in results:
+        label = (((result.get("v2") or {}).get("slices") or {}).get(slice_key) or "unknown")
+        buckets.setdefault(str(label), []).append(result)
+    return buckets
+
+
+def _slice_summary(results: list[dict[str, Any]]) -> dict[str, Any]:
+    passed = sum(1 for result in results if result.get("passed"))
+    chunk_recalls = [float(result["chunk_score"]["recall"]) for result in results if result.get("chunk_score")]
+    return {
+        "cases": len(results),
+        "pass_rate": _safe_ratio(passed, len(results)),
+        "avg_chunk_recall": (
+            round(sum(chunk_recalls) / len(chunk_recalls), 4) if chunk_recalls else None
+        ),
+        "metrics": _compute_v2_metrics(results),
+    }
+
+
+def _build_slice_report(results: list[dict[str, Any]]) -> dict[str, Any]:
+    report: dict[str, Any] = {}
+    for slice_key in ("query_type_route", "ambiguity", "recency_sensitivity", "source_quality"):
+        bucketed = _bucketize(results, slice_key)
+        report[slice_key] = {
+            label: _slice_summary(bucket_results)
+            for label, bucket_results in sorted(bucketed.items(), key=lambda item: item[0])
+        }
+    return report
+
+
+def _evaluate_release_gate(
+    *,
+    metrics: dict[str, Any],
+    case_passed: int,
+    case_total: int,
+    thresholds: dict[str, float],
+    require_all_metrics: bool,
+) -> dict[str, Any]:
+    checks: list[dict[str, Any]] = []
+    failures: list[str] = []
+    missing: list[str] = []
+
+    case_pass_rate = _safe_ratio(case_passed, case_total) if case_total else 0.0
+    case_threshold = thresholds["case_pass_rate_min"]
+    case_ok = (case_pass_rate or 0.0) >= case_threshold
+    checks.append(
+        {
+            "metric": "case_pass_rate",
+            "operator": ">=",
+            "threshold": case_threshold,
+            "observed": case_pass_rate,
+            "available": True,
+            "passed": case_ok,
+        }
+    )
+    if not case_ok:
+        failures.append("case_pass_rate")
+
+    metric_specs = [
+        ("target_resolution_accuracy", ">=", thresholds["target_resolution_accuracy_min"]),
+        ("abstention_correctness", ">=", thresholds["abstention_correctness_min"]),
+        ("source_trust_compliance", ">=", thresholds["source_trust_compliance_min"]),
+        ("verifier_precision", ">=", thresholds["verifier_precision_min"]),
+        ("contradiction_rate", "<=", thresholds["contradiction_rate_max"]),
+        ("unsupported_mechanism_rate", "<=", thresholds["unsupported_mechanism_rate_max"]),
+    ]
+
+    for metric_name, operator, threshold in metric_specs:
+        observed = _to_float((metrics.get(metric_name) or {}).get("value"))
+        available = observed is not None
+        if not available:
+            passed = not require_all_metrics
+            missing.append(metric_name)
+        elif operator == ">=":
+            passed = observed >= threshold
+        else:
+            passed = observed <= threshold
+        checks.append(
+            {
+                "metric": metric_name,
+                "operator": operator,
+                "threshold": threshold,
+                "observed": observed,
+                "available": available,
+                "passed": passed,
+            }
+        )
+        if not passed:
+            failures.append(metric_name)
+
+    if failures:
+        status = "fail"
+    elif missing:
+        status = "pass_with_gaps"
+    else:
+        status = "pass"
+
+    return {
+        "status": status,
+        "checks": checks,
+        "thresholds": thresholds,
+        "require_all_metrics": require_all_metrics,
+        "missing_metrics": missing,
+        "failed_metrics": failures,
+    }
 
 # ---------------------------------------------------------------------------
 # Macro-answer evaluation against gold expectations
@@ -526,6 +1281,7 @@ def evaluate_case(case: dict[str, Any], runtime: dict[str, Any], *, skip_generat
     chunk_ids = [chunk["chunk_uid"] for chunk in result["chunks"] if chunk.get("chunk_uid")]
     entities = _chunk_entities(runtime["sqlite_conn"], chunk_ids)
     macro_event_ids, macro_event_types = _chunk_macro_events(runtime["sqlite_conn"], chunk_ids)
+    source_meta_by_chunk = _fetch_chunk_article_meta(runtime["sqlite_conn"], chunk_ids)
     grounding = _answer_grounding(result["answer"], result["citation_map"])
     required_grounding = case.get("expected_answer_grounding", {})
 
@@ -571,6 +1327,7 @@ def evaluate_case(case: dict[str, Any], runtime: dict[str, Any], *, skip_generat
     # --- macro answer quality evaluation (new) ---
     macro_answer_eval: dict[str, Any] = {"passed": True, "skipped": True}
     macro_answer_passed = True
+    parsed_answer_meta: dict[str, Any] | None = None
 
     gold_answer_quality = case.get("expected_answer_quality", {})
     if gold_answer_quality and not skip_generation:
@@ -582,11 +1339,35 @@ def evaluate_case(case: dict[str, Any], runtime: dict[str, Any], *, skip_generat
         parsed = parse_answer_meta(result["answer"], all_mechs)
         # Attach raw answer so evaluate_macro_answer can do phrase matching
         parsed["_raw_answer"] = result["answer"]
+        parsed_answer_meta = parsed
 
         macro_answer_eval = evaluate_macro_answer(parsed, gold_answer_quality)
         macro_answer_passed = macro_answer_eval["passed"]
 
     passes.append(macro_answer_passed)
+
+    route_type = _extract_route_type(case, result)
+    resolved_target = _extract_resolved_target(result)
+    answer_confidence = _extract_answer_confidence(result, parsed_answer_meta)
+    decision = _extract_decision(result, result["answer"], answer_confidence)
+    verifier_events = _extract_verifier_events(result)
+
+    target_resolution_eval = _evaluate_target_resolution(case, resolved_target)
+    abstention_eval = _evaluate_abstention(case, decision, result["answer"])
+    source_trust_eval = _evaluate_source_trust(case, source_meta_by_chunk)
+    verifier_precision_eval = _evaluate_verifier_precision(case, verifier_events)
+    contradiction_eval = _evaluate_contradiction(result)
+    unsupported_mechanism_eval = _evaluate_unsupported_mechanisms(
+        case,
+        result,
+        parsed_answer_meta,
+    )
+    slices = {
+        "query_type_route": route_type,
+        "ambiguity": _ambiguity_slice(resolved_target),
+        "recency_sensitivity": _recency_sensitivity_slice(case),
+        "source_quality": _source_quality_slice(source_meta_by_chunk, case),
+    }
 
     return {
         "id": case["id"],
@@ -600,6 +1381,20 @@ def evaluate_case(case: dict[str, Any], runtime: dict[str, Any], *, skip_generat
         "macro_answer_passed": macro_answer_passed,
         "answer": result["answer"],
         "provenance": result["provenance"],
+        "v2": {
+            "route_type": route_type,
+            "answer_confidence": answer_confidence,
+            "decision": decision,
+            "resolved_target": resolved_target,
+            "target_resolution_eval": target_resolution_eval,
+            "abstention_eval": abstention_eval,
+            "source_trust_eval": source_trust_eval,
+            "verifier_events": verifier_events,
+            "verifier_precision_eval": verifier_precision_eval,
+            "contradiction_eval": contradiction_eval,
+            "unsupported_mechanism_eval": unsupported_mechanism_eval,
+            "slices": slices,
+        },
         "passed": all(passes),
     }
 
@@ -615,11 +1410,27 @@ def run_suite(gold_path: Path, *, skip_generation: bool, disable_reranker: bool)
     finally:
         close_runtime(runtime)
     passed = sum(1 for result in results if result["passed"])
+    v2_metrics = _compute_v2_metrics(results)
+    slice_report = _build_slice_report(results)
+    release_gate_thresholds = {
+        **DEFAULT_RELEASE_GATE_THRESHOLDS,
+        **(payload.get("release_gate_thresholds") or {}),
+    }
+    release_gate = _evaluate_release_gate(
+        metrics=v2_metrics,
+        case_passed=passed,
+        case_total=len(results),
+        thresholds=release_gate_thresholds,
+        require_all_metrics=bool(payload.get("release_gate_require_all_metrics", False)),
+    )
     return {
         "suite": str(gold_path),
         "cases": results,
         "passed": passed,
         "total": len(results),
+        "v2_metrics": v2_metrics,
+        "slice_report": slice_report,
+        "release_gate": release_gate,
     }
 
 
@@ -697,6 +1508,11 @@ def bootstrap_case(gold_path: Path, case_id: str, query: str, *, skip_generation
             "forbidden_overclaims": [],
             "max_confidence_if_mixed": None,
         },
+        # Optional v2 deterministic evaluation hooks.
+        "expected_route_type": None,
+        "expected_target": {},
+        "expected_abstain": None,
+        "source_trust_policy": {},
         "min_chunk_recall": 0.5,
         "min_entity_recall": 1.0,
         "min_macro_type_recall": 0.5,
