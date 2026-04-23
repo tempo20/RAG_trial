@@ -819,9 +819,9 @@ def _is_boilerplate_article(text: str, url: str = "") -> bool:
 
 def _save_to_sqlite(articles: list[dict], scraped_at_utc: str) -> None:
     """Persist ok articles to SQLite, silently skipping duplicates."""
-    from create_sql_db import create_database
+    from create_sql_db import create_database, connect_sqlite
     create_database(SQLITE_DB)
-    conn = sqlite3.connect(SQLITE_DB)
+    conn = connect_sqlite(SQLITE_DB)
     inserted = skipped = skipped_boilerplate = 0
     for art in articles:
         if art.get("status") != "ok" or not art.get("text"):
