@@ -47,6 +47,27 @@ MAX_TOKENS_OUT              = int(os.getenv("MACRO_MAX_TOKENS_OUT", "1200"))
 CHUNK_SCORE_THRESHOLD       = int(os.getenv("MACRO_CHUNK_SCORE_THRESHOLD", "3"))
 MACRO_MAX_CHUNKS_PER_ARTICLE = int(os.getenv("MACRO_MAX_CHUNKS_PER_ARTICLE", "2"))
 
+ALLOWED_MACRO_CONTENT_CLASSES: frozenset[str] = frozenset({
+    "news_report",
+    "analysis",
+    "official_release",
+})
+
+VERIFICATION_STATUS_ALLOWED: frozenset[str] = frozenset({"verified", "weak", "rejected"})
+VERIFIER_REJECT_SUPPORT_THRESHOLD = float(os.getenv("MACRO_VERIFIER_REJECT_THRESHOLD", "0.35"))
+VERIFIER_WEAK_SUPPORT_THRESHOLD = float(os.getenv("MACRO_VERIFIER_WEAK_THRESHOLD", "0.60"))
+VERIFIER_MIN_EVIDENCE_MATCH_RATIO = float(os.getenv("MACRO_VERIFIER_MIN_EVIDENCE_MATCH_RATIO", "0.50"))
+PROCESSING_STATE_ORDER = {
+    "ingested": 0,
+    "classified": 1,
+    "chunked": 2,
+    "embedded": 3,
+    "entity_resolved": 4,
+    "macro_candidate_extracted": 5,
+    "macro_verified": 6,
+    "graph_synced": 7,
+}
+
 # ---------------------------------------------------------------------------
 # Canonical vocabularies
 # ---------------------------------------------------------------------------
@@ -179,6 +200,111 @@ def _load_macro_extraction_prompt(path: Path) -> str:
 
 
 MACRO_EXTRACTION_PROMPT = _load_macro_extraction_prompt(PROMPT_TEMPLATES_PATH)
+
+MACRO_CANDIDATE_EXTRACTION_PROMPT = """\
+You are Pass A in a two-pass macro extraction system.
+Goal: high-recall candidate extraction from the news excerpt.
+
+Rules:
+- Extract up to 4 plausible macro events supported by the text.
+- Prefer recall: include borderline candidates if there is at least one explicit textual anchor.
+- Do not invent facts not present in the text.
+- For evidence_spans: include 1-3 short verbatim phrases from the text.
+- Keep channels and asset_impacts concise (0-2 each).
+- confidence is an initial score (0.0-1.0), not final verification.
+
+Return ONLY a JSON object:
+
+{{
+  "events": [
+    {{
+      "event_type": "<one of: {shock_types}>",
+      "summary": "<one concise sentence>",
+      "region": "<country, region, or 'global'>",
+      "time_horizon": "<one of: {horizons}>",
+      "shock_types": ["<subset of: {shock_types}>"],
+      "channels": [
+        {{
+          "channel_name": "<one of: {channels}>",
+          "direction": "<one of: {directions}>",
+          "strength": "<one of: {strengths}>"
+        }}
+      ],
+      "asset_impacts": [
+        {{
+          "target_type": "<'ticker' | 'asset_class' | 'currency' | 'commodity'>",
+          "target_id": "<symbol or name>",
+          "direction": "<one of: {directions}>",
+          "strength": "<one of: {strengths}>",
+          "horizon": "<one of: {horizons}>",
+          "rationale": "<one short phrase>"
+        }}
+      ],
+      "evidence_spans": ["<short verbatim phrase from text>"],
+      "confidence": <float 0.0-1.0>
+    }}
+  ]
+}}
+
+If no plausible macro events are present, return {{"events": []}}.
+Use only allowed enum values; do not invent labels.
+
+NEWS EXCERPT:
+{text}
+"""
+
+DEFAULT_MACRO_VERIFICATION_PROMPT = """\
+You are Pass B verifier in a macro extraction pipeline.
+You must verify each candidate event against the excerpt using explicit support only.
+
+Rules:
+- Verify direct textual support, not inference.
+- Validate evidence spans: reject or mark weak if spans are not truly present/supportive.
+- Calibrate confidence downward when support is weak or ambiguous.
+- Keep candidate_index unchanged.
+- Allowed verification_status values: verified, weak, rejected.
+- support_score and confidence_calibrated must be floats 0.0-1.0.
+
+Return ONLY JSON:
+{{
+  "verifications": [
+    {{
+      "candidate_index": <int>,
+      "verification_status": "<verified|weak|rejected>",
+      "support_score": <float 0.0-1.0>,
+      "confidence_calibrated": <float 0.0-1.0>,
+      "rejection_reason": "<short string or empty>"
+    }}
+  ]
+}}
+
+CANDIDATES JSON:
+{candidates_json}
+
+NEWS EXCERPT:
+{text}
+"""
+
+
+def _load_macro_verification_prompt(path: Path) -> str:
+    """
+    Load Pass-B verification prompt from prompt_templates.json.
+    Falls back to DEFAULT_MACRO_VERIFICATION_PROMPT when unavailable.
+    """
+    if not path.exists():
+        return DEFAULT_MACRO_VERIFICATION_PROMPT
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return DEFAULT_MACRO_VERIFICATION_PROMPT
+
+    value = data.get("MACRO_VERIFICATION_PROMPT")
+    if value is None:
+        return DEFAULT_MACRO_VERIFICATION_PROMPT
+    return _coerce_template_value(value, "MACRO_VERIFICATION_PROMPT")
+
+
+MACRO_VERIFICATION_PROMPT = _load_macro_verification_prompt(PROMPT_TEMPLATES_PATH)
 
 # ---------------------------------------------------------------------------
 # Enum enforcement helpers
@@ -476,20 +602,12 @@ def _repair_json(raw: str) -> str | None:
     return raw[:last_valid] if last_valid else None
 
 
-def _call_claude(client: Any, chunk_text: str) -> tuple[bool, str, str | None]:
+def _call_claude_prompt(client: Any, prompt: str) -> tuple[bool, str, str | None]:
     """
-    Call Claude and return (success, raw_json, error_text).
+    Call Claude with an already-rendered prompt and return (success, raw_json, error_text).
     Uses assistant prefill of '{' to force a JSON object response.
     Falls back to _repair_json if the response is truncated mid-JSON.
     """
-    prompt = MACRO_EXTRACTION_PROMPT.format(
-        shock_types=", ".join(SHOCK_TYPES),
-        horizons=", ".join(HORIZONS),
-        channels=", ".join(MACRO_CHANNELS),
-        directions=", ".join(DIRECTIONS),
-        strengths=", ".join(STRENGTHS),
-        text=chunk_text,
-    )
     try:
         response = client.messages.create(
             model=GEN_MODEL_NAME,
@@ -524,6 +642,46 @@ def _call_claude(client: Any, chunk_text: str) -> tuple[bool, str, str | None]:
     except Exception as exc:
         return False, "", str(exc)
 
+
+def _call_candidate_extraction(client: Any, chunk_text: str) -> tuple[bool, str, str | None]:
+    prompt = MACRO_CANDIDATE_EXTRACTION_PROMPT.format(
+        shock_types=", ".join(SHOCK_TYPES),
+        horizons=", ".join(HORIZONS),
+        channels=", ".join(MACRO_CHANNELS),
+        directions=", ".join(DIRECTIONS),
+        strengths=", ".join(STRENGTHS),
+        text=chunk_text,
+    )
+    return _call_claude_prompt(client, prompt)
+
+
+def _call_verification(
+    client: Any,
+    *,
+    chunk_text: str,
+    candidates: list[dict],
+) -> tuple[bool, str, str | None]:
+    candidates_payload = [
+        {
+            "candidate_index": idx,
+            "event_type": ev.get("event_type"),
+            "summary": ev.get("summary"),
+            "region": ev.get("region"),
+            "time_horizon": ev.get("time_horizon"),
+            "shock_types": ev.get("shock_types", []),
+            "channels": ev.get("channels", []),
+            "asset_impacts": ev.get("asset_impacts", []),
+            "evidence_spans": ev.get("evidence_spans", []),
+            "confidence": ev.get("confidence"),
+        }
+        for idx, ev in enumerate(candidates)
+    ]
+    prompt = MACRO_VERIFICATION_PROMPT.format(
+        candidates_json=json.dumps(candidates_payload, ensure_ascii=True),
+        text=chunk_text,
+    )
+    return _call_claude_prompt(client, prompt)
+
 # ---------------------------------------------------------------------------
 # SQLite helpers
 # ---------------------------------------------------------------------------
@@ -549,13 +707,285 @@ def _raw_excerpt(raw_json: str | None, max_chars: int = 400) -> str | None:
     return compact[: max_chars - 3] + "..."
 
 
+_TABLE_COLUMNS_CACHE: dict[str, set[str]] = {}
+
+
+def _table_columns(conn: sqlite3.Connection, table_name: str) -> set[str]:
+    if table_name in _TABLE_COLUMNS_CACHE:
+        return _TABLE_COLUMNS_CACHE[table_name]
+    rows = conn.execute(f"PRAGMA table_info({table_name})").fetchall()
+    cols = {row[1] for row in rows}
+    _TABLE_COLUMNS_CACHE[table_name] = cols
+    return cols
+
+
+def _table_has_column(conn: sqlite3.Connection, table_name: str, column_name: str) -> bool:
+    return column_name in _table_columns(conn, table_name)
+
+
+def _table_exists(conn: sqlite3.Connection, table_name: str) -> bool:
+    return bool(_table_columns(conn, table_name))
+
+
+def _clamp01(value: Any, default: float = 0.0) -> float:
+    try:
+        f = float(value)
+    except (TypeError, ValueError):
+        return default
+    if f < 0.0:
+        return 0.0
+    if f > 1.0:
+        return 1.0
+    return f
+
+
+def _normalize_for_match(text: str) -> str:
+    return " ".join((text or "").lower().split())
+
+
+def _evidence_match_ratio(spans: list[str], chunk_text: str) -> tuple[float, list[str]]:
+    if not spans:
+        return 0.0, []
+    normalized_chunk = _normalize_for_match(chunk_text)
+    matched: list[str] = []
+    for span in spans:
+        if not span:
+            continue
+        if _normalize_for_match(span) in normalized_chunk:
+            matched.append(span)
+    if not spans:
+        return 0.0, matched
+    return (len(matched) / len(spans)), matched
+
+
+def _extract_verifications(parsed: dict[str, Any]) -> list[dict[str, Any]]:
+    raw = parsed.get("verifications", [])
+    if not isinstance(raw, list):
+        return []
+    rows: list[dict[str, Any]] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        try:
+            candidate_index = int(item.get("candidate_index"))
+        except (TypeError, ValueError):
+            continue
+        status = str(item.get("verification_status", "weak")).strip().lower()
+        if status not in VERIFICATION_STATUS_ALLOWED:
+            status = "weak"
+        rows.append(
+            {
+                "candidate_index": candidate_index,
+                "verification_status": status,
+                "support_score": _clamp01(item.get("support_score"), default=0.0),
+                "confidence_calibrated": _clamp01(item.get("confidence_calibrated"), default=0.0),
+                "rejection_reason": (item.get("rejection_reason") or "").strip(),
+            }
+        )
+    return rows
+
+
+def _write_processing_state_hook(conn: sqlite3.Connection, chunk: dict, state: str) -> None:
+    rank = PROCESSING_STATE_ORDER.get(state)
+    if rank is None:
+        return
+    rank_expr = (
+        "CASE COALESCE(processing_state, '') "
+        "WHEN 'ingested' THEN 0 "
+        "WHEN 'classified' THEN 1 "
+        "WHEN 'chunked' THEN 2 "
+        "WHEN 'embedded' THEN 3 "
+        "WHEN 'entity_resolved' THEN 4 "
+        "WHEN 'macro_candidate_extracted' THEN 5 "
+        "WHEN 'macro_verified' THEN 6 "
+        "WHEN 'graph_synced' THEN 7 "
+        "ELSE -1 END"
+    )
+    changed = False
+    if _table_has_column(conn, "chunks", "processing_state"):
+        conn.execute(
+            (
+                "UPDATE chunks SET processing_state = ? "
+                "WHERE chunk_id = ? "
+                f"AND ({rank_expr}) < ?"
+            ),
+            (state, chunk["chunk_id"], rank),
+        )
+        changed = True
+    if _table_has_column(conn, "articles", "processing_state"):
+        conn.execute(
+            (
+                "UPDATE articles SET processing_state = ? "
+                "WHERE article_id = ? "
+                f"AND ({rank_expr}) < ?"
+            ),
+            (state, chunk["article_id"], rank),
+        )
+        changed = True
+    if changed:
+        conn.commit()
+
+
+def _write_candidate_rows(
+    conn: sqlite3.Connection,
+    *,
+    run_id: str,
+    chunk: dict,
+    candidates: list[dict[str, Any]],
+) -> list[str]:
+    if not _table_exists(conn, "macro_event_candidates"):
+        return []
+    columns = _table_columns(conn, "macro_event_candidates")
+    if not columns:
+        return []
+
+    candidate_ids: list[str] = []
+    for idx, ev in enumerate(candidates):
+        candidate_id = _md5(f"{run_id}::candidate::{idx}")
+        candidate_ids.append(candidate_id)
+        row = {
+            "candidate_id": candidate_id,
+            "run_id": run_id,
+            "article_id": chunk["article_id"],
+            "chunk_id": chunk["chunk_id"],
+            "macro_event_index": idx,
+            "event_type": ev.get("event_type"),
+            "summary": ev.get("summary"),
+            "region": ev.get("region"),
+            "time_horizon": ev.get("time_horizon"),
+            "initial_confidence": _clamp01(ev.get("confidence"), default=0.0),
+            "confidence_initial": _clamp01(ev.get("confidence"), default=0.0),
+            "evidence_spans_json": json.dumps(ev.get("evidence_spans", []), ensure_ascii=True),
+            "candidate_json": json.dumps(ev, ensure_ascii=True),
+            "raw_candidate_json": json.dumps(ev, ensure_ascii=True),
+            "created_at": _now_utc(),
+        }
+        payload = {k: v for k, v in row.items() if k in columns}
+        if not payload:
+            continue
+        sql = (
+            f"INSERT OR REPLACE INTO macro_event_candidates ({', '.join(payload.keys())}) "
+            f"VALUES ({', '.join('?' for _ in payload)})"
+        )
+        conn.execute(sql, tuple(payload.values()))
+    conn.commit()
+    return candidate_ids
+
+
+def _write_verification_rows(
+    conn: sqlite3.Connection,
+    *,
+    run_id: str,
+    chunk: dict,
+    candidates: list[dict[str, Any]],
+    verifications: list[dict[str, Any]],
+    candidate_ids: list[str],
+) -> list[dict[str, Any]]:
+    by_index = {row["candidate_index"]: row for row in verifications}
+    normalized_results: list[dict[str, Any]] = []
+    for idx, ev in enumerate(candidates):
+        spans = [str(s).strip() for s in ev.get("evidence_spans", []) if str(s).strip()]
+        evidence_ratio, matched_spans = _evidence_match_ratio(spans, chunk["text"])
+        model = by_index.get(
+            idx,
+            {
+                "candidate_index": idx,
+                "verification_status": "weak",
+                "support_score": 0.0,
+                "confidence_calibrated": 0.0,
+                "rejection_reason": "verifier_missing_row",
+            },
+        )
+        support_score = round((_clamp01(model.get("support_score"), 0.0) + evidence_ratio) / 2.0, 4)
+        confidence_initial = _clamp01(ev.get("confidence"), 0.0)
+        confidence_from_verifier = _clamp01(model.get("confidence_calibrated"), 0.0)
+        confidence_calibrated = round(
+            min(confidence_initial, confidence_from_verifier, support_score),
+            4,
+        )
+        evidence_valid = bool(spans) and evidence_ratio >= VERIFIER_MIN_EVIDENCE_MATCH_RATIO
+
+        status = str(model.get("verification_status", "weak")).lower()
+        rejection_reason = str(model.get("rejection_reason") or "").strip()
+        if status not in VERIFICATION_STATUS_ALLOWED:
+            status = "weak"
+
+        if not spans:
+            status = "rejected"
+            rejection_reason = rejection_reason or "missing_evidence_spans"
+        elif not evidence_valid:
+            status = "rejected"
+            rejection_reason = rejection_reason or "invalid_evidence_spans"
+        elif status == "rejected":
+            rejection_reason = rejection_reason or "verifier_rejected"
+        elif support_score < VERIFIER_REJECT_SUPPORT_THRESHOLD:
+            status = "rejected"
+            rejection_reason = rejection_reason or "support_score_below_reject_threshold"
+        elif status == "weak" or support_score < VERIFIER_WEAK_SUPPORT_THRESHOLD:
+            status = "weak"
+        else:
+            status = "verified"
+
+        normalized_results.append(
+            {
+                "candidate_index": idx,
+                "candidate_id": candidate_ids[idx] if idx < len(candidate_ids) else None,
+                "verification_status": status,
+                "support_score": support_score,
+                "confidence_initial": confidence_initial,
+                "confidence_calibrated": confidence_calibrated,
+                "evidence_span_valid": evidence_valid,
+                "evidence_spans_count": len(spans),
+                "matched_spans_count": len(matched_spans),
+                "rejection_reason": rejection_reason,
+            }
+        )
+
+    if not _table_exists(conn, "macro_event_verifications"):
+        return normalized_results
+    columns = _table_columns(conn, "macro_event_verifications")
+    if not columns:
+        return normalized_results
+
+    for row_data in normalized_results:
+        idx = int(row_data["candidate_index"])
+        verification_id = _md5(f"{run_id}::verification::{idx}")
+        payload = {
+            "verification_id": verification_id,
+            "candidate_id": row_data["candidate_id"],
+            "run_id": run_id,
+            "article_id": chunk["article_id"],
+            "chunk_id": chunk["chunk_id"],
+            "macro_event_index": idx,
+            "verification_status": row_data["verification_status"],
+            "support_score": row_data["support_score"],
+            "confidence_calibrated": row_data["confidence_calibrated"],
+            "evidence_span_valid": 1 if row_data["evidence_span_valid"] else 0,
+            "evidence_spans_count": row_data["evidence_spans_count"],
+            "matched_spans_count": row_data["matched_spans_count"],
+            "rejection_reason": row_data["rejection_reason"],
+            "created_at": _now_utc(),
+        }
+        payload = {k: v for k, v in payload.items() if k in columns}
+        if not payload:
+            continue
+        sql = (
+            f"INSERT OR REPLACE INTO macro_event_verifications ({', '.join(payload.keys())}) "
+            f"VALUES ({', '.join('?' for _ in payload)})"
+        )
+        conn.execute(sql, tuple(payload.values()))
+    conn.commit()
+    return normalized_results
+
+
 def _load_chunks_by_ids(conn: sqlite3.Connection, chunk_ids: list[str]) -> list[dict]:
     if not chunk_ids:
         return []
+    content_class_expr = "a.content_class" if _table_has_column(conn, "articles", "content_class") else "NULL AS content_class"
     placeholders = ",".join("?" for _ in chunk_ids)
     rows = conn.execute(
         f"""
-        SELECT c.chunk_id, c.article_id, c.text, c.token_count, a.title, a.source
+        SELECT c.chunk_id, c.article_id, c.text, c.token_count, a.title, a.source, {content_class_expr}
         FROM chunks c
         JOIN articles a ON a.article_id = c.article_id
         WHERE c.chunk_id IN ({placeholders})
@@ -571,6 +1001,7 @@ def _load_chunks_by_ids(conn: sqlite3.Connection, chunk_ids: list[str]) -> list[
             "token_count": r[3],
             "title": r[4] or "",
             "source": r[5] or "",
+            "content_class": (r[6] or "").strip() if r[6] else "",
         }
         for r in rows
     ]
@@ -659,6 +1090,7 @@ def _review_reasons_for_output(
     was_hard_include: bool,
     events: list[dict],
     enum_audits: list[dict],
+    verification_rows: list[dict[str, Any]] | None = None,
 ) -> list[str]:
     reasons: list[str] = []
     if not events and (was_hard_include or chunk_score >= CHUNK_SCORE_THRESHOLD + 3):
@@ -673,6 +1105,14 @@ def _review_reasons_for_output(
         reasons.append("event_without_asset_impacts")
     if events and any(not ev.get("channels") for ev in events):
         reasons.append("event_without_channels")
+    if verification_rows:
+        statuses = [row.get("verification_status") for row in verification_rows]
+        if statuses and all(status == "rejected" for status in statuses):
+            reasons.append("all_candidates_rejected")
+        if any(status == "weak" for status in statuses):
+            reasons.append("weak_verification_support")
+        if any(not bool(row.get("evidence_span_valid")) for row in verification_rows):
+            reasons.append("invalid_evidence_span")
     return reasons
 
 
@@ -685,27 +1125,28 @@ def _load_unprocessed_chunks(
     rows if reprocess_failed=True).  Also pulls article title and source so
     the prefilter can use them without an extra query.
     """
+    content_class_expr = "a.content_class" if _table_has_column(conn, "articles", "content_class") else "NULL AS content_class"
     if reprocess_failed:
         sql = """
             SELECT c.chunk_id, c.article_id, c.text, c.token_count,
-                   a.title, a.source
+                   a.title, a.source, {content_class_expr}
             FROM chunks c
             JOIN articles a ON a.article_id = c.article_id
             LEFT JOIN macro_extraction_runs r
                    ON r.chunk_id = c.chunk_id AND r.success = 1
             WHERE r.run_id IS NULL
               AND c.token_count >= ?
-        """
+        """.format(content_class_expr=content_class_expr)
     else:
         sql = """
             SELECT c.chunk_id, c.article_id, c.text, c.token_count,
-                   a.title, a.source
+                   a.title, a.source, {content_class_expr}
             FROM chunks c
             JOIN articles a ON a.article_id = c.article_id
             LEFT JOIN macro_extraction_runs r ON r.chunk_id = c.chunk_id
             WHERE r.run_id IS NULL
               AND c.token_count >= ?
-        """
+        """.format(content_class_expr=content_class_expr)
     rows = conn.execute(sql, (MIN_TOKENS,)).fetchall()
     return [
         {
@@ -715,6 +1156,7 @@ def _load_unprocessed_chunks(
             "token_count": r[3],
             "title":       r[4] or "",
             "source":      r[5] or "",
+            "content_class": (r[6] or "").strip() if r[6] else "",
         }
         for r in rows
     ]
@@ -851,6 +1293,7 @@ def run_extraction(
 ) -> None:
     client = _build_client()
     from create_sql_db import create_database, connect_sqlite
+
     create_database(db_path)
     conn = connect_sqlite(db_path)
 
@@ -863,9 +1306,24 @@ def run_extraction(
 
     total = len(chunks)
 
-    # Prefilter — fast, zero-cost pass before any API call
-    surviving = []
+    # Prefilter: quality gate + content-class gate before any API call.
+    surviving: list[dict[str, Any]] = []
+    class_filtered_out = 0
     for chunk in chunks:
+        content_class = (chunk.get("content_class") or "").strip().lower()
+        if content_class and content_class not in ALLOWED_MACRO_CONTENT_CLASSES:
+            class_filtered_out += 1
+            _write_processing_audit(
+                conn,
+                chunk=chunk,
+                stage="class_gate",
+                status="class_filtered",
+                chunk_macro_score=None,
+                was_hard_include=False,
+                review_reasons=[f"content_class_excluded:{content_class}"],
+            )
+            continue
+
         was_hard_include = _article_is_hard_include(chunk.get("source", ""), chunk.get("title", ""))
         chunk_score = _chunk_macro_score(chunk["text"])
         chunk["_hard_macro_hits"] = _count_term_hits(chunk["text"], _HARD_MACRO_TERMS)
@@ -887,27 +1345,22 @@ def run_extraction(
                 was_hard_include=was_hard_include,
                 review_reasons=[],
             )
-    prefiltered_out = total - len(surviving)
+    prefiltered_out = total - class_filtered_out - len(surviving)
 
-    # ------------------------------------------------------------------
-    # Article-level redundancy control — keep only the top-N scoring
-    # chunks per article to avoid paying for redundant API calls across
-    # chunks of the same article.
-    # ------------------------------------------------------------------
-    _article_buckets: dict[str, list[dict]] = defaultdict(list)
+    # Keep only top-N chunks per article to avoid redundant calls.
+    _article_buckets: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for chunk in surviving:
         _article_buckets[chunk["article_id"]].append(chunk)
 
-    dedup_surviving: list[dict] = []
+    dedup_surviving: list[dict[str, Any]] = []
     article_dedup_skipped = 0
-    for _art_chunks in _article_buckets.values():
-        article_is_hard_include = any(bool(c.get("_was_hard_include")) for c in _art_chunks)
-
+    for article_chunks in _article_buckets.values():
+        article_is_hard_include = any(bool(c.get("_was_hard_include")) for c in article_chunks)
         if article_is_hard_include:
-            dedup_surviving.extend(_art_chunks)
+            dedup_surviving.extend(article_chunks)
             continue
 
-        _art_chunks.sort(
+        article_chunks.sort(
             key=lambda c: (
                 c.get("_macro_score", 0),
                 c.get("_title_macro_hits", 0),
@@ -916,48 +1369,45 @@ def run_extraction(
             ),
             reverse=True,
         )
-
-        kept = _art_chunks[:MACRO_MAX_CHUNKS_PER_ARTICLE]
-        dropped = _art_chunks[MACRO_MAX_CHUNKS_PER_ARTICLE:]
+        kept = article_chunks[:MACRO_MAX_CHUNKS_PER_ARTICLE]
+        dropped = article_chunks[MACRO_MAX_CHUNKS_PER_ARTICLE:]
         dedup_surviving.extend(kept)
-
-        for sk in dropped:
+        for dropped_chunk in dropped:
             article_dedup_skipped += 1
             _write_processing_audit(
                 conn,
-                chunk=sk,
+                chunk=dropped_chunk,
                 stage="article_dedup",
                 status="article_dedup_skipped",
-                chunk_macro_score=sk.get("_macro_score"),
-                was_hard_include=bool(sk.get("_was_hard_include")),
+                chunk_macro_score=dropped_chunk.get("_macro_score"),
+                was_hard_include=bool(dropped_chunk.get("_was_hard_include")),
                 review_reasons=["article_level_redundancy_skip"],
             )
     surviving = dedup_surviving
 
     print(
         f"[macro_extract] {total} unprocessed chunks — "
-        f"{prefiltered_out} skipped by prefilter, "
-        f"{article_dedup_skipped} skipped by article dedup, "
-        f"{len(surviving)} sent to Claude"
+        f"{class_filtered_out} class-filtered, "
+        f"{prefiltered_out} prefiltered, "
+        f"{article_dedup_skipped} article-deduped, "
+        f"{len(surviving)} sent to two-pass extraction"
     )
 
     ok = failed = skipped_empty = 0
 
     for i, chunk in enumerate(surviving, 1):
         print(f"  [{i}/{len(surviving)}] chunk {chunk['chunk_id'][:16]}...", end=" ")
-
         run_id = str(uuid.uuid4())
-        success, raw_json, error_text = _call_claude(client, chunk["text"])
 
+        success, raw_json, error_text = _call_candidate_extraction(client, chunk["text"])
         _write_run(conn, run_id, chunk, success, raw_json if success else None, error_text)
-
         if not success:
             print(f"FAILED: {error_text}")
             _write_processing_audit(
                 conn,
                 chunk=chunk,
                 run_id=run_id,
-                stage="model_call",
+                stage="candidate_extraction",
                 status="api_failed",
                 failure_reason=error_text,
                 queue_name=RETRY_QUEUE_NAME,
@@ -972,14 +1422,14 @@ def run_extraction(
 
         try:
             parsed = json.loads(raw_json)
-            events: list[dict] = parsed.get("events", [])
+            candidate_events: list[dict[str, Any]] = parsed.get("events", [])
         except (json.JSONDecodeError, AttributeError) as exc:
             print(f"PARSE_ERROR: {exc}")
             _write_processing_audit(
                 conn,
                 chunk=chunk,
                 run_id=run_id,
-                stage="parse",
+                stage="candidate_parse",
                 status="parse_failed",
                 failure_reason=str(exc),
                 queue_name=RETRY_QUEUE_NAME,
@@ -992,21 +1442,34 @@ def run_extraction(
             failed += 1
             continue
 
-        if not events:
-            print("no events")
+        candidate_events = candidate_events[:4]
+        candidate_events, enum_audits = _enforce_enums(candidate_events)
+        _write_enum_audits(conn, run_id, enum_audits)
+        candidate_ids = _write_candidate_rows(
+            conn,
+            run_id=run_id,
+            chunk=chunk,
+            candidates=candidate_events,
+        )
+        if candidate_events:
+            _write_processing_state_hook(conn, chunk, "macro_candidate_extracted")
+
+        if not candidate_events:
+            print("no candidates")
             review_reasons = _review_reasons_for_output(
                 chunk,
                 chunk_score=int(chunk.get("_macro_score") or 0),
                 was_hard_include=bool(chunk.get("_was_hard_include")),
                 events=[],
-                enum_audits=[],
+                enum_audits=enum_audits,
+                verification_rows=[],
             )
             suspicious = bool(review_reasons)
             _write_processing_audit(
                 conn,
                 chunk=chunk,
                 run_id=run_id,
-                stage="normalize",
+                stage="candidate_extract",
                 status="empty_success",
                 queue_name=REVIEW_QUEUE_NAME if suspicious else None,
                 chunk_macro_score=chunk.get("_macro_score"),
@@ -1019,40 +1482,91 @@ def run_extraction(
             skipped_empty += 1
             continue
 
-        events, enum_audits = _enforce_enums(events)
-        _write_enum_audits(conn, run_id, enum_audits)
+        v_success, v_raw_json, v_error_text = _call_verification(
+            client,
+            chunk_text=chunk["text"],
+            candidates=candidate_events,
+        )
+        verifier_rows: list[dict[str, Any]]
+        if v_success:
+            try:
+                verifier_rows = _extract_verifications(json.loads(v_raw_json))
+            except (json.JSONDecodeError, AttributeError):
+                verifier_rows = []
+        else:
+            verifier_rows = []
+
+        verifier_rows = _write_verification_rows(
+            conn,
+            run_id=run_id,
+            chunk=chunk,
+            candidates=candidate_events,
+            verifications=verifier_rows,
+            candidate_ids=candidate_ids,
+        )
+        verifier_by_index = {row.get("candidate_index"): row for row in verifier_rows}
+
+        verified_events: list[dict[str, Any]] = []
+        weak_count = 0
+        rejected_count = 0
+        for idx, event in enumerate(candidate_events):
+            verification = verifier_by_index.get(idx, {})
+            status = str(verification.get("verification_status") or "weak").lower()
+            if status == "weak":
+                weak_count += 1
+            if status == "rejected":
+                rejected_count += 1
+            calibrated_confidence = _clamp01(
+                verification.get("confidence_calibrated"),
+                default=_clamp01(event.get("confidence"), 0.0),
+            )
+            if status == "verified":
+                verified_events.append({**event, "confidence": calibrated_confidence})
+
+        if verified_events:
+            _write_normalized(conn, run_id, chunk, verified_events)
+            _write_processing_state_hook(conn, chunk, "macro_verified")
+
         review_reasons = _review_reasons_for_output(
             chunk,
             chunk_score=int(chunk.get("_macro_score") or 0),
             was_hard_include=bool(chunk.get("_was_hard_include")),
-            events=events,
+            events=verified_events,
             enum_audits=enum_audits,
+            verification_rows=verifier_rows,
         )
+        if not v_success:
+            review_reasons.append("verification_api_failed")
         suspicious = bool(review_reasons)
-        _write_normalized(conn, run_id, chunk, events)
         _write_processing_audit(
             conn,
             chunk=chunk,
             run_id=run_id,
-            stage="normalize",
-            status="events_written",
+            stage="verification",
+            status="events_written" if verified_events else "verification_rejected",
             queue_name=REVIEW_QUEUE_NAME if suspicious else None,
             chunk_macro_score=chunk.get("_macro_score"),
             was_hard_include=bool(chunk.get("_was_hard_include")),
-            event_count=len(events),
+            event_count=len(verified_events),
             suspicious=suspicious,
             review_reasons=review_reasons,
-            raw_json=raw_json,
+            raw_json=v_raw_json if v_success else raw_json,
         )
-        print(f"{len(events)} event(s)")
-        ok += 1
+
+        print(
+            f"{len(verified_events)} verified "
+            f"(weak={weak_count}, rejected={rejected_count})"
+        )
+        if verified_events:
+            ok += 1
 
     conn.close()
     print(
-        f"\n[macro_extract] done — {ok} chunks with events, "
+        f"\n[macro_extract] done — {ok} chunks with verified events, "
         f"{skipped_empty} empty, {failed} failed, "
+        f"{class_filtered_out} class-filtered, "
         f"{prefiltered_out} prefiltered, "
-        f"{article_dedup_skipped} article-deduped (no API call)"
+        f"{article_dedup_skipped} article-deduped"
     )
 
 
