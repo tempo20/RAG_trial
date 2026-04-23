@@ -104,6 +104,133 @@ NEO4J_BATCH_SIZE = int(os.getenv("NEO4J_BATCH_SIZE", "200"))
 # SQLite store
 SQLITE_DB = os.getenv("SQLITE_DB", "my_database.db")
 
+PROCESSING_STATE_ORDER = {
+    "ingested": 0,
+    "classified": 1,
+    "chunked": 2,
+    "embedded": 3,
+    "entity_resolved": 4,
+    "macro_candidate_extracted": 5,
+    "macro_verified": 6,
+    "graph_synced": 7,
+}
+
+
+def _state_rank_sql(column_name: str = "processing_state") -> str:
+    return (
+        f"CASE COALESCE({column_name}, '') "
+        "WHEN 'ingested' THEN 0 "
+        "WHEN 'classified' THEN 1 "
+        "WHEN 'chunked' THEN 2 "
+        "WHEN 'embedded' THEN 3 "
+        "WHEN 'entity_resolved' THEN 4 "
+        "WHEN 'macro_candidate_extracted' THEN 5 "
+        "WHEN 'macro_verified' THEN 6 "
+        "WHEN 'graph_synced' THEN 7 "
+        "ELSE -1 END"
+    )
+
+
+def _advance_article_processing_state(
+    article_ids: list[str] | set[str],
+    target_state: str,
+    db_path: str = SQLITE_DB,
+) -> int:
+    if target_state not in PROCESSING_STATE_ORDER:
+        return 0
+    ids = sorted({aid for aid in article_ids if aid})
+    if not ids:
+        return 0
+
+    from create_sql_db import connect_sqlite
+    conn = connect_sqlite(db_path)
+    rank = PROCESSING_STATE_ORDER[target_state]
+    rank_expr = _state_rank_sql("processing_state")
+    before = conn.total_changes
+    conn.executemany(
+        (
+            "UPDATE articles "
+            "SET processing_state = ? "
+            "WHERE article_id = ? "
+            f"AND ({rank_expr}) < ?"
+        ),
+        [(target_state, aid, rank) for aid in ids],
+    )
+    conn.commit()
+    changed = conn.total_changes - before
+    conn.close()
+    return int(changed)
+
+
+def _advance_chunk_processing_state(
+    chunk_ids: list[str] | set[str],
+    target_state: str,
+    db_path: str = SQLITE_DB,
+) -> int:
+    if target_state not in PROCESSING_STATE_ORDER:
+        return 0
+    ids = sorted({cid for cid in chunk_ids if cid})
+    if not ids:
+        return 0
+
+    from create_sql_db import connect_sqlite
+    conn = connect_sqlite(db_path)
+    rank = PROCESSING_STATE_ORDER[target_state]
+    rank_expr = _state_rank_sql("processing_state")
+    before = conn.total_changes
+    conn.executemany(
+        (
+            "UPDATE chunks "
+            "SET processing_state = ? "
+            "WHERE chunk_id = ? "
+            f"AND ({rank_expr}) < ?"
+        ),
+        [(target_state, cid, rank) for cid in ids],
+    )
+    conn.commit()
+    changed = conn.total_changes - before
+    conn.close()
+    return int(changed)
+
+
+def _advance_articles_to_embedded_when_ready(
+    db_path: str = SQLITE_DB,
+    article_ids: list[str] | set[str] | None = None,
+) -> int:
+    from create_sql_db import connect_sqlite
+    conn = connect_sqlite(db_path, fk=False)
+    conn.row_factory = sqlite3.Row
+    params: list[str] = []
+    where_clause = ""
+    if article_ids is not None:
+        ids = sorted({aid for aid in article_ids if aid})
+        if not ids:
+            conn.close()
+            return 0
+        placeholders = ",".join("?" for _ in ids)
+        where_clause = f"WHERE c.article_id IN ({placeholders})"
+        params = ids
+
+    rows = conn.execute(
+        f"""
+        SELECT c.article_id
+        FROM chunks c
+        {where_clause}
+        GROUP BY c.article_id
+        HAVING SUM(
+            CASE
+                WHEN c.embedding_json IS NULL OR c.embedding_json = '' THEN 1
+                ELSE 0
+            END
+        ) = 0
+        """
+        ,
+        params,
+    ).fetchall()
+    conn.close()
+    ready_article_ids = {row["article_id"] for row in rows if row["article_id"]}
+    return _advance_article_processing_state(ready_article_ids, "embedded", db_path)
+
 
 # Helpers
 
@@ -181,7 +308,9 @@ def load_articles_from_sqlite(db_path: str = SQLITE_DB) -> list[dict]:
     conn.row_factory = sqlite3.Row
     rows = conn.execute(
         "SELECT article_id, url, title, source, source_rss, "
-        "published_at, scraped_at_utc, content_hash, status, raw_text "
+        "published_at, scraped_at_utc, content_hash, status, raw_text, "
+        "source_trust_tier, content_class, article_quality_score, quality_flags_json, "
+        "processing_state "
         "FROM articles"
     ).fetchall()
     conn.close()
@@ -197,6 +326,11 @@ def load_articles_from_sqlite(db_path: str = SQLITE_DB) -> list[dict]:
             "content_hash":  r["content_hash"],
             "status":        r["status"] or "ok",
             "text":          r["raw_text"],
+            "source_trust_tier": r["source_trust_tier"],
+            "content_class": r["content_class"],
+            "article_quality_score": r["article_quality_score"],
+            "quality_flags_json": r["quality_flags_json"],
+            "processing_state": r["processing_state"],
         }
         for r in rows
     ]
@@ -393,6 +527,10 @@ def build_chunks(articles: list[dict]) -> list[dict]:
                 "published_date": art["published_dt"].strftime("%Y-%m-%d"),
                 "period_key":     art["period_key"],
                 "token_count":    _approx_tokens(block),
+                "topic_labels_json": None,
+                "theme_id": None,
+                "theme_label": None,
+                "theme_confidence": None,
                 # Populated later by embed_chunks()
                 "embedding":      None,
             })
@@ -1155,7 +1293,7 @@ def run_sqlite_pass(
     keep_per_singletons: if True, skips the PER singleton filter so all
     extracted person entities are written regardless of chunk frequency.
     """
-    from create_sql_db import create_database, connect_sqlite, ensure_migrations
+    from create_sql_db import create_database, ensure_migrations
     create_database(db_path)
     ensure_migrations(db_path)
 
@@ -1169,6 +1307,11 @@ def run_sqlite_pass(
 
     articles = filter_articles(raw_articles, skip_ids)
     print(f"[sqlite_pass] {len(articles)} new articles after filtering")
+    article_ids = [a["article_id"] for a in articles]
+    if article_ids:
+        advanced = _advance_article_processing_state(article_ids, "classified", db_path)
+        if advanced:
+            print(f"[sqlite_pass] state update: {advanced} article(s) -> classified")
 
     if not articles:
         print("[sqlite_pass] Nothing new to process.")
@@ -1178,6 +1321,9 @@ def run_sqlite_pass(
             print("[sqlite_pass] Backfilling missing chunk embeddings ...")
             backfilled = backfill_chunk_embeddings_sqlite(db_path=db_path)
             print(f"[sqlite_pass] Backfilled {backfilled} chunk embedding(s)")
+            embedded = _advance_articles_to_embedded_when_ready(db_path=db_path)
+            if embedded:
+                print(f"[sqlite_pass] state update: {embedded} article(s) -> embedded")
         print("[sqlite_pass] Running integrity checks ...")
         run_integrity_check(db_path)
         print("[sqlite_pass] Done.")
@@ -1186,8 +1332,15 @@ def run_sqlite_pass(
     # Chunk
     print("[sqlite_pass] Chunking ...")
     chunks = build_chunks(articles)
+    chunk_ids = [c["chunk_uid"] for c in chunks]
     print(f"[sqlite_pass] {len(chunks)} chunks produced")
     _upsert_chunks_sqlite(chunks, db_path)
+    chunk_advanced = _advance_chunk_processing_state(chunk_ids, "chunked", db_path)
+    if chunk_advanced:
+        print(f"[sqlite_pass] state update: {chunk_advanced} chunk(s) -> chunked")
+    advanced = _advance_article_processing_state(article_ids, "chunked", db_path)
+    if advanced:
+        print(f"[sqlite_pass] state update: {advanced} article(s) -> chunked")
 
     if skip_embeddings:
         print("[sqlite_pass] Skipping chunk embeddings (--skip-embeddings)")
@@ -1195,6 +1348,9 @@ def run_sqlite_pass(
         print("[sqlite_pass] Backfilling missing chunk embeddings ...")
         backfilled = backfill_chunk_embeddings_sqlite(db_path=db_path)
         print(f"[sqlite_pass] Backfilled {backfilled} chunk embedding(s)")
+        advanced = _advance_articles_to_embedded_when_ready(db_path=db_path, article_ids=article_ids)
+        if advanced:
+            print(f"[sqlite_pass] state update: {advanced} article(s) -> embedded")
 
     # Entity extraction
     if not skip_entities:
@@ -1210,6 +1366,12 @@ def run_sqlite_pass(
             mentions = _drop_per_singletons(mentions)
             print(f"[sqlite_pass] {len(mentions)} mentions after PER singleton filter")
         _upsert_entity_mentions_sqlite(mentions, db_path)
+        chunk_advanced = _advance_chunk_processing_state(chunk_ids, "entity_resolved", db_path)
+        article_advanced = _advance_article_processing_state(article_ids, "entity_resolved", db_path)
+        if chunk_advanced:
+            print(f"[sqlite_pass] state update: {chunk_advanced} chunk(s) -> entity_resolved")
+        if article_advanced:
+            print(f"[sqlite_pass] state update: {article_advanced} article(s) -> entity_resolved")
 
         del pipe
         gc.collect()
@@ -1233,8 +1395,9 @@ def _upsert_chunks_sqlite(chunks: list[dict], db_path: str = SQLITE_DB) -> None:
     for c in chunks:
         cur = conn.execute(
             "INSERT OR IGNORE INTO chunks "
-            "(chunk_id, article_id, chunk_index, text, token_count, published_date, period_key, embedding_json) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, NULL)",
+            "(chunk_id, article_id, chunk_index, text, token_count, published_date, period_key, "
+            "embedding_json, topic_labels_json, theme_id, theme_label, theme_confidence, processing_state) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?)",
             (
                 c["chunk_uid"],
                 c["article_id"],
@@ -1243,6 +1406,11 @@ def _upsert_chunks_sqlite(chunks: list[dict], db_path: str = SQLITE_DB) -> None:
                 c.get("token_count"),
                 c.get("published_date"),
                 c.get("period_key"),
+                c.get("topic_labels_json"),
+                c.get("theme_id"),
+                c.get("theme_label"),
+                c.get("theme_confidence"),
+                "chunked",
             ),
         )
         inserted += cur.rowcount
@@ -1318,7 +1486,14 @@ def _write_chunk_embeddings_sqlite(
     from create_sql_db import connect_sqlite
     conn = connect_sqlite(db_path)
     conn.executemany(
-        "UPDATE chunks SET embedding_json = ? WHERE chunk_id = ?",
+        "UPDATE chunks "
+        "SET embedding_json = ?, "
+        "processing_state = CASE "
+        "  WHEN processing_state IS NULL OR processing_state IN ('chunked', 'classified', 'ingested') "
+        "  THEN 'embedded' "
+        "  ELSE processing_state "
+        "END "
+        "WHERE chunk_id = ?",
         rows,
     )
     conn.commit()
