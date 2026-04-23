@@ -18,3 +18,4 @@ my_database_snapshot.db
 !prompt_templates.json
 !ticker_company_map.csv
 !notebooks/test.py
+!timesfm*
