@@ -183,6 +183,52 @@ def show_questionable_events(db_path: str, limit: int) -> None:
     conn.close()
 
 
+def show_latest_stream_briefs(db_path: str, limit: int = 20) -> None:
+    conn = _connect(db_path)
+    rows = conn.execute(
+        """
+        SELECT
+            source,
+            title,
+            substr(raw_text, 1, 280) AS summary,
+            content_class,
+            article_quality_score,
+            quality_flags_json,
+            published_at,
+            scraped_at_utc
+        FROM articles
+        WHERE source = 'TradingEconomics'
+          AND source_provider = 'stream'
+        ORDER BY coalesce(published_at, scraped_at_utc) DESC
+        LIMIT ?
+        """,
+        (limit,),
+    ).fetchall()
+    if not rows:
+        print("[analyst] no TradingEconomics stream briefs found")
+        conn.close()
+        return
+
+    for row in rows:
+        flags = []
+        try:
+            payload = json.loads(row["quality_flags_json"] or "{}")
+            if isinstance(payload, dict):
+                flags = payload.get("flags") or []
+            elif isinstance(payload, list):
+                flags = payload
+        except json.JSONDecodeError:
+            flags = []
+        print(
+            f"- source={row['source']} class={row['content_class']} "
+            f"quality={row['article_quality_score']} date={row['published_at'] or row['scraped_at_utc']}"
+        )
+        print(f"  title: {row['title']}")
+        print(f"  summary: {row['summary']}")
+        print(f"  flags: {', '.join(str(flag) for flag in flags) or '-'}")
+    conn.close()
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Analyst-facing SQLite inspection tools")
     parser.add_argument("--db", default="my_database.db", help="Path to SQLite DB")
@@ -201,6 +247,9 @@ def main() -> None:
     questionable_parser = subparsers.add_parser("questionable-events", help="Show suspicious or questionable events")
     questionable_parser.add_argument("--limit", type=int, default=20, help="Rows to print")
 
+    stream_parser = subparsers.add_parser("latest-stream-briefs", help="Show latest TradingEconomics stream briefs")
+    stream_parser.add_argument("--limit", type=int, default=20, help="Rows to print")
+
     args = parser.parse_args()
     if args.command == "latest-events":
         show_latest_macro_events(args.db, args.limit, args.min_confidence)
@@ -210,6 +259,8 @@ def main() -> None:
         show_entities_with_most_impact_links(args.db, args.limit)
     elif args.command == "questionable-events":
         show_questionable_events(args.db, args.limit)
+    elif args.command == "latest-stream-briefs":
+        show_latest_stream_briefs(args.db, args.limit)
 
 
 if __name__ == "__main__":

@@ -91,6 +91,9 @@ FIN_LINK_ENABLE_FUZZY = os.getenv("FIN_LINK_ENABLE_FUZZY", "1").strip().lower() 
 
 # Minimum article quality gate
 MIN_ARTICLE_WORDS = int(os.getenv("MIN_ARTICLE_WORDS", "80"))
+STREAM_BRIEF_MIN_WORDS = int(os.getenv("TRADINGECONOMICS_MIN_WORDS", "20"))
+STREAM_BRIEF_SINGLE_CHUNK_MAX_WORDS = int(os.getenv("STREAM_BRIEF_SINGLE_CHUNK_MAX_WORDS", "180"))
+STREAM_BRIEF_MAX_ENTITIES_PER_CHUNK = int(os.getenv("STREAM_BRIEF_MAX_ENTITIES_PER_CHUNK", "4"))
 
 # Deduplication (ingestion-authoritative)
 ENABLE_MINHASH_DEDUP = os.getenv("ENABLE_MINHASH_DEDUP", "1").strip().lower() in {"1", "true", "yes", "on"}
@@ -307,7 +310,7 @@ def load_articles_from_sqlite(db_path: str = SQLITE_DB) -> list[dict]:
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
     rows = conn.execute(
-        "SELECT article_id, url, title, source, source_rss, "
+        "SELECT article_id, url, title, source, source_rss, source_provider, "
         "published_at, scraped_at_utc, content_hash, status, raw_text, "
         "source_trust_tier, content_class, article_quality_score, quality_flags_json, "
         "processing_state "
@@ -321,6 +324,7 @@ def load_articles_from_sqlite(db_path: str = SQLITE_DB) -> list[dict]:
             "title":         r["title"],
             "source":        r["source"],
             "source_rss":    r["source_rss"],
+            "source_provider": r["source_provider"],
             "published":     r["published_at"],
             "scraped_at_utc": r["scraped_at_utc"],
             "content_hash":  r["content_hash"],
@@ -370,8 +374,13 @@ def filter_articles(
         if not text:
             continue
 
+        content_class = str(art.get("content_class") or "").strip().lower()
+        min_words_for_article = min_words
+        if content_class == "stream_brief":
+            min_words_for_article = max(1, STREAM_BRIEF_MIN_WORDS)
+
         # Minimum length gate
-        if len(text.split()) < min_words:
+        if len(text.split()) < min_words_for_article:
             continue
 
         # Content-hash deduplication (catches same article at different URLs)
@@ -405,6 +414,7 @@ def filter_articles(
             "period_key":   period_key,
             "content_hash": chash,
             "text":         text,
+            "content_class": content_class,
         })
 
     if not candidates:
@@ -516,7 +526,12 @@ def build_chunks(articles: list[dict]) -> list[dict]:
     """
     all_chunks = []
     for art in articles:
-        text_blocks = chunk_text(art["text"])
+        content_class = str(art.get("content_class") or "").strip().lower()
+        words = len((art.get("text") or "").split())
+        if content_class == "stream_brief" and words <= STREAM_BRIEF_SINGLE_CHUNK_MAX_WORDS:
+            text_blocks = [art["text"].strip()]
+        else:
+            text_blocks = chunk_text(art["text"])
         for i, block in enumerate(text_blocks):
             chunk_uid = f"{art['article_id']}::chunk::{i}"
             all_chunks.append({
@@ -531,6 +546,7 @@ def build_chunks(articles: list[dict]) -> list[dict]:
                 "theme_id": None,
                 "theme_label": None,
                 "theme_confidence": None,
+                "content_class": content_class,
                 # Populated later by embed_chunks()
                 "embedding":      None,
             })
@@ -907,6 +923,8 @@ def extract_entities_from_chunks(
             batch_results = [[] for _ in batch_chunks]
 
         for chunk, ner_result in zip(batch_chunks, batch_results):
+            is_stream_brief = str(chunk.get("content_class") or "").strip().lower() == "stream_brief"
+            stream_mentions_kept = 0
             for ent in ner_result:
                 etype = ent.get("entity_group") or ent.get("entity", "")
                 etype = re.sub(r"^[BI]-", "", etype)
@@ -947,10 +965,20 @@ def extract_entities_from_chunks(
                 else:
                     continue
 
+                if is_stream_brief:
+                    if resolved_type == "PER":
+                        continue
+                    if link_method == "ner_heuristic" and resolved_type in {"ORG", "MISC"}:
+                        continue
+                    if stream_mentions_kept >= STREAM_BRIEF_MAX_ENTITIES_PER_CHUNK:
+                        continue
+
                 key = (chunk["chunk_uid"], canonical_name)
                 if key in seen:
                     continue
                 seen.add(key)
+                if is_stream_brief:
+                    stream_mentions_kept += 1
 
                 mentions.append({
                     "chunk_uid":      chunk["chunk_uid"],

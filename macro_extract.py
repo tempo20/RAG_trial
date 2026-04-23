@@ -20,6 +20,7 @@ import hashlib
 import importlib
 import json
 import os
+import re
 import sqlite3
 import uuid
 from collections import defaultdict
@@ -51,7 +52,11 @@ ALLOWED_MACRO_CONTENT_CLASSES: frozenset[str] = frozenset({
     "news_report",
     "analysis",
     "official_release",
+    "stream_brief",
 })
+
+STREAM_BRIEF_MAX_CONFIDENCE = float(os.getenv("STREAM_BRIEF_MAX_CONFIDENCE", "0.62"))
+STREAM_BRIEF_MIN_SUPPORT_SCORE = float(os.getenv("STREAM_BRIEF_MIN_SUPPORT_SCORE", "0.74"))
 
 VERIFICATION_STATUS_ALLOWED: frozenset[str] = frozenset({"verified", "weak", "rejected"})
 VERIFIER_REJECT_SUPPORT_THRESHOLD = float(os.getenv("MACRO_VERIFIER_REJECT_THRESHOLD", "0.35"))
@@ -530,6 +535,14 @@ _TITLE_MACRO_KEYWORDS: list[str] = [
     "rate hike", "rate cut", "central bank",
 ]
 
+_STREAM_BRIEF_EXPLICIT_PATTERNS: list[tuple[str, str]] = [
+    (r"\b(rate decision|raised rates?|cut rates?|kept rates? (?:unchanged|steady)|policy rate)\b", "rate_decision"),
+    (r"\b(cpi|inflation|consumer price index|pce)\b.*\b(release|rose|fell|accelerat|decelerat|surpris)", "inflation_release"),
+    (r"\b(gdp|gross domestic product)\b.*\b(release|grew|contract|surpris)", "gdp_release"),
+    (r"\b(nonfarm payroll|payrolls|unemployment|jobless claims|labor market)\b.*\b(release|rose|fell|surpris)", "labor_release"),
+    (r"\b(sanction|tariff|blockade|export ban|import ban|embargo|supply disruption)\b", "policy_supply_action"),
+]
+
 
 def _article_is_hard_include(source: str, title: str) -> bool:
     """Return True if every chunk from this article should always be sent to Claude."""
@@ -548,6 +561,18 @@ def _chunk_macro_score(text: str) -> int:
     directional_hits = _count_term_hits(low, _DIRECTIONAL_TERMS)
     noise_hits = _count_term_hits(low, _NOISE_TERMS)
     return 2 * hard_hits + directional_hits - 2 * noise_hits
+
+
+def _is_stream_brief_explicit(chunk: dict[str, Any]) -> tuple[bool, list[str]]:
+    text = str(chunk.get("text") or "")
+    title = str(chunk.get("title") or "")
+    combined = f"{title} {text}".lower()
+    matched = [
+        reason
+        for pattern, reason in _STREAM_BRIEF_EXPLICIT_PATTERNS
+        if re.search(pattern, combined)
+    ]
+    return bool(matched), matched
 
 
 def _should_process_chunk(chunk: dict) -> bool:
@@ -1125,7 +1150,9 @@ def _load_unprocessed_chunks(
     rows if reprocess_failed=True).  Also pulls article title and source so
     the prefilter can use them without an extra query.
     """
-    content_class_expr = "a.content_class" if _table_has_column(conn, "articles", "content_class") else "NULL AS content_class"
+    has_content_class = _table_has_column(conn, "articles", "content_class")
+    content_class_expr = "a.content_class" if has_content_class else "NULL AS content_class"
+    stream_token_exception = " OR a.content_class = 'stream_brief'" if has_content_class else ""
     if reprocess_failed:
         sql = """
             SELECT c.chunk_id, c.article_id, c.text, c.token_count,
@@ -1135,8 +1162,8 @@ def _load_unprocessed_chunks(
             LEFT JOIN macro_extraction_runs r
                    ON r.chunk_id = c.chunk_id AND r.success = 1
             WHERE r.run_id IS NULL
-              AND c.token_count >= ?
-        """.format(content_class_expr=content_class_expr)
+              AND (c.token_count >= ?{stream_token_exception})
+        """.format(content_class_expr=content_class_expr, stream_token_exception=stream_token_exception)
     else:
         sql = """
             SELECT c.chunk_id, c.article_id, c.text, c.token_count,
@@ -1145,8 +1172,8 @@ def _load_unprocessed_chunks(
             JOIN articles a ON a.article_id = c.article_id
             LEFT JOIN macro_extraction_runs r ON r.chunk_id = c.chunk_id
             WHERE r.run_id IS NULL
-              AND c.token_count >= ?
-        """.format(content_class_expr=content_class_expr)
+              AND (c.token_count >= ?{stream_token_exception})
+        """.format(content_class_expr=content_class_expr, stream_token_exception=stream_token_exception)
     rows = conn.execute(sql, (MIN_TOKENS,)).fetchall()
     return [
         {
@@ -1324,6 +1351,22 @@ def run_extraction(
             )
             continue
 
+        if content_class == "stream_brief":
+            explicit_ok, explicit_reasons = _is_stream_brief_explicit(chunk)
+            if not explicit_ok:
+                _write_processing_audit(
+                    conn,
+                    chunk=chunk,
+                    stage="prefilter",
+                    status="prefilter_skipped",
+                    chunk_macro_score=0,
+                    was_hard_include=False,
+                    review_reasons=["stream_brief_skipped", "stream_brief_low_context"],
+                )
+                continue
+            chunk["_stream_brief_explicit_reasons"] = explicit_reasons
+            chunk["_stream_brief_explicit"] = True
+
         was_hard_include = _article_is_hard_include(chunk.get("source", ""), chunk.get("title", ""))
         chunk_score = _chunk_macro_score(chunk["text"])
         chunk["_hard_macro_hits"] = _count_term_hits(chunk["text"], _HARD_MACRO_TERMS)
@@ -1331,6 +1374,8 @@ def run_extraction(
         chunk["_noise_hits"] = _count_term_hits(chunk["text"], _NOISE_TERMS)
         chunk["_title_macro_hits"] = _count_term_hits(chunk.get("title", ""), _TITLE_MACRO_KEYWORDS)
         should_process = was_hard_include or chunk_score >= CHUNK_SCORE_THRESHOLD
+        if content_class == "stream_brief":
+            should_process = bool(chunk.get("_stream_brief_explicit"))
         chunk["_macro_score"] = chunk_score
         chunk["_was_hard_include"] = was_hard_include
         if should_process:
@@ -1509,6 +1554,8 @@ def run_extraction(
         verified_events: list[dict[str, Any]] = []
         weak_count = 0
         rejected_count = 0
+        stream_brief_low_context_rejected = False
+        is_stream_brief = (chunk.get("content_class") or "").strip().lower() == "stream_brief"
         for idx, event in enumerate(candidate_events):
             verification = verifier_by_index.get(idx, {})
             status = str(verification.get("verification_status") or "weak").lower()
@@ -1520,6 +1567,13 @@ def run_extraction(
                 verification.get("confidence_calibrated"),
                 default=_clamp01(event.get("confidence"), 0.0),
             )
+            if is_stream_brief:
+                support_score = _clamp01(verification.get("support_score"), 0.0)
+                evidence_valid = bool(verification.get("evidence_span_valid"))
+                if status != "verified" or support_score < STREAM_BRIEF_MIN_SUPPORT_SCORE or not evidence_valid:
+                    stream_brief_low_context_rejected = True
+                    continue
+                calibrated_confidence = min(calibrated_confidence, STREAM_BRIEF_MAX_CONFIDENCE)
             if status == "verified":
                 verified_events.append({**event, "confidence": calibrated_confidence})
 
@@ -1535,6 +1589,10 @@ def run_extraction(
             enum_audits=enum_audits,
             verification_rows=verifier_rows,
         )
+        if is_stream_brief and not verified_events:
+            review_reasons.extend(["stream_brief_skipped", "stream_brief_low_context"])
+        elif stream_brief_low_context_rejected:
+            review_reasons.append("stream_brief_low_context")
         if not v_success:
             review_reasons.append("verification_api_failed")
         suspicious = bool(review_reasons)

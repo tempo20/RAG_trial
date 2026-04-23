@@ -23,10 +23,11 @@ import random
 import sqlite3
 import time
 import re
+from html import unescape
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urljoin
 
 try:
     import aiohttp
@@ -36,6 +37,10 @@ except ImportError:  # pragma: no cover - exercised in dependency-light envs
 import feedparser
 import requests
 from dotenv import load_dotenv
+try:
+    from bs4 import BeautifulSoup
+except ImportError:  # pragma: no cover - exercised in dependency-light envs
+    BeautifulSoup = None
 try:
     import trafilatura
 except ImportError:  # pragma: no cover - exercised in dependency-light envs
@@ -124,6 +129,52 @@ RETRYABLE_STATUS_CODES = frozenset({408, 429, 500, 502, 503, 504})
 
 MIN_ARTICLE_WORDS = int(os.getenv("MIN_ARTICLE_WORDS", "80"))
 MIN_FEED_WORDS = int(os.getenv("MIN_FEED_WORDS", "40"))
+ENABLE_TRADINGECONOMICS_STREAM = os.getenv("ENABLE_TRADINGECONOMICS_STREAM", "0").strip().lower() in {"1", "true", "yes", "on"}
+TRADINGECONOMICS_STREAM_URL = os.getenv("TRADINGECONOMICS_STREAM_URL", "https://tradingeconomics.com/stream").strip()
+TRADINGECONOMICS_MAX_ITEMS = int(os.getenv("TRADINGECONOMICS_MAX_ITEMS", "60"))
+TRADINGECONOMICS_MIN_WORDS = int(os.getenv("TRADINGECONOMICS_MIN_WORDS", "8"))
+TRADINGECONOMICS_MAX_WORDS = int(os.getenv("TRADINGECONOMICS_MAX_WORDS", "240"))
+TRADINGECONOMICS_MAX_AGE_HOURS = int(os.getenv("TRADINGECONOMICS_MAX_AGE_HOURS", "24"))
+TRADINGECONOMICS_STREAM_DEBUG = os.getenv("TRADINGECONOMICS_STREAM_DEBUG", "0").strip().lower() in {"1", "true", "yes", "on"}
+TRADINGECONOMICS_DEBUG_HTML_PATH = os.getenv("TRADINGECONOMICS_DEBUG_HTML_PATH", "").strip()
+TRADINGECONOMICS_STRICT_FILTER = os.getenv("TRADINGECONOMICS_STRICT_FILTER", "0").strip().lower() in {"1", "true", "yes", "on"}
+
+_TE_STREAM_NAV_TERMS = (
+    "home", "markets", "calendar", "forecast", "indicators", "news",
+    "stream", "portfolio", "screeners", "currencies", "commodities",
+    "stocks", "bonds", "crypto", "watchlist", "screener", "login",
+    "sign in", "sign up", "pricing", "advertise", "download app",
+)
+_TE_STREAM_EXCLUDE_HINTS = (
+    "quote", "quotes", "board", "market-board", "calendar", "ticker",
+    "watchlist", "navbar", "header", "footer", "menu", "sidenav",
+    "breadcrumb", "search", "chart", "price-table",
+)
+_TE_STREAM_ITEM_HINTS = (
+    "stream", "timeline", "news", "event", "update", "story", "brief",
+)
+_TE_STREAM_MACRO_TERMS = (
+    "inflation", "cpi", "pce", "gdp", "unemployment", "payroll",
+    "rate", "interest", "central bank", "federal reserve", "ecb",
+    "boj", "pboc", "treasury", "bond", "yield", "tariff", "sanction",
+    "blockade", "supply disruption", "trade", "oil", "gas", "energy",
+    "commodity", "currency", "fx", "fiscal", "monetary", "deficit",
+    "export", "import", "economic", "economy",
+)
+_TE_STREAM_STOCK_BLURB_TERMS = (
+    "stock", "shares", "eps", "quarter", "guidance", "buyback",
+    "dividend", "earnings",
+)
+_TE_STREAM_REQUEST_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0.0.0 Safari/537.36"
+    ),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Referer": "https://tradingeconomics.com/",
+}
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -210,7 +261,8 @@ def fetch_json_with_backoff(
     params: dict[str, Any],
     timeout: int = REQUEST_TIMEOUT,
     max_attempts: int = HTTP_MAX_ATTEMPTS,
-) -> tuple[dict[str, Any] | None, str | None, int]:
+    request_headers: dict[str, str] | None = None,
+) -> tuple[Any | None, str | None, int]:
     """
     Returns (payload, error, requests_made).
     """
@@ -224,7 +276,7 @@ def fetch_json_with_backoff(
                 url,
                 params=params,
                 timeout=timeout,
-                headers={"User-Agent": "Mozilla/5.0"},
+                headers=request_headers or {"User-Agent": "Mozilla/5.0"},
             )
 
             if _is_retryable_status(resp.status_code):
@@ -269,6 +321,7 @@ def fetch_text_with_backoff(
     url: str,
     timeout: int = REQUEST_TIMEOUT,
     max_attempts: int = HTTP_MAX_ATTEMPTS,
+    request_headers: dict[str, str] | None = None,
 ) -> tuple[str | None, str | None]:
     last_error: str | None = None
 
@@ -277,7 +330,7 @@ def fetch_text_with_backoff(
             resp = session.get(
                 url,
                 timeout=timeout,
-                headers={"User-Agent": "Mozilla/5.0"},
+                headers=request_headers or {"User-Agent": "Mozilla/5.0"},
             )
 
             if _is_retryable_status(resp.status_code):
@@ -312,6 +365,564 @@ def fetch_text_with_backoff(
         time.sleep(_backoff_delay(attempt))
 
     return None, last_error
+
+
+# ---------------------------------------------------------------------------
+# TradingEconomics stream briefs (short-form, low-context auxiliary source)
+# ---------------------------------------------------------------------------
+
+def _te_norm_text(text: str) -> str:
+    cleaned = unescape(str(text or ""))
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    return cleaned
+
+
+def _te_stream_title(text: str) -> str:
+    sentence = re.split(r"(?<=[.!?])\s+", text, maxsplit=1)[0].strip()
+    if sentence:
+        return sentence[:160]
+    words = text.split()
+    return " ".join(words[:12]).strip() or "TradingEconomics Stream Brief"
+
+
+def _te_symbol_density(text: str) -> float:
+    if not text:
+        return 1.0
+    symbol_count = sum(1 for ch in text if not ch.isalnum() and not ch.isspace())
+    return symbol_count / max(len(text), 1)
+
+
+def _te_numeric_density(text: str) -> float:
+    tokens = re.findall(r"\S+", text)
+    if not tokens:
+        return 1.0
+    numeric_like = sum(
+        1
+        for tok in tokens
+        if re.fullmatch(r"[+\-]?\$?[0-9.,:%/]+[kmb]?", tok.lower())
+    )
+    return numeric_like / max(len(tokens), 1)
+
+
+def _te_is_stock_blurb(text: str) -> bool:
+    lower = text.lower()
+    has_stock_term = any(term in lower for term in _TE_STREAM_STOCK_BLURB_TERMS)
+    has_macro_term = any(term in lower for term in _TE_STREAM_MACRO_TERMS)
+    return has_stock_term and not has_macro_term
+
+
+def is_valid_te_stream_item(text: str) -> bool:
+    # Base filter: keep broad stream coverage and let downstream ranking score quality.
+    clean = _te_norm_text(text)
+    if not clean:
+        return False
+
+    words = re.findall(r"[A-Za-z0-9$%.-]+", clean)
+    word_count = len(words)
+    if word_count < TRADINGECONOMICS_MIN_WORDS or word_count > TRADINGECONOMICS_MAX_WORDS:
+        return False
+
+    lower = clean.lower()
+    if any(nav in lower for nav in _TE_STREAM_NAV_TERMS):
+        nav_hits = sum(1 for nav in _TE_STREAM_NAV_TERMS if nav in lower)
+        if nav_hits >= 4:
+            return False
+
+    alpha_tokens = sum(1 for tok in words if re.search(r"[A-Za-z]", tok))
+    if alpha_tokens / max(word_count, 1) < 0.35:
+        return False
+
+    if not TRADINGECONOMICS_STRICT_FILTER:
+        return True
+
+    # Optional strict filter for users who only want macro-heavy, low-noise briefs.
+    if _te_symbol_density(clean) > 0.24:
+        return False
+    if _te_numeric_density(clean) > 0.55:
+        return False
+
+    if _te_is_stock_blurb(clean):
+        return False
+
+    if re.search(r"\b(open|high|low|close|bid|ask|volume|change)\b", lower) and re.search(r"\b\d", lower):
+        return False
+    if re.search(r"\b\d+(?:\.\d+)?\s*(?:up|down)\s*\d+(?:\.\d+)?%?\b", lower):
+        return False
+
+    return True
+
+
+def _te_parse_stream_date(raw: str, *, now_utc: datetime) -> datetime | None:
+    clean = _te_norm_text(raw)
+    if not clean:
+        return None
+
+    lower = clean.lower()
+    if lower in {"now", "just now", "moments ago"}:
+        return now_utc
+    if lower == "yesterday":
+        return now_utc - timedelta(days=1)
+
+    rel_match = re.search(
+        r"\b(?:(an?|one)|(\d+))\s*(second|sec|minute|min|hour|hr|day|week|month|year)s?\s+ago\b",
+        lower,
+    )
+    if rel_match:
+        qty = 1 if (rel_match.group(1) or "").strip() else int(rel_match.group(2))
+        unit = rel_match.group(3)
+        if unit in {"second", "sec"}:
+            delta = timedelta(seconds=qty)
+        elif unit in {"minute", "min"}:
+            delta = timedelta(minutes=qty)
+        elif unit in {"hour", "hr"}:
+            delta = timedelta(hours=qty)
+        elif unit == "day":
+            delta = timedelta(days=qty)
+        elif unit == "week":
+            delta = timedelta(days=7 * qty)
+        elif unit == "month":
+            delta = timedelta(days=30 * qty)
+        else:
+            delta = timedelta(days=365 * qty)
+        return now_utc - delta
+
+    iso_raw = clean.replace("Z", "+00:00")
+    try:
+        parsed_iso = datetime.fromisoformat(iso_raw)
+        if parsed_iso.tzinfo is None:
+            parsed_iso = parsed_iso.replace(tzinfo=timezone.utc)
+        return parsed_iso.astimezone(timezone.utc)
+    except ValueError:
+        pass
+
+    compact = clean.replace("-", "").replace(":", "").replace("Z", "")
+    parsed_alpha = _parse_alpha_datetime(compact)
+    if parsed_alpha is not None:
+        return parsed_alpha
+
+    for fmt in (
+        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%d %H:%M",
+        "%Y-%m-%d",
+        "%b %d, %Y %I:%M %p",
+        "%b %d, %Y %H:%M",
+        "%d %b %Y %H:%M",
+        "%m/%d/%Y %I:%M %p",
+        "%m/%d/%Y %H:%M",
+        "%m/%d/%Y",
+    ):
+        try:
+            return datetime.strptime(clean, fmt).replace(tzinfo=timezone.utc)
+        except ValueError:
+            continue
+    return None
+
+
+def _te_extract_published(node, *, now_utc: datetime) -> datetime | None:
+    if node is None:
+        return None
+
+    stream_date_tag = node.select_one(".te-stream-date")
+    if stream_date_tag is not None:
+        raw_stream_date = (stream_date_tag.get_text(" ", strip=True) or "").strip()
+        parsed_stream_date = _te_parse_stream_date(raw_stream_date, now_utc=now_utc)
+        if parsed_stream_date is not None:
+            return parsed_stream_date
+
+    time_tag = node.find("time")
+    if time_tag is not None:
+        raw_time = (time_tag.get("datetime") or time_tag.get_text(" ", strip=True) or "").strip()
+        parsed_time = _te_parse_stream_date(raw_time, now_utc=now_utc)
+        if parsed_time is not None:
+            return parsed_time
+    return None
+
+
+def _te_container_is_excluded(node) -> bool:
+    attrs = " ".join(
+        str(val)
+        for attr in ("id", "class", "role", "data-module", "data-widget")
+        for val in ([node.get(attr)] if node.get(attr) is not None else [])
+    ).lower()
+    return any(hint in attrs for hint in _TE_STREAM_EXCLUDE_HINTS)
+
+
+def _te_extract_regex_candidates(
+    html: str,
+    *,
+    now_utc: datetime,
+) -> list[tuple[str, datetime | None]]:
+    candidates: list[tuple[str, datetime | None]] = []
+
+    li_blocks = re.findall(
+        r"<li[^>]*class=[\"'][^\"']*te-stream-item[^\"']*[\"'][^>]*>(.*?)</li>",
+        html,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    for block in li_blocks:
+        desc_match = re.search(
+            r"<(?:span|div|p)[^>]*class=[\"'][^\"']*te-stream-item-description[^\"']*[\"'][^>]*>(.*?)</(?:span|div|p)>",
+            block,
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+        if not desc_match:
+            continue
+        desc_raw = re.sub(r"<[^>]+>", " ", desc_match.group(1))
+        text = _te_norm_text(desc_raw)
+        if not text:
+            continue
+
+        published_dt: datetime | None = None
+        date_match = re.search(
+            r"<(?:small|span|div)[^>]*class=[\"'][^\"']*te-stream-date[^\"']*[\"'][^>]*>(.*?)</(?:small|span|div)>",
+            block,
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+        if date_match:
+            date_raw = _te_norm_text(re.sub(r"<[^>]+>", " ", date_match.group(1)))
+            published_dt = _te_parse_stream_date(date_raw, now_utc=now_utc)
+
+        candidates.append((text, published_dt))
+
+    if candidates:
+        return candidates
+
+    for desc_match in re.finditer(
+        r"<(?:span|div|p)[^>]*class=[\"'][^\"']*te-stream-item-description[^\"']*[\"'][^>]*>(.*?)</(?:span|div|p)>",
+        html,
+        flags=re.IGNORECASE | re.DOTALL,
+    ):
+        desc_raw = re.sub(r"<[^>]+>", " ", desc_match.group(1))
+        text = _te_norm_text(desc_raw)
+        if text:
+            candidates.append((text, None))
+    return candidates
+
+
+def _te_extract_script_candidates(
+    soup,
+    *,
+    now_utc: datetime,
+) -> list[tuple[str, datetime | None]]:
+    candidates: list[tuple[str, datetime | None]] = []
+    for script in soup.find_all("script"):
+        raw = script.string or script.get_text(" ", strip=False) or ""
+        if not raw:
+            continue
+        lower_raw = raw.lower()
+        if "te-stream-item-description" not in lower_raw and "indc_news_stream" not in lower_raw:
+            continue
+        normalized = unescape(raw).replace('\\"', '"').replace("\\/", "/")
+        candidates.extend(_te_extract_regex_candidates(normalized, now_utc=now_utc))
+    return candidates
+
+
+def _te_fetch_stream_api_records(
+    session: requests.Session,
+    *,
+    now_utc: datetime,
+) -> tuple[list[dict[str, Any]], dict[str, int], str | None]:
+    parsed = urlparse(TRADINGECONOMICS_STREAM_URL)
+    if not parsed.scheme or not parsed.netloc:
+        return [], {"invalid_stream_url": 1}, "invalid_stream_url"
+
+    stream_api_url = f"{parsed.scheme}://{parsed.netloc}/ws/stream.ashx"
+    payload, error, _ = fetch_json_with_backoff(
+        session=session,
+        url=stream_api_url,
+        params={"start": 0, "size": max(TRADINGECONOMICS_MAX_ITEMS, 20)},
+        timeout=REQUEST_TIMEOUT,
+        max_attempts=HTTP_MAX_ATTEMPTS,
+        request_headers=_TE_STREAM_REQUEST_HEADERS,
+    )
+    if error:
+        return [], {"api_request_error": 1}, error
+    if not isinstance(payload, list):
+        return [], {"unexpected_api_payload": 1}, "unexpected_api_payload"
+
+    records: list[dict[str, Any]] = []
+    reject_stats: defaultdict[str, int] = defaultdict(int)
+    seen_urls: set[str] = set()
+    max_age = timedelta(hours=max(TRADINGECONOMICS_MAX_AGE_HOURS, 1))
+
+    for row in payload:
+        if len(records) >= max(TRADINGECONOMICS_MAX_ITEMS, 1):
+            break
+        if not isinstance(row, dict):
+            reject_stats["invalid_row_type"] += 1
+            continue
+
+        desc_raw = row.get("description") or row.get("html") or ""
+        text = _te_norm_text(re.sub(r"<[^>]+>", " ", str(desc_raw)))
+        if not text:
+            reject_stats["empty_description"] += 1
+            continue
+        if not is_valid_te_stream_item(text):
+            reject_stats["invalid_text_filter"] += 1
+            continue
+
+        published_dt: datetime | None = None
+        date_raw = _te_norm_text(str(row.get("date") or ""))
+        if date_raw:
+            published_dt = _te_parse_stream_date(date_raw, now_utc=now_utc)
+        if published_dt is None:
+            diff_raw = _te_norm_text(str(row.get("diff") or ""))
+            if diff_raw:
+                published_dt = _te_parse_stream_date(diff_raw, now_utc=now_utc)
+        if published_dt is None:
+            reject_stats["missing_or_unparseable_date"] += 1
+            continue
+        if published_dt > now_utc + timedelta(minutes=5):
+            reject_stats["future_timestamp"] += 1
+            continue
+        if (now_utc - published_dt) > max_age:
+            reject_stats["older_than_24h"] += 1
+            continue
+
+        row_url = _te_norm_text(str(row.get("url") or ""))
+        row_id = _te_norm_text(str(row.get("ID") or ""))
+        if row_url:
+            canonical_url = row_url if row_url.startswith(("http://", "https://")) else urljoin(TRADINGECONOMICS_STREAM_URL, row_url)
+            if row_id and "/news/" not in canonical_url:
+                canonical_url = canonical_url.rstrip("/") + f"/news/{row_id}"
+        else:
+            digest = hashlib.md5(text.encode("utf-8")).hexdigest()[:14]
+            canonical_url = f"{TRADINGECONOMICS_STREAM_URL}#brief-{digest}"
+
+        if canonical_url in seen_urls:
+            reject_stats["deduplicated"] += 1
+            continue
+        seen_urls.add(canonical_url)
+
+        title = _te_norm_text(str(row.get("title") or "")) or _te_stream_title(text)
+        records.append(
+            {
+                "url": canonical_url,
+                "source": "TradingEconomics",
+                "source_rss": "https://tradingeconomics.com/stream",
+                "status": "ok",
+                "error": None,
+                "title": title[:160],
+                "published": published_dt.isoformat(),
+                "text": text,
+                "author": None,
+                "source_provider": "stream",
+            }
+        )
+
+    return records, dict(reject_stats), None
+
+
+def fetch_tradingeconomics_stream() -> list[dict[str, Any]]:
+    if not TRADINGECONOMICS_STREAM_URL:
+        return []
+
+    now_utc = datetime.now(timezone.utc)
+    with requests.Session() as session:
+        api_records, api_rejects, api_error = _te_fetch_stream_api_records(
+            session=session,
+            now_utc=now_utc,
+        )
+        if api_records:
+            if TRADINGECONOMICS_STREAM_DEBUG:
+                print(
+                    "[te_stream] API stream accepted: "
+                    f"{len(api_records)} (rejects: {api_rejects})"
+                )
+            return api_records
+        if TRADINGECONOMICS_STREAM_DEBUG:
+            print(
+                "[te_stream] API stream empty; falling back to HTML parse "
+                f"(error={api_error}, rejects={api_rejects})"
+            )
+
+        html, error = fetch_text_with_backoff(
+            session=session,
+            url=TRADINGECONOMICS_STREAM_URL,
+            timeout=REQUEST_TIMEOUT,
+            request_headers=_TE_STREAM_REQUEST_HEADERS,
+        )
+    if error or not html:
+        print(f"[te_stream] fetch skipped: {error or 'no_html'}")
+        return []
+    if BeautifulSoup is None:
+        print("[te_stream] BeautifulSoup unavailable; HTML fallback skipped")
+        return []
+    if TRADINGECONOMICS_DEBUG_HTML_PATH:
+        try:
+            with open(TRADINGECONOMICS_DEBUG_HTML_PATH, "w", encoding="utf-8") as debug_f:
+                debug_f.write(html)
+            print(f"[te_stream] debug html saved: {TRADINGECONOMICS_DEBUG_HTML_PATH}")
+        except Exception as exc:
+            print(f"[te_stream] debug html save failed: {type(exc).__name__}")
+
+    soup = BeautifulSoup(html, "html.parser")
+    candidate_nodes: list[tuple[Any | None, str, datetime | None]] = []
+    seen_candidate_keys: set[str] = set()
+
+    def _push_candidate(node: Any | None, text: str, published_dt: datetime | None = None) -> None:
+        clean_text = _te_norm_text(text)
+        if not clean_text:
+            return
+        if node is None:
+            key = f"text:{hashlib.md5(clean_text.encode('utf-8')).hexdigest()[:16]}"
+        else:
+            key = f"node:{id(node)}"
+        if key in seen_candidate_keys:
+            return
+        seen_candidate_keys.add(key)
+        candidate_nodes.append((node, clean_text, published_dt))
+
+    # Primary path: explicit TradingEconomics stream classes from the live DOM.
+    for node in soup.select("#stream li.indc_news_stream, li.indc_news_stream, li[class*='indc_news_stream']"):
+        if _te_container_is_excluded(node):
+            continue
+        desc_node = node.select_one("span.te-stream-item-description, .te-stream-item-description")
+        text = (
+            desc_node.get_text(" ", strip=True)
+            if desc_node is not None
+            else node.get_text(" ", strip=True)
+        )
+        _push_candidate(node, text, _te_extract_published(node, now_utc=now_utc))
+
+    # Primary path: explicit TradingEconomics stream classes from the live DOM.
+    for desc_node in soup.select(".te-stream-item-description"):
+        owner = (
+            desc_node.find_parent("li")
+            or desc_node.find_parent("article")
+            or desc_node.find_parent("div")
+            or desc_node
+        )
+        if _te_container_is_excluded(owner):
+            continue
+        _push_candidate(
+            owner,
+            desc_node.get_text(" ", strip=True),
+            _te_extract_published(owner, now_utc=now_utc),
+        )
+
+    # Secondary path: explicit stream item rows, even if description class is missing.
+    for node in soup.select("#stream li.te-stream-item, li.te-stream-item, #stream li"):
+        if _te_container_is_excluded(node):
+            continue
+        desc_node = node.select_one(".te-stream-item-description")
+        text = (
+            desc_node.get_text(" ", strip=True)
+            if desc_node is not None
+            else node.get_text(" ", strip=True)
+        )
+        _push_candidate(node, text, _te_extract_published(node, now_utc=now_utc))
+
+    if TRADINGECONOMICS_STREAM_DEBUG:
+        print(
+            "[te_stream] selector counts: "
+            f"desc={len(soup.select('.te-stream-item-description'))}, "
+            f"items={len(soup.select('#stream li.te-stream-item, li.te-stream-item, #stream li'))}, "
+            f"candidates={len(candidate_nodes)}"
+        )
+
+    # Fallback: looser container scan for resilience when TE tweaks class names.
+    if not candidate_nodes:
+        candidate_containers = []
+        for node in soup.find_all(["section", "div", "main", "article", "ul", "ol"]):
+            attrs = " ".join(
+                str(val)
+                for attr in ("id", "class", "data-module", "data-widget")
+                for val in ([node.get(attr)] if node.get(attr) is not None else [])
+            ).lower()
+            if not attrs:
+                continue
+            if not any(hint in attrs for hint in _TE_STREAM_ITEM_HINTS):
+                continue
+            if _te_container_is_excluded(node):
+                continue
+            candidate_containers.append(node)
+
+        for container in candidate_containers:
+            for node in container.find_all(["li", "article", "div"], recursive=True):
+                if _te_container_is_excluded(node):
+                    continue
+                desc_node = node.select_one(".te-stream-item-description")
+                text = (
+                    desc_node.get_text(" ", strip=True)
+                    if desc_node is not None
+                    else node.get_text(" ", strip=True)
+                )
+                _push_candidate(node, text, _te_extract_published(node, now_utc=now_utc))
+
+    if not candidate_nodes:
+        for text, published_dt in _te_extract_regex_candidates(html, now_utc=now_utc):
+            _push_candidate(None, text, published_dt)
+
+    if not candidate_nodes:
+        for text, published_dt in _te_extract_script_candidates(soup, now_utc=now_utc):
+            _push_candidate(None, text, published_dt)
+
+    if not candidate_nodes:
+        html_lower = html.lower()
+        print(
+            "[te_stream] ambiguous parse; no item candidates "
+            f"(html_markers: desc={html_lower.count('te-stream-item-description')}, "
+            f"item={html_lower.count('te-stream-item')}, len={len(html)})"
+        )
+        return []
+
+    records: list[dict[str, Any]] = []
+    seen_urls: set[str] = set()
+    max_age = timedelta(hours=max(TRADINGECONOMICS_MAX_AGE_HOURS, 1))
+    valid_count = 0
+    reject_stats: defaultdict[str, int] = defaultdict(int)
+    for node, raw_text, parsed_published_dt in candidate_nodes:
+        if len(records) >= max(TRADINGECONOMICS_MAX_ITEMS, 1):
+            break
+        text = _te_norm_text(raw_text)
+        if not is_valid_te_stream_item(text):
+            reject_stats["invalid_text_filter"] += 1
+            continue
+        published_dt = parsed_published_dt
+        if published_dt is None and node is not None:
+            published_dt = _te_extract_published(node, now_utc=now_utc)
+        if published_dt is None:
+            reject_stats["missing_or_unparseable_date"] += 1
+            continue
+        if published_dt > now_utc + timedelta(minutes=5):
+            reject_stats["future_timestamp"] += 1
+            continue
+        if (now_utc - published_dt) > max_age:
+            reject_stats["older_than_24h"] += 1
+            continue
+
+        digest = hashlib.md5(text.encode("utf-8")).hexdigest()[:14]
+        synthetic_url = f"{TRADINGECONOMICS_STREAM_URL}#brief-{digest}"
+        if synthetic_url in seen_urls:
+            reject_stats["deduplicated"] += 1
+            continue
+        seen_urls.add(synthetic_url)
+
+        valid_count += 1
+        records.append(
+            {
+                "url": synthetic_url,
+                "source": "TradingEconomics",
+                "source_rss": "https://tradingeconomics.com/stream",
+                "status": "ok",
+                "error": None,
+                "title": _te_stream_title(text),
+                "published": published_dt.isoformat(),
+                "text": text,
+                "author": None,
+                "source_provider": "stream",
+            }
+        )
+
+    if valid_count == 0:
+        print(
+            "[te_stream] no valid stream brief items after filtering "
+            f"(rejects: {dict(reject_stats)})"
+        )
+        return []
+
+    return records
 
 
 # ---------------------------------------------------------------------------
@@ -826,8 +1437,25 @@ def _domain_matches(host: str, domains: tuple[str, ...]) -> bool:
 
 
 def _classify_source_trust_tier(source_name: str | None, url: str) -> str:
+    return _classify_source_trust_tier_with_provider(
+        source_name=source_name,
+        url=url,
+        source_provider=None,
+    )
+
+
+def _classify_source_trust_tier_with_provider(
+    *,
+    source_name: str | None,
+    url: str,
+    source_provider: str | None,
+) -> str:
     host = _host_from_url(url)
     source_lower = (source_name or "").strip().lower()
+    provider_lower = (source_provider or "").strip().lower()
+
+    if source_lower == "tradingeconomics" and provider_lower == "stream":
+        return "tier_2"
 
     if _domain_matches(host, _BLOCKED_SOURCE_DOMAINS):
         return "blocked"
@@ -851,6 +1479,7 @@ def _classify_content_class(
     text: str,
     url: str,
     source_name: str | None,
+    source_provider: str | None = None,
 ) -> tuple[str, list[str]]:
     """Deterministic, inspectable content classification."""
     clean_text = " ".join((text or "").split())
@@ -858,8 +1487,14 @@ def _classify_content_class(
     lower_title = (title or "").strip().lower()
     lower_url = (url or "").strip().lower()
     source_lower = (source_name or "").strip().lower()
+    provider_lower = (source_provider or "").strip().lower()
     word_count = len(lower_text.split())
     flags: list[str] = []
+
+    # TradingEconomics stream briefs are short-form updates, not normal articles.
+    if source_lower == "tradingeconomics" and provider_lower == "stream":
+        flags.append("stream_brief")
+        return "stream_brief", flags
 
     if word_count < 25:
         flags.append("very_short_text")
@@ -928,6 +1563,8 @@ def _score_article_quality(
     url: str,
     source_tier: str,
     content_class: str,
+    source_name: str | None = None,
+    source_provider: str | None = None,
 ) -> tuple[float, list[str]]:
     """
     Deterministic quality scoring in [0, 100].
@@ -935,6 +1572,13 @@ def _score_article_quality(
     """
     words = len((text or "").split())
     flags: list[str] = []
+
+    if (
+        (source_name or "").strip().lower() == "tradingeconomics"
+        and (source_provider or "").strip().lower() == "stream"
+    ) or content_class == "stream_brief":
+        return 0.6, ["stream_brief", "short_form_source"]
+
     score = 50.0
 
     if words < MIN_ARTICLE_WORDS:
@@ -973,6 +1617,7 @@ def _score_article_quality(
         "news_report": 8.0,
         "analysis": 6.0,
         "official_release": 8.0,
+        "stream_brief": -18.0,
         "evergreen_explainer": 2.0,
         "ticker_page": -15.0,
         "navigation_page": -35.0,
@@ -1047,14 +1692,20 @@ def _save_to_sqlite(articles: list[dict], scraped_at_utc: str) -> None:
             continue
 
         url = art.get("url", "")
+        source_provider = (art.get("source_provider") or "").strip().lower() or None
         aid = _article_id(art.get("url", ""), art.get("published"))
         content_class, class_flags = _classify_content_class(
             title=art.get("title"),
             text=art["text"],
             url=url,
             source_name=art.get("source"),
+            source_provider=source_provider,
         )
-        source_trust_tier = _classify_source_trust_tier(art.get("source"), url)
+        source_trust_tier = _classify_source_trust_tier_with_provider(
+            source_name=art.get("source"),
+            url=url,
+            source_provider=source_provider,
+        )
         article_quality_score, score_flags = _score_article_quality(
             title=art.get("title"),
             text=art["text"],
@@ -1062,8 +1713,12 @@ def _save_to_sqlite(articles: list[dict], scraped_at_utc: str) -> None:
             url=url,
             source_tier=source_trust_tier,
             content_class=content_class,
+            source_name=art.get("source"),
+            source_provider=source_provider,
         )
         quality_flags = sorted(set(class_flags + score_flags))
+        if content_class == "stream_brief":
+            quality_flags = sorted(set(quality_flags + ["stream_brief", "short_form_source"]))
         quality_flags_json = json.dumps(
             {
                 "flags": quality_flags,
@@ -1080,6 +1735,7 @@ def _save_to_sqlite(articles: list[dict], scraped_at_utc: str) -> None:
             art.get("title"),
             art.get("source"),
             art.get("source_rss"),
+            art.get("source_provider"),
             art.get("published"),
             scraped_at_utc,
             _content_hash(art["text"]),
@@ -1093,6 +1749,7 @@ def _save_to_sqlite(articles: list[dict], scraped_at_utc: str) -> None:
         if aid in existing_ids:
             conn.execute(
                 "UPDATE articles SET "
+                "source_provider = ?, "
                 "source_trust_tier = ?, "
                 "content_class = ?, "
                 "article_quality_score = ?, "
@@ -1103,6 +1760,7 @@ def _save_to_sqlite(articles: list[dict], scraped_at_utc: str) -> None:
                 "END "
                 "WHERE article_id = ?",
                 (
+                    art.get("source_provider"),
                     source_trust_tier,
                     content_class,
                     article_quality_score,
@@ -1114,10 +1772,10 @@ def _save_to_sqlite(articles: list[dict], scraped_at_utc: str) -> None:
         else:
             conn.execute(
                 "INSERT INTO articles "
-                "(article_id,url,title,source,source_rss,published_at,"
+                "(article_id,url,title,source,source_rss,source_provider,published_at,"
                 "scraped_at_utc,content_hash,status,raw_text,"
                 "source_trust_tier,content_class,article_quality_score,quality_flags_json,processing_state) "
-                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 row + ("classified",),
             )
             existing_ids.add(aid)
@@ -1166,17 +1824,29 @@ def main(reset_db: bool = False) -> None:
     if discovery_meta.get("fallback_used"):
         print("Fallback provider was used during discovery")
 
-    if not links:
+    if not links and not ENABLE_TRADINGECONOMICS_STREAM:
         print("No links found. Exiting.")
         return
 
     print("\nStep 2: Scraping articles (async) ...")
     start_time = time.time()
 
-    if os.name == "nt" and hasattr(asyncio, "WindowsSelectorEventLoopPolicy"):
-        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
-
-    articles = asyncio.run(scrape_articles_async(links, source_by_url))
+    if links:
+        if os.name == "nt" and hasattr(asyncio, "WindowsSelectorEventLoopPolicy"):
+            asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+        articles = asyncio.run(scrape_articles_async(links, source_by_url))
+    else:
+        print("No RSS/alpha links found; continuing with TradingEconomics stream only.")
+        articles = []
+    te_articles: list[dict[str, Any]] = []
+    if ENABLE_TRADINGECONOMICS_STREAM:
+        print("\nStep 2b: Scraping TradingEconomics stream briefs ...")
+        te_articles = fetch_tradingeconomics_stream()
+        if te_articles:
+            print(f"  TradingEconomics stream briefs collected: {len(te_articles)}")
+            articles.extend(te_articles)
+        else:
+            print("  TradingEconomics stream briefs collected: 0")
     scrape_duration = time.time() - start_time
     print(f"Scraped {len(articles)} articles in {scrape_duration:.1f} seconds")
     if scrape_duration > 0:
@@ -1195,7 +1865,9 @@ def main(reset_db: bool = False) -> None:
         print(f"  {status}: {count}")
 
     payload = {
-        "source_rss": [source["url"] for source in RSS_SOURCES],
+        "source_rss": [source["url"] for source in RSS_SOURCES] + (
+            ["https://tradingeconomics.com/stream"] if te_articles else []
+        ),
         "scraped_at_utc": datetime.now(timezone.utc).isoformat(),
         "count": len(articles),
         "articles": articles,
@@ -1206,6 +1878,8 @@ def main(reset_db: bool = False) -> None:
             "dedup_authority": "ingestion_pipeline",
             "scrape_duration_seconds": scrape_duration,
             "discovery": discovery_meta,
+            "tradingeconomics_stream_enabled": ENABLE_TRADINGECONOMICS_STREAM,
+            "tradingeconomics_stream_items": len(te_articles),
         },
     }
 

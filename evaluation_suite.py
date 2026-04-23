@@ -47,6 +47,8 @@ _RECENCY_SENSITIVE_TERMS: tuple[str, ...] = (
     "newest",
 )
 
+LOW_CONTEXT_CONTENT_CLASSES: frozenset[str] = frozenset({"stream_brief"})
+
 # ---------------------------------------------------------------------------
 # Answer-quality parsing helpers (deterministic, no LLM judge)
 # ---------------------------------------------------------------------------
@@ -731,6 +733,11 @@ def _source_quality_slice(source_meta_by_chunk: dict[str, dict[str, Any]], case:
         for item in source_meta_by_chunk.values()
         if item.get("source_trust_tier")
     ]
+    classes = [
+        str(item.get("content_class")).strip().lower()
+        for item in source_meta_by_chunk.values()
+        if item.get("content_class")
+    ]
     qualities = [
         float(item["article_quality_score"])
         for item in source_meta_by_chunk.values()
@@ -738,6 +745,11 @@ def _source_quality_slice(source_meta_by_chunk: dict[str, dict[str, Any]], case:
     ]
 
     if "blocked" in tiers or "tier_3" in tiers:
+        return "low"
+    if classes and all(cls in LOW_CONTEXT_CONTENT_CLASSES for cls in classes):
+        # stream_brief is a legitimate source class, but should be evaluated as low-context.
+        if qualities and (sum(qualities) / len(qualities)) >= 0.70:
+            return "medium"
         return "low"
     if qualities:
         avg = sum(qualities) / len(qualities)

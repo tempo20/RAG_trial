@@ -95,6 +95,8 @@ SUMMARY_MAX_CHUNKS_PER_SOURCE = int(os.getenv("SUMMARY_MAX_CHUNKS_PER_SOURCE", "
 SUMMARY_DUPLICATE_SIM_THRESHOLD = float(os.getenv("SUMMARY_DUPLICATE_SIM_THRESHOLD", "0.9"))
 SUMMARY_MIN_UNIQUE_SOURCES = int(os.getenv("SUMMARY_MIN_UNIQUE_SOURCES", "3"))
 SUMMARY_CANDIDATE_LIMIT = int(os.getenv("SUMMARY_CANDIDATE_LIMIT", "300"))
+SUMMARY_STREAM_BRIEF_MAX_SHARE = float(os.getenv("SUMMARY_STREAM_BRIEF_MAX_SHARE", "0.55"))
+SUMMARY_MIN_FULL_CONTEXT_CHUNKS = int(os.getenv("SUMMARY_MIN_FULL_CONTEXT_CHUNKS", "2"))
 SUMMARY_TERMS = (
     "summary",
     "summarise",
@@ -126,6 +128,9 @@ RERANKER_MODEL_NAME = os.getenv("RERANKER_MODEL_NAME", "cross-encoder/ms-marco-M
 ENABLE_CROSS_ENCODER_RERANK = os.getenv("ENABLE_CROSS_ENCODER_RERANK", "1").strip().lower() in {"1", "true", "yes", "on"}
 RERANK_CANDIDATE_LIMIT = int(os.getenv("RERANK_CANDIDATE_LIMIT", "10"))
 RERANK_WEIGHT = float(os.getenv("RERANK_WEIGHT", "0.85"))
+STREAM_BRIEF_DAILY_SUMMARY_MULTIPLIER = float(os.getenv("STREAM_BRIEF_DAILY_SUMMARY_MULTIPLIER", "1.30"))
+STREAM_BRIEF_CONFIDENCE_PENALTY_THRESHOLD = float(os.getenv("STREAM_BRIEF_CONFIDENCE_PENALTY_THRESHOLD", "0.50"))
+STREAM_BRIEF_DOMINANT_THRESHOLD = float(os.getenv("STREAM_BRIEF_DOMINANT_THRESHOLD", "0.85"))
 SOURCE_KEYWORDS = {
     "bbc": "BBC",
     "bloomberg": "Bloomberg",
@@ -188,7 +193,7 @@ ROUTE_PROFILES: dict[str, dict[str, Any]] = {
         "recency_half_life_days": max(1.0, RECENCY_HALF_LIFE_DAYS * 0.8),
         "candidate_cap": max(30, EXPANDED_K * 8),
         "answer_strictness": "high",
-        "allowed_content_classes": ("news_report", "analysis", "official_release"),
+        "allowed_content_classes": ("news_report", "analysis", "official_release", "stream_brief"),
     },
     "daily_summary": {
         "top_k": SUMMARY_TOP_K,
@@ -196,7 +201,7 @@ ROUTE_PROFILES: dict[str, dict[str, Any]] = {
         "recency_half_life_days": SUMMARY_RECENCY_HALF_LIFE_DAYS,
         "candidate_cap": max(SUMMARY_CANDIDATE_LIMIT, SUMMARY_EXPANDED_K * 4),
         "answer_strictness": "high",
-        "allowed_content_classes": ("news_report", "analysis", "official_release"),
+        "allowed_content_classes": ("news_report", "analysis", "official_release", "stream_brief"),
     },
     "macro_causal": {
         "top_k": max(6, TOP_K),
@@ -204,7 +209,7 @@ ROUTE_PROFILES: dict[str, dict[str, Any]] = {
         "recency_half_life_days": max(1.0, RECENCY_HALF_LIFE_DAYS),
         "candidate_cap": max(48, EXPANDED_K * 10),
         "answer_strictness": "high",
-        "allowed_content_classes": ("news_report", "analysis", "official_release"),
+        "allowed_content_classes": ("news_report", "analysis", "official_release", "stream_brief"),
     },
     "entity_profile": {
         "top_k": max(5, TOP_K),
@@ -212,7 +217,7 @@ ROUTE_PROFILES: dict[str, dict[str, Any]] = {
         "recency_half_life_days": max(2.0, RECENCY_HALF_LIFE_DAYS * 1.2),
         "candidate_cap": max(36, EXPANDED_K * 8),
         "answer_strictness": "medium",
-        "allowed_content_classes": ("news_report", "analysis", "official_release", "evergreen_explainer"),
+        "allowed_content_classes": ("news_report", "analysis", "official_release", "stream_brief", "evergreen_explainer"),
     },
     "live_market_data": {
         "top_k": max(4, TOP_K),
@@ -220,7 +225,7 @@ ROUTE_PROFILES: dict[str, dict[str, Any]] = {
         "recency_half_life_days": max(1.0, RECENCY_HALF_LIFE_DAYS * 0.7),
         "candidate_cap": max(28, EXPANDED_K * 6),
         "answer_strictness": "high",
-        "allowed_content_classes": ("news_report", "analysis", "official_release", "ticker_page"),
+        "allowed_content_classes": ("news_report", "analysis", "official_release", "stream_brief", "ticker_page"),
     },
     "broad_exploration": {
         "top_k": max(6, TOP_K),
@@ -228,7 +233,7 @@ ROUTE_PROFILES: dict[str, dict[str, Any]] = {
         "recency_half_life_days": max(2.0, RECENCY_HALF_LIFE_DAYS * 1.1),
         "candidate_cap": max(60, EXPANDED_K * 12),
         "answer_strictness": "medium",
-        "allowed_content_classes": ("news_report", "analysis", "official_release", "evergreen_explainer"),
+        "allowed_content_classes": ("news_report", "analysis", "official_release", "stream_brief", "evergreen_explainer"),
     },
     "ambiguous": {
         "top_k": max(5, TOP_K),
@@ -236,7 +241,7 @@ ROUTE_PROFILES: dict[str, dict[str, Any]] = {
         "recency_half_life_days": max(1.5, RECENCY_HALF_LIFE_DAYS),
         "candidate_cap": max(40, EXPANDED_K * 8),
         "answer_strictness": "very_high",
-        "allowed_content_classes": ("news_report", "analysis", "official_release"),
+        "allowed_content_classes": ("news_report", "analysis", "official_release", "stream_brief"),
     },
 }
 
@@ -251,6 +256,7 @@ CONTENT_CLASS_SCORES = {
     "news_report": 1.0,
     "analysis": 0.9,
     "official_release": 0.95,
+    "stream_brief": 0.50,
     "evergreen_explainer": 0.68,
     "ticker_page": 0.45,
     "navigation_page": 0.2,
@@ -258,6 +264,8 @@ CONTENT_CLASS_SCORES = {
     "quote_page": 0.22,
     "junk": 0.0,
 }
+
+FULL_CONTEXT_CONTENT_CLASSES = frozenset({"news_report", "analysis", "official_release"})
 
 SOURCE_QUALITY_FALLBACK = {
     "reuters": 0.95,
@@ -709,11 +717,21 @@ def _route_allows_content_class(route_profile: dict[str, Any], content_class: st
     return str(content_class).strip().lower() in {c.lower() for c in allowed}
 
 
-def _source_quality_component(row: dict[str, Any]) -> float:
+def _is_stream_brief_chunk(row: dict[str, Any]) -> bool:
+    return (row.get("content_class") or "").strip().lower() == "stream_brief"
+
+
+def _is_full_context_chunk(row: dict[str, Any]) -> bool:
+    return (row.get("content_class") or "").strip().lower() in FULL_CONTEXT_CONTENT_CLASSES
+
+
+def _source_quality_component(row: dict[str, Any], route_type: str | None = None) -> float:
     trust_tier = (row.get("source_trust_tier") or "").strip().lower()
     trust_score = SOURCE_TRUST_SCORES.get(trust_tier, 0.65)
     content_class = (row.get("content_class") or "").strip().lower()
     class_score = CONTENT_CLASS_SCORES.get(content_class, 0.60)
+    if content_class == "stream_brief" and route_type == "daily_summary":
+        class_score = _clamp01(class_score * STREAM_BRIEF_DAILY_SUMMARY_MULTIPLIER)
     quality_raw = _safe_float(row.get("article_quality_score"), 60.0)
     quality_score = _clamp01(quality_raw / 100.0 if quality_raw > 1.0 else quality_raw)
     source_name = (row.get("source") or "").strip().lower()
@@ -809,7 +827,7 @@ def _apply_unified_scoring(
             semantic_score = _clamp01(cosine_sim(query_vec, np.array(emb, dtype=np.float32)))
         keyword_overlap = _clamp01(_keyword_overlap_score(query, row.get("text", "")))
         target_match = _target_match_component(row, target)
-        source_quality = _source_quality_component(row)
+        source_quality = _source_quality_component(row, route_type=route_type)
 
         ts = _published_date_to_ts(row.get("published_date"))
         recency_score = float(np.exp(-max(0.0, float(now_ts - ts)) / half_life_s)) if ts is not None else 0.0
@@ -908,7 +926,12 @@ def _cluster_summary_themes(chunks: list[dict[str, Any]]) -> list[dict[str, Any]
     return themed
 
 
-def _compute_answer_confidence(chunks: list[dict], target: QueryTarget | None, decision_hint: str | None = None) -> tuple[float, dict[str, Any]]:
+def _compute_answer_confidence(
+    chunks: list[dict],
+    target: QueryTarget | None,
+    decision_hint: str | None = None,
+    route_type: str | None = None,
+) -> tuple[float, dict[str, Any]]:
     relevant_chunks = _clamp01(len(chunks) / 8.0)
     unique_sources = len({(chunk.get("source") or "").lower() for chunk in chunks if chunk.get("source")})
     source_diversity = _clamp01(unique_sources / 4.0)
@@ -938,6 +961,22 @@ def _compute_answer_confidence(chunks: list[dict], target: QueryTarget | None, d
         - ANSWER_CONFIDENCE_WEIGHTS["contradiction_penalty"] * contradiction_penalty
     )
     confidence = max(0.0, min(100.0, round(100.0 * score_0_1, 1)))
+
+    stream_brief_count = sum(1 for chunk in chunks if _is_stream_brief_chunk(chunk))
+    stream_brief_share = (stream_brief_count / len(chunks)) if chunks else 0.0
+    if stream_brief_share > STREAM_BRIEF_CONFIDENCE_PENALTY_THRESHOLD:
+        over = min(
+            1.0,
+            (stream_brief_share - STREAM_BRIEF_CONFIDENCE_PENALTY_THRESHOLD)
+            / max(1e-6, 1.0 - STREAM_BRIEF_CONFIDENCE_PENALTY_THRESHOLD),
+        )
+        damp = 1.0 - 0.25 * over
+        confidence = max(0.0, round(confidence * damp, 1))
+    if stream_brief_share >= STREAM_BRIEF_DOMINANT_THRESHOLD:
+        confidence = min(confidence, 32.0)
+    elif stream_brief_share >= 0.70:
+        confidence = min(confidence, 55.0)
+
     if decision_hint == "ambiguous":
         confidence = min(confidence, 55.0)
 
@@ -949,6 +988,9 @@ def _compute_answer_confidence(chunks: list[dict], target: QueryTarget | None, d
         "recency_coverage": recency_coverage,
         "ambiguity_score": ambiguity_penalty,
         "contradiction_signals": contradiction_penalty,
+        "stream_brief_count": stream_brief_count,
+        "stream_brief_share": stream_brief_share,
+        "route_type": route_type,
     }
     return confidence, signals
 
@@ -1536,7 +1578,56 @@ def _filter_summary_chunks(
             f"(max {max_per_source}/source): {source_cap_uids}"
         )
 
-    unique_src_list = sorted(source_counts.keys())
+    # Pass 3: keep stream briefs useful but prevent domination in summaries.
+    if out:
+        max_stream_briefs = max(
+            1,
+            int(round(max(0.10, min(0.95, SUMMARY_STREAM_BRIEF_MAX_SHARE)) * len(out))),
+        )
+        stream_kept = 0
+        stream_share_drops: list[str] = []
+        capped_out: list[dict] = []
+        for ch in out:
+            if _is_stream_brief_chunk(ch):
+                if stream_kept >= max_stream_briefs:
+                    stream_share_drops.append(ch.get("chunk_uid") or ch.get("article_id") or "?")
+                    continue
+                stream_kept += 1
+            capped_out.append(ch)
+        if stream_share_drops:
+            print(
+                f"  [summary-filter] stream-brief share drops "
+                f"(max {max_stream_briefs}): {stream_share_drops}"
+            )
+        out = capped_out
+
+        fuller_available = [c for c in kept_after_dedup if _is_full_context_chunk(c)]
+        fuller_in_out = sum(1 for ch in out if _is_full_context_chunk(ch))
+        if fuller_available and fuller_in_out < SUMMARY_MIN_FULL_CONTEXT_CHUNKS:
+            needed = SUMMARY_MIN_FULL_CONTEXT_CHUNKS - fuller_in_out
+            existing_ids = {ch.get("chunk_uid") for ch in out if ch.get("chunk_uid")}
+            replacements: list[dict] = []
+            for candidate in fuller_available:
+                cid = candidate.get("chunk_uid")
+                if cid and cid in existing_ids:
+                    continue
+                replacements.append(candidate)
+                if len(replacements) >= needed:
+                    break
+
+            if replacements:
+                stream_positions = [idx for idx, ch in enumerate(out) if _is_stream_brief_chunk(ch)]
+                while replacements and stream_positions:
+                    pos = stream_positions.pop()
+                    out[pos] = replacements.pop(0)
+                while replacements:
+                    out.append(replacements.pop(0))
+                print(
+                    f"  [summary-filter] injected fuller-context chunks "
+                    f"to maintain summary balance (target={SUMMARY_MIN_FULL_CONTEXT_CHUNKS})"
+                )
+
+    unique_src_list = sorted({(ch.get("source") or "unknown").strip().lower() for ch in out})
     print(
         f"  [summary-filter] selected={len(out)} | "
         f"unique sources ({len(unique_src_list)}): {unique_src_list}"
@@ -3821,8 +3912,14 @@ def run_query_once(
         all_chunks,
         primary_target,
         decision_hint="ambiguous" if final_route == "ambiguous" else None,
+        route_type=final_route,
     )
     decision = _decide_answer_mode(answer_confidence)
+    stream_brief_share = _safe_float(confidence_signals.get("stream_brief_share"), 0.0)
+    if stream_brief_share >= STREAM_BRIEF_DOMINANT_THRESHOLD:
+        decision = "abstain"
+    elif stream_brief_share > STREAM_BRIEF_CONFIDENCE_PENALTY_THRESHOLD and decision == "answer":
+        decision = "cautious_answer"
 
     if decision == "abstain" and not (skip_generation or DEBUG_SKIP_GENERATION):
         final = (
