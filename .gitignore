@@ -24,4 +24,4 @@ my_database_snapshot.db
 !ticker_company_map.csv
 !notebooks/test.py
 !timesfm*
-!test
+!test*
