@@ -23,5 +23,5 @@ my_database_snapshot.db
 !gold_eval_cases.json
 !ticker_company_map.csv
 !notebooks/test.py
-!timesfm*
-!test*
+timesfm*
+test*.py
