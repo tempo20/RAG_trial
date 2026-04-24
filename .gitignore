@@ -22,6 +22,6 @@ my_database_snapshot.db
 !prompt_templates.json
 !gold_eval_cases.json
 !ticker_company_map.csv
-!notebooks/test.py
+notebooks/test.py
 timesfm*
 test*.py

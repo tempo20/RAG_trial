@@ -114,6 +114,9 @@ MACRO_CHANNELS = [
 DIRECTIONS = ["up", "down", "mixed", "unclear"]
 STRENGTHS  = ["weak", "moderate", "strong"]
 HORIZONS   = ["intraday", "near_term", "medium_term", "long_term"]
+NOVELTY_HINTS = ["new", "continuation", "stale"]
+URGENCY_LEVELS = ["low", "medium", "high"]
+MARKET_SURPRISE_LEVELS = ["low", "medium", "high"]
 
 # ---------------------------------------------------------------------------
 # Prompt template
@@ -206,17 +209,22 @@ def _load_macro_extraction_prompt(path: Path) -> str:
 
 MACRO_EXTRACTION_PROMPT = _load_macro_extraction_prompt(PROMPT_TEMPLATES_PATH)
 
-MACRO_CANDIDATE_EXTRACTION_PROMPT = """\
+DEFAULT_MACRO_CANDIDATE_EXTRACTION_PROMPT = """\
 You are Pass A in a two-pass macro extraction system.
 Goal: high-recall candidate extraction from the news excerpt.
 
 Rules:
-- Extract up to 4 plausible macro events supported by the text.
-- Prefer recall: include borderline candidates if there is at least one explicit textual anchor.
+- Extract AT MOST 4 events, but only if each has direct evidence in the text.
+- Prefer recall relative to the verifier: include borderline candidates only when there is at least one explicit textual anchor.
 - Do not invent facts not present in the text.
+- Do not include candidates with no direct supporting phrase.
+- Focus on one dominant macro mechanism per event.
 - For evidence_spans: include 1-3 short verbatim phrases from the text.
 - Keep channels and asset_impacts concise (0-2 each).
 - confidence is an initial score (0.0-1.0), not final verification.
+- novelty_hint is optional and must be one of: {novelty_hints}
+- urgency is optional and must be one of: {urgency_levels}
+- market_surprise is optional and must be one of: {market_surprise_levels}
 
 Return ONLY a JSON object:
 
@@ -246,17 +254,43 @@ Return ONLY a JSON object:
         }}
       ],
       "evidence_spans": ["<short verbatim phrase from text>"],
-      "confidence": <float 0.0-1.0>
+      "confidence": <float 0.0-1.0>,
+      "novelty_hint": "<optional one of: {novelty_hints}>",
+      "urgency": "<optional one of: {urgency_levels}>",
+      "market_surprise": "<optional one of: {market_surprise_levels}>"
     }}
   ]
 }}
 
-If no plausible macro events are present, return {{"events": []}}.
+If no direct-evidence macro events are present, return {{"events": []}}.
 Use only allowed enum values; do not invent labels.
 
 NEWS EXCERPT:
 {text}
 """
+
+
+def _load_macro_candidate_extraction_prompt(path: Path) -> str:
+    """
+    Load the candidate extraction prompt from prompt_templates.json.
+    Falls back to MACRO_EXTRACTION_PROMPT for backward compatibility.
+    """
+    if not path.exists():
+        return DEFAULT_MACRO_CANDIDATE_EXTRACTION_PROMPT
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return DEFAULT_MACRO_CANDIDATE_EXTRACTION_PROMPT
+
+    value = data.get("MACRO_CANDIDATE_EXTRACTION_PROMPT")
+    if value is None:
+        value = data.get("MACRO_EXTRACTION_PROMPT")
+    if value is None:
+        return DEFAULT_MACRO_CANDIDATE_EXTRACTION_PROMPT
+    return _coerce_template_value(value, "MACRO_CANDIDATE_EXTRACTION_PROMPT")
+
+
+MACRO_CANDIDATE_EXTRACTION_PROMPT = _load_macro_candidate_extraction_prompt(PROMPT_TEMPLATES_PATH)
 
 DEFAULT_MACRO_VERIFICATION_PROMPT = """\
 You are Pass B verifier in a macro extraction pipeline.
@@ -269,6 +303,10 @@ Rules:
 - Keep candidate_index unchanged.
 - Allowed verification_status values: verified, weak, rejected.
 - support_score and confidence_calibrated must be floats 0.0-1.0.
+- rejection_reason should be populated for rejected rows and optional for weak rows.
+- novelty_hint is optional and must be one of: {novelty_hints}
+- urgency is optional and must be one of: {urgency_levels}
+- market_surprise is optional and must be one of: {market_surprise_levels}
 
 Return ONLY JSON:
 {{
@@ -278,7 +316,11 @@ Return ONLY JSON:
       "verification_status": "<verified|weak|rejected>",
       "support_score": <float 0.0-1.0>,
       "confidence_calibrated": <float 0.0-1.0>,
-      "rejection_reason": "<short string or empty>"
+      "rejection_reason": "<short string or empty>",
+      "novelty_hint": "<optional one of: {novelty_hints}>",
+      "urgency": "<optional one of: {urgency_levels}>",
+      "market_surprise": "<optional one of: {market_surprise_levels}>",
+      "verifier_notes": "<short support assessment>"
     }}
   ]
 }}
@@ -380,6 +422,28 @@ def _enforce_enums(events: list[dict]) -> tuple[list[dict], list[dict]]:
             }
         )
         ev["time_horizon"] = normalized_horizon or ""
+
+        for field_name, allowed, label in (
+            ("novelty_hint", NOVELTY_HINTS, "NOVELTY_HINTS"),
+            ("urgency", URGENCY_LEVELS, "URGENCY_LEVELS"),
+            ("market_surprise", MARKET_SURPRISE_LEVELS, "MARKET_SURPRISE_LEVELS"),
+        ):
+            raw_value = str(ev.get(field_name) or "").strip().lower()
+            if not raw_value:
+                ev[field_name] = None
+                continue
+            normalized_value, action = _snap(raw_value, allowed, label)
+            audits.append(
+                {
+                    "macro_event_index": idx,
+                    "parent_kind": "macro_event",
+                    "field_label": field_name,
+                    "raw_value": raw_value,
+                    "normalized_value": normalized_value,
+                    "action": action,
+                }
+            )
+            ev[field_name] = normalized_value
 
         # channels
         clean_channels = []
@@ -675,6 +739,9 @@ def _call_candidate_extraction(client: Any, chunk_text: str) -> tuple[bool, str,
         channels=", ".join(MACRO_CHANNELS),
         directions=", ".join(DIRECTIONS),
         strengths=", ".join(STRENGTHS),
+        novelty_hints=", ".join(NOVELTY_HINTS),
+        urgency_levels=", ".join(URGENCY_LEVELS),
+        market_surprise_levels=", ".join(MARKET_SURPRISE_LEVELS),
         text=chunk_text,
     )
     return _call_claude_prompt(client, prompt)
@@ -698,10 +765,16 @@ def _call_verification(
             "asset_impacts": ev.get("asset_impacts", []),
             "evidence_spans": ev.get("evidence_spans", []),
             "confidence": ev.get("confidence"),
+            "novelty_hint": ev.get("novelty_hint"),
+            "urgency": ev.get("urgency"),
+            "market_surprise": ev.get("market_surprise"),
         }
         for idx, ev in enumerate(candidates)
     ]
     prompt = MACRO_VERIFICATION_PROMPT.format(
+        novelty_hints=", ".join(NOVELTY_HINTS),
+        urgency_levels=", ".join(URGENCY_LEVELS),
+        market_surprise_levels=", ".join(MARKET_SURPRISE_LEVELS),
         candidates_json=json.dumps(candidates_payload, ensure_ascii=True),
         text=chunk_text,
     )
@@ -764,6 +837,13 @@ def _clamp01(value: Any, default: float = 0.0) -> float:
     return f
 
 
+def _normalize_optional_enum(value: Any, allowed: list[str]) -> str | None:
+    normalized = str(value or "").strip().lower()
+    if not normalized:
+        return None
+    return normalized if normalized in allowed else None
+
+
 def _normalize_for_match(text: str) -> str:
     return " ".join((text or "").lower().split())
 
@@ -803,8 +883,18 @@ def _extract_verifications(parsed: dict[str, Any]) -> list[dict[str, Any]]:
                 "candidate_index": candidate_index,
                 "verification_status": status,
                 "support_score": _clamp01(item.get("support_score"), default=0.0),
-                "confidence_calibrated": _clamp01(item.get("confidence_calibrated"), default=0.0),
+                "confidence_calibrated": _clamp01(
+                    item.get("confidence_calibrated", item.get("calibrated_confidence")),
+                    default=0.0,
+                ),
                 "rejection_reason": (item.get("rejection_reason") or "").strip(),
+                "novelty_hint": _normalize_optional_enum(item.get("novelty_hint"), NOVELTY_HINTS),
+                "urgency": _normalize_optional_enum(item.get("urgency"), URGENCY_LEVELS),
+                "market_surprise": _normalize_optional_enum(
+                    item.get("market_surprise"),
+                    MARKET_SURPRISE_LEVELS,
+                ),
+                "verifier_notes": (item.get("verifier_notes") or "").strip(),
             }
         )
     return rows
@@ -868,6 +958,7 @@ def _write_candidate_rows(
     for idx, ev in enumerate(candidates):
         candidate_id = _md5(f"{run_id}::candidate::{idx}")
         candidate_ids.append(candidate_id)
+        spans = [str(span).strip() for span in ev.get("evidence_spans", []) if str(span).strip()]
         row = {
             "candidate_id": candidate_id,
             "run_id": run_id,
@@ -878,11 +969,18 @@ def _write_candidate_rows(
             "summary": ev.get("summary"),
             "region": ev.get("region"),
             "time_horizon": ev.get("time_horizon"),
+            "evidence_text": spans[0] if spans else None,
+            "evidence_span_json": json.dumps(spans, ensure_ascii=True),
             "initial_confidence": _clamp01(ev.get("confidence"), default=0.0),
             "confidence_initial": _clamp01(ev.get("confidence"), default=0.0),
-            "evidence_spans_json": json.dumps(ev.get("evidence_spans", []), ensure_ascii=True),
+            "evidence_spans_json": json.dumps(spans, ensure_ascii=True),
             "candidate_json": json.dumps(ev, ensure_ascii=True),
             "raw_candidate_json": json.dumps(ev, ensure_ascii=True),
+            "novelty_hint": ev.get("novelty_hint"),
+            "urgency": ev.get("urgency"),
+            "market_surprise": ev.get("market_surprise"),
+            "extraction_pass": "candidate",
+            "content_class": chunk.get("content_class"),
             "created_at": _now_utc(),
         }
         payload = {k: v for k, v in row.items() if k in columns}
@@ -923,7 +1021,10 @@ def _write_verification_rows(
         )
         support_score = round((_clamp01(model.get("support_score"), 0.0) + evidence_ratio) / 2.0, 4)
         confidence_initial = _clamp01(ev.get("confidence"), 0.0)
-        confidence_from_verifier = _clamp01(model.get("confidence_calibrated"), 0.0)
+        confidence_from_verifier = _clamp01(
+            model.get("confidence_calibrated"),
+            confidence_initial,
+        )
         confidence_calibrated = round(
             min(confidence_initial, confidence_from_verifier, support_score),
             4,
@@ -934,6 +1035,23 @@ def _write_verification_rows(
         rejection_reason = str(model.get("rejection_reason") or "").strip()
         if status not in VERIFICATION_STATUS_ALLOWED:
             status = "weak"
+        novelty_hint = model.get("novelty_hint") or ev.get("novelty_hint")
+        urgency = model.get("urgency") or ev.get("urgency")
+        market_surprise = model.get("market_surprise") or ev.get("market_surprise")
+        verifier_notes = {
+            "model_verification_status": str(model.get("verification_status") or "").lower() or None,
+            "model_support_score": _clamp01(model.get("support_score"), 0.0),
+            "model_confidence_calibrated": _clamp01(
+                model.get("confidence_calibrated"),
+                confidence_initial,
+            ),
+            "evidence_match_ratio": round(evidence_ratio, 4),
+            "matched_spans": matched_spans,
+            "verifier_notes": model.get("verifier_notes") or "",
+            "novelty_hint": novelty_hint,
+            "urgency": urgency,
+            "market_surprise": market_surprise,
+        }
 
         if not spans:
             status = "rejected"
@@ -963,6 +1081,10 @@ def _write_verification_rows(
                 "evidence_spans_count": len(spans),
                 "matched_spans_count": len(matched_spans),
                 "rejection_reason": rejection_reason,
+                "novelty_hint": novelty_hint,
+                "urgency": urgency,
+                "market_surprise": market_surprise,
+                "verifier_notes_json": json.dumps(verifier_notes, ensure_ascii=True),
             }
         )
 
@@ -984,11 +1106,13 @@ def _write_verification_rows(
             "macro_event_index": idx,
             "verification_status": row_data["verification_status"],
             "support_score": row_data["support_score"],
+            "confidence_initial": row_data["confidence_initial"],
             "confidence_calibrated": row_data["confidence_calibrated"],
             "evidence_span_valid": 1 if row_data["evidence_span_valid"] else 0,
             "evidence_spans_count": row_data["evidence_spans_count"],
             "matched_spans_count": row_data["matched_spans_count"],
             "rejection_reason": row_data["rejection_reason"],
+            "verifier_notes_json": row_data["verifier_notes_json"],
             "created_at": _now_utc(),
         }
         payload = {k: v for k, v in payload.items() if k in columns}
@@ -1221,27 +1345,38 @@ def _write_run(
 
 def _write_normalized(conn: sqlite3.Connection, run_id: str, chunk: dict, events: list[dict]) -> None:
     """Write normalized macro rows for one run."""
+    macro_event_columns = _table_columns(conn, "macro_events")
     for idx, ev in enumerate(events):
         macro_event_id = _md5(f"{run_id}::{idx}")
 
         # macro_events
-        conn.execute(
-            "INSERT OR IGNORE INTO macro_events "
-            "(macro_event_id, run_id, article_id, chunk_id, event_type, summary, "
-            "region, time_horizon, confidence) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (
-                macro_event_id,
-                run_id,
-                chunk["article_id"],
-                chunk["chunk_id"],
-                ev.get("event_type", ""),
-                ev.get("summary", ""),
-                ev.get("region", ""),
-                ev.get("time_horizon", ""),
-                ev.get("confidence"),
-            ),
-        )
+        macro_event_row = {
+            "macro_event_id": macro_event_id,
+            "run_id": run_id,
+            "article_id": chunk["article_id"],
+            "chunk_id": chunk["chunk_id"],
+            "event_type": ev.get("event_type", ""),
+            "summary": ev.get("summary", ""),
+            "region": ev.get("region", ""),
+            "time_horizon": ev.get("time_horizon", ""),
+            "event_time_start": ev.get("event_time_start"),
+            "event_time_end": ev.get("event_time_end"),
+            "confidence": ev.get("confidence"),
+            "verification_status": ev.get("verification_status"),
+            "support_score": ev.get("support_score"),
+            "novelty_hint": ev.get("novelty_hint"),
+            "urgency": ev.get("urgency"),
+            "market_surprise": ev.get("market_surprise"),
+        }
+        macro_event_payload = {
+            key: value for key, value in macro_event_row.items() if key in macro_event_columns
+        }
+        if macro_event_payload:
+            conn.execute(
+                f"INSERT OR IGNORE INTO macro_events ({', '.join(macro_event_payload.keys())}) "
+                f"VALUES ({', '.join('?' for _ in macro_event_payload)})",
+                tuple(macro_event_payload.values()),
+            )
 
         # macro_event_shock_types
         for shock in ev.get("shock_types", []):
@@ -1575,7 +1710,19 @@ def run_extraction(
                     continue
                 calibrated_confidence = min(calibrated_confidence, STREAM_BRIEF_MAX_CONFIDENCE)
             if status == "verified":
-                verified_events.append({**event, "confidence": calibrated_confidence})
+                verified_events.append(
+                    {
+                        **event,
+                        "confidence": calibrated_confidence,
+                        "verification_status": status,
+                        "support_score": _clamp01(verification.get("support_score"), 0.0),
+                        "novelty_hint": verification.get("novelty_hint") or event.get("novelty_hint"),
+                        "urgency": verification.get("urgency") or event.get("urgency"),
+                        "market_surprise": (
+                            verification.get("market_surprise") or event.get("market_surprise")
+                        ),
+                    }
+                )
 
         if verified_events:
             _write_normalized(conn, run_id, chunk, verified_events)

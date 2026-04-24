@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import importlib
 import json
+import math
 import re
 import sqlite3
 from pathlib import Path
@@ -48,6 +49,17 @@ _RECENCY_SENSITIVE_TERMS: tuple[str, ...] = (
 )
 
 LOW_CONTEXT_CONTENT_CLASSES: frozenset[str] = frozenset({"stream_brief"})
+REQUIRED_RETRIEVAL_SCORE_COMPONENTS: tuple[str, ...] = (
+    "semantic_score",
+    "keyword_overlap_score",
+    "target_match_score",
+    "source_quality_score",
+    "recency_score",
+    "graph_relevance_score",
+    "event_support_score",
+    "duplicate_penalty",
+    "ambiguity_penalty",
+)
 
 # ---------------------------------------------------------------------------
 # Answer-quality parsing helpers (deterministic, no LLM judge)
@@ -237,6 +249,24 @@ def _normalized_text(value: Any) -> str | None:
         return None
     text = str(value).strip().lower()
     return text or None
+
+
+def _string_or_none(value: Any) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def _safe_json_loads(value: Any) -> Any:
+    if value in (None, ""):
+        return None
+    if isinstance(value, (dict, list)):
+        return value
+    try:
+        return json.loads(str(value))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return None
 
 
 def _target_attr(target: Any, key: str) -> Any:
@@ -586,12 +616,43 @@ def _extract_verifier_events(result: dict[str, Any]) -> list[dict[str, Any]]:
         events.append(
             {
                 "macro_event_id": str(event_id),
+                "cluster_id": _string_or_none(item.get("cluster_id")),
                 "verification_status": _normalized_text(item.get("verification_status")) or "unknown",
                 "support_score": _to_float(item.get("support_score")),
                 "confidence_calibrated": _to_float(item.get("confidence_calibrated")),
+                "novelty_hint": _normalized_text(item.get("novelty_hint")),
             }
         )
     return events
+
+
+def _extract_selected_signals(result: dict[str, Any]) -> list[dict[str, Any]]:
+    raw = (
+        result.get("selected_signals")
+        or (result.get("answer_meta") or {}).get("selected_signals")
+        or []
+    )
+    if not isinstance(raw, list):
+        return []
+
+    signals: list[dict[str, Any]] = []
+    for index, item in enumerate(raw):
+        if not isinstance(item, dict):
+            continue
+        feedback = _safe_json_loads(item.get("market_feedback")) or item.get("market_feedback") or {}
+        signals.append(
+            {
+                "signal_id": _string_or_none(
+                    item.get("signal_id") or item.get("id") or item.get("alert_id")
+                ),
+                "cluster_id": _string_or_none(item.get("cluster_id") or item.get("event_cluster_id")),
+                "signal_score": _to_float(item.get("signal_score")),
+                "novelty_hint": _normalized_text(item.get("novelty_hint")),
+                "market_feedback": feedback if isinstance(feedback, (dict, list)) else {},
+                "rank": index + 1,
+            }
+        )
+    return signals
 
 
 def _evaluate_verifier_precision(
@@ -624,6 +685,384 @@ def _evaluate_verifier_precision(
         "precision": precision,
         "expected_macro_event_ids": sorted(expected),
         "verified_macro_event_ids": sorted(verified_ids),
+    }
+
+
+def _expected_ranked_ids(case: dict[str, Any]) -> tuple[str | None, list[str]]:
+    signal_ids = case.get("expected_signal_ranking") or case.get("expected_signal_ids") or []
+    cluster_ids = case.get("expected_cluster_ranking") or case.get("expected_cluster_ids") or []
+    if signal_ids:
+        return "signal_id", [str(item) for item in signal_ids if str(item).strip()]
+    if cluster_ids:
+        return "cluster_id", [str(item) for item in cluster_ids if str(item).strip()]
+    return None, []
+
+
+def _extract_ranked_ids(
+    *,
+    selected_signals: list[dict[str, Any]],
+    retrieval_candidates: list[dict[str, Any]],
+    key: str,
+) -> list[str]:
+    ranked: list[str] = []
+    seen: set[str] = set()
+
+    for signal in selected_signals:
+        value = _string_or_none(signal.get(key))
+        if value and value not in seen:
+            ranked.append(value)
+            seen.add(value)
+
+    if ranked:
+        return ranked
+
+    sorted_candidates = sorted(
+        retrieval_candidates,
+        key=lambda item: (
+            int(item.get("selected") or 0),
+            _to_float(item.get("final_score")) or 0.0,
+        ),
+        reverse=True,
+    )
+    for candidate in sorted_candidates:
+        value = _string_or_none(candidate.get(key))
+        if value and value not in seen:
+            ranked.append(value)
+            seen.add(value)
+    return ranked
+
+
+def _evaluate_cluster_recall(
+    case: dict[str, Any],
+    selected_signals: list[dict[str, Any]],
+    retrieval_candidates: list[dict[str, Any]],
+) -> dict[str, Any]:
+    expected = {str(item) for item in case.get("expected_cluster_ids", []) if str(item).strip()}
+    if not expected:
+        return {
+            "available": False,
+            "skipped": True,
+            "hits": 0,
+            "expected_count": 0,
+            "recall": None,
+        }
+
+    observed = set(_extract_ranked_ids(
+        selected_signals=selected_signals,
+        retrieval_candidates=retrieval_candidates,
+        key="cluster_id",
+    ))
+    hits = sorted(expected & observed)
+    return {
+        "available": True,
+        "passed": True,
+        "hits": len(hits),
+        "expected_count": len(expected),
+        "observed_cluster_ids": sorted(observed),
+        "expected_cluster_ids": sorted(expected),
+        "recall": _safe_ratio(len(hits), len(expected)),
+    }
+
+
+def _discounted_cumulative_gain(ranked_ids: list[str], gains: dict[str, float]) -> float:
+    score = 0.0
+    for index, identifier in enumerate(ranked_ids):
+        gain = gains.get(identifier, 0.0)
+        if gain <= 0.0:
+            continue
+        score += gain / math.log2(index + 2)
+    return score
+
+
+def _evaluate_signal_ranking_quality(
+    case: dict[str, Any],
+    selected_signals: list[dict[str, Any]],
+    retrieval_candidates: list[dict[str, Any]],
+) -> dict[str, Any]:
+    key, expected = _expected_ranked_ids(case)
+    if not key or not expected:
+        return {
+            "available": False,
+            "skipped": True,
+            "ndcg": None,
+            "predicted_count": 0,
+        }
+
+    predicted = _extract_ranked_ids(
+        selected_signals=selected_signals,
+        retrieval_candidates=retrieval_candidates,
+        key=key,
+    )
+    if not predicted:
+        return {
+            "available": False,
+            "skipped": True,
+            "ndcg": None,
+            "predicted_count": 0,
+        }
+
+    gains = {
+        identifier: float(len(expected) - rank)
+        for rank, identifier in enumerate(expected)
+    }
+    observed_dcg = _discounted_cumulative_gain(predicted[: len(expected)], gains)
+    ideal_dcg = _discounted_cumulative_gain(expected, gains)
+    return {
+        "available": True,
+        "passed": True,
+        "id_kind": key,
+        "expected_ranked_ids": expected,
+        "predicted_ranked_ids": predicted[: len(expected)],
+        "predicted_count": len(predicted),
+        "ndcg": _safe_ratio(observed_dcg, ideal_dcg),
+    }
+
+
+def _evaluate_novelty_detection(
+    case: dict[str, Any],
+    selected_signals: list[dict[str, Any]],
+    verifier_events: list[dict[str, Any]],
+) -> dict[str, Any]:
+    raw_expected = case.get("expected_novelty_hints") or {}
+    expected: dict[str, str] = {}
+    if isinstance(raw_expected, dict):
+        expected = {
+            str(key): str(value).strip().lower()
+            for key, value in raw_expected.items()
+            if str(key).strip() and str(value).strip()
+        }
+    elif isinstance(raw_expected, list):
+        for item in raw_expected:
+            if not isinstance(item, dict):
+                continue
+            identifier = (
+                item.get("signal_id")
+                or item.get("cluster_id")
+                or item.get("macro_event_id")
+                or item.get("id")
+            )
+            novelty_hint = item.get("novelty_hint")
+            if identifier and novelty_hint:
+                expected[str(identifier)] = str(novelty_hint).strip().lower()
+
+    if not expected:
+        return {
+            "available": False,
+            "skipped": True,
+            "matches": 0,
+            "expected_count": 0,
+            "accuracy": None,
+        }
+
+    observed: dict[str, str] = {}
+    for signal in selected_signals:
+        novelty_hint = _normalized_text(signal.get("novelty_hint"))
+        if novelty_hint:
+            for key in ("signal_id", "cluster_id"):
+                identifier = _string_or_none(signal.get(key))
+                if identifier:
+                    observed.setdefault(identifier, novelty_hint)
+    for event in verifier_events:
+        novelty_hint = _normalized_text(event.get("novelty_hint"))
+        identifier = _string_or_none(event.get("macro_event_id"))
+        if identifier and novelty_hint:
+            observed.setdefault(identifier, novelty_hint)
+
+    matches = sum(1 for identifier, hint in expected.items() if observed.get(identifier) == hint)
+    return {
+        "available": True,
+        "passed": True,
+        "matches": matches,
+        "expected_count": len(expected),
+        "accuracy": _safe_ratio(matches, len(expected)),
+        "expected": expected,
+        "observed": observed,
+    }
+
+
+def _extract_signal_feedback_outcomes(
+    result: dict[str, Any],
+    selected_signals: list[dict[str, Any]],
+) -> list[str]:
+    labels: list[str] = []
+
+    def _append_outcome(payload: Any) -> None:
+        if isinstance(payload, dict):
+            label = payload.get("outcome_label") or payload.get("label") or payload.get("status")
+            norm = _normalized_text(label)
+            if norm:
+                labels.append(norm)
+        elif isinstance(payload, list):
+            for item in payload:
+                _append_outcome(item)
+
+    for signal in selected_signals:
+        _append_outcome(signal.get("market_feedback"))
+    _append_outcome(result.get("market_feedback"))
+    return labels
+
+
+def _evaluate_signal_hit_rate(
+    result: dict[str, Any],
+    selected_signals: list[dict[str, Any]],
+) -> dict[str, Any]:
+    outcomes = _extract_signal_feedback_outcomes(result, selected_signals)
+    hits = sum(1 for label in outcomes if label == "hit")
+    misses = sum(1 for label in outcomes if label == "miss")
+    unclear = sum(1 for label in outcomes if label not in {"hit", "miss"})
+    considered = hits + misses
+    if considered == 0:
+        return {
+            "available": False,
+            "skipped": True,
+            "hits": hits,
+            "misses": misses,
+            "unclear": unclear,
+            "hit_rate": None,
+        }
+    return {
+        "available": True,
+        "passed": True,
+        "hits": hits,
+        "misses": misses,
+        "unclear": unclear,
+        "considered": considered,
+        "hit_rate": _safe_ratio(hits, considered),
+    }
+
+
+def _fetch_observability_rows(
+    sqlite_conn: sqlite3.Connection,
+    run_id: str | None,
+) -> tuple[dict[str, Any] | None, list[dict[str, Any]]]:
+    if not run_id:
+        return None, []
+
+    qa_run: dict[str, Any] | None = None
+    retrieval_rows: list[dict[str, Any]] = []
+
+    try:
+        cursor = sqlite_conn.execute("SELECT * FROM qa_runs WHERE run_id = ?", (run_id,))
+        row = cursor.fetchone()
+        if row is not None:
+            columns = [item[0] for item in cursor.description or []]
+            qa_run = {
+                column: (row[column] if isinstance(row, sqlite3.Row) else row[index])
+                for index, column in enumerate(columns)
+            }
+    except sqlite3.Error:
+        qa_run = None
+
+    try:
+        cursor = sqlite_conn.execute(
+            "SELECT * FROM retrieval_candidates WHERE run_id = ? ORDER BY selected DESC, final_score DESC",
+            (run_id,),
+        )
+        rows = cursor.fetchall()
+        columns = [item[0] for item in cursor.description or []]
+        for row in rows:
+            retrieval_rows.append(
+                {
+                    column: (row[column] if isinstance(row, sqlite3.Row) else row[index])
+                    for index, column in enumerate(columns)
+                }
+            )
+    except sqlite3.Error:
+        retrieval_rows = []
+
+    return qa_run, retrieval_rows
+
+
+def _evaluate_observability(
+    *,
+    case: dict[str, Any],
+    result: dict[str, Any],
+    qa_run: dict[str, Any] | None,
+    retrieval_candidates: list[dict[str, Any]],
+    selected_signals: list[dict[str, Any]],
+) -> dict[str, Any]:
+    run_id = _string_or_none(result.get("run_id"))
+    if not run_id:
+        return {
+            "available": False,
+            "skipped": True,
+            "passed": False,
+        }
+
+    route_type = _extract_route_type(case, result)
+    qa_run_logged = qa_run is not None
+    route_decision_payload = _safe_json_loads((qa_run or {}).get("route_decision_json"))
+    answer_meta_payload = _safe_json_loads((qa_run or {}).get("answer_meta_json"))
+    answer_decision_payload = _safe_json_loads((qa_run or {}).get("answer_decision_json"))
+    selected_signals_payload = _safe_json_loads((qa_run or {}).get("selected_signals_json"))
+
+    retrieval_required = bool(result.get("chunks")) or bool(retrieval_candidates)
+    retrieval_logged = bool(retrieval_candidates) if retrieval_required else True
+
+    score_component_rows = 0
+    score_component_missing: dict[str, int] = {}
+    for candidate in retrieval_candidates:
+        trace = _safe_json_loads(candidate.get("score_trace_json")) or {}
+        missing = [
+            component
+            for component in REQUIRED_RETRIEVAL_SCORE_COMPONENTS
+            if component not in trace
+        ]
+        if not missing:
+            score_component_rows += 1
+            continue
+        for component in missing:
+            score_component_missing[component] = score_component_missing.get(component, 0) + 1
+    score_components_logged = (
+        score_component_rows == len(retrieval_candidates)
+        if retrieval_candidates
+        else not retrieval_required
+    )
+
+    route_decision_logged = isinstance(route_decision_payload, dict) and bool(
+        route_decision_payload.get("final_route") or route_decision_payload.get("route_seed")
+    )
+    answer_decision_logged = (
+        isinstance(answer_meta_payload, dict)
+        and "decision" in answer_meta_payload
+        and "answer_confidence" in answer_meta_payload
+    ) or (
+        isinstance(answer_decision_payload, dict)
+        and "decision" in answer_decision_payload
+        and "answer_confidence" in answer_decision_payload
+    )
+    signal_logging_required = (
+        route_type == "signal_discovery"
+        or bool(selected_signals)
+        or bool(case.get("expected_signal_ids"))
+        or bool(case.get("expected_cluster_ids"))
+    )
+    selected_signals_logged = (
+        isinstance(selected_signals_payload, list)
+        if signal_logging_required
+        else True
+    )
+
+    return {
+        "available": True,
+        "passed": all(
+            (
+                qa_run_logged,
+                route_decision_logged,
+                retrieval_logged,
+                score_components_logged,
+                answer_decision_logged,
+                selected_signals_logged,
+            )
+        ),
+        "qa_run_logged": qa_run_logged,
+        "retrieval_candidates_logged": retrieval_logged,
+        "route_decision_logged": route_decision_logged,
+        "score_components_logged": score_components_logged,
+        "answer_decision_logged": answer_decision_logged,
+        "selected_signals_logged": selected_signals_logged,
+        "logged_candidate_count": len(retrieval_candidates),
+        "score_component_missing": score_component_missing,
     }
 
 
@@ -801,6 +1240,56 @@ def _aggregate_verifier_precision(results: list[dict[str, Any]]) -> dict[str, An
     }
 
 
+def _aggregate_fraction_metric(
+    results: list[dict[str, Any]],
+    *,
+    key: str,
+    numerator_key: str,
+    denominator_key: str,
+    value_key: str,
+) -> dict[str, Any]:
+    numerator = 0
+    denominator = 0
+    case_ids: list[str] = []
+    for result in results:
+        metric = ((result.get("v2") or {}).get(key) or {})
+        if not metric.get("available"):
+            continue
+        numerator += int(metric.get(numerator_key, 0))
+        denominator += int(metric.get(denominator_key, 0))
+        case_ids.append(result.get("id", "unknown"))
+    return {
+        "value": _safe_ratio(numerator, denominator),
+        numerator_key: numerator,
+        denominator_key: denominator,
+        "cases": case_ids,
+    }
+
+
+def _aggregate_average_metric(
+    results: list[dict[str, Any]],
+    *,
+    key: str,
+    value_key: str,
+) -> dict[str, Any]:
+    values: list[float] = []
+    case_ids: list[str] = []
+    for result in results:
+        metric = ((result.get("v2") or {}).get(key) or {})
+        if not metric.get("available"):
+            continue
+        value = _to_float(metric.get(value_key))
+        if value is None:
+            continue
+        values.append(value)
+        case_ids.append(result.get("id", "unknown"))
+    return {
+        "value": round(sum(values) / len(values), 4) if values else None,
+        "cases": case_ids,
+        "count": len(values),
+    }
+
+
 def _aggregate_contradiction_rate(results: list[dict[str, Any]]) -> dict[str, Any]:
     contradictions = 0
     total = 0
@@ -839,9 +1328,36 @@ def _compute_v2_metrics(results: list[dict[str, Any]]) -> dict[str, Any]:
         "target_resolution_accuracy": _aggregate_boolean_metric(results, "target_resolution_eval"),
         "abstention_correctness": _aggregate_boolean_metric(results, "abstention_eval"),
         "source_trust_compliance": _aggregate_boolean_metric(results, "source_trust_eval"),
+        "cluster_recall": _aggregate_fraction_metric(
+            results,
+            key="cluster_recall_eval",
+            numerator_key="hits",
+            denominator_key="expected_count",
+            value_key="recall",
+        ),
+        "signal_ranking_quality": _aggregate_average_metric(
+            results,
+            key="signal_ranking_eval",
+            value_key="ndcg",
+        ),
+        "novelty_detection": _aggregate_fraction_metric(
+            results,
+            key="novelty_detection_eval",
+            numerator_key="matches",
+            denominator_key="expected_count",
+            value_key="accuracy",
+        ),
         "verifier_precision": _aggregate_verifier_precision(results),
         "contradiction_rate": _aggregate_contradiction_rate(results),
         "unsupported_mechanism_rate": _aggregate_unsupported_mechanism_rate(results),
+        "signal_hit_rate": _aggregate_fraction_metric(
+            results,
+            key="signal_market_feedback_eval",
+            numerator_key="hits",
+            denominator_key="considered",
+            value_key="hit_rate",
+        ),
+        "observability_coverage": _aggregate_boolean_metric(results, "observability_eval"),
     }
 
 
@@ -913,6 +1429,17 @@ def _evaluate_release_gate(
         ("contradiction_rate", "<=", thresholds["contradiction_rate_max"]),
         ("unsupported_mechanism_rate", "<=", thresholds["unsupported_mechanism_rate_max"]),
     ]
+    optional_thresholds = [
+        ("cluster_recall", ">=", "cluster_recall_min"),
+        ("signal_ranking_quality", ">=", "signal_ranking_quality_min"),
+        ("novelty_detection", ">=", "novelty_detection_min"),
+        ("signal_hit_rate", ">=", "signal_hit_rate_min"),
+        ("observability_coverage", ">=", "observability_coverage_min"),
+    ]
+    for metric_name, operator, threshold_key in optional_thresholds:
+        threshold = thresholds.get(threshold_key)
+        if threshold is not None:
+            metric_specs.append((metric_name, operator, threshold))
 
     for metric_name, operator, threshold in metric_specs:
         observed = _to_float((metrics.get(metric_name) or {}).get("value"))
@@ -1363,10 +1890,22 @@ def evaluate_case(case: dict[str, Any], runtime: dict[str, Any], *, skip_generat
     answer_confidence = _extract_answer_confidence(result, parsed_answer_meta)
     decision = _extract_decision(result, result["answer"], answer_confidence)
     verifier_events = _extract_verifier_events(result)
+    selected_signals = _extract_selected_signals(result)
+    qa_run, retrieval_candidate_rows = _fetch_observability_rows(
+        runtime["sqlite_conn"],
+        _string_or_none(result.get("run_id")),
+    )
 
     target_resolution_eval = _evaluate_target_resolution(case, resolved_target)
     abstention_eval = _evaluate_abstention(case, decision, result["answer"])
     source_trust_eval = _evaluate_source_trust(case, source_meta_by_chunk)
+    cluster_recall_eval = _evaluate_cluster_recall(case, selected_signals, retrieval_candidate_rows)
+    signal_ranking_eval = _evaluate_signal_ranking_quality(
+        case,
+        selected_signals,
+        retrieval_candidate_rows,
+    )
+    novelty_detection_eval = _evaluate_novelty_detection(case, selected_signals, verifier_events)
     verifier_precision_eval = _evaluate_verifier_precision(case, verifier_events)
     contradiction_eval = _evaluate_contradiction(result)
     unsupported_mechanism_eval = _evaluate_unsupported_mechanisms(
@@ -1374,12 +1913,42 @@ def evaluate_case(case: dict[str, Any], runtime: dict[str, Any], *, skip_generat
         result,
         parsed_answer_meta,
     )
+    signal_market_feedback_eval = _evaluate_signal_hit_rate(result, selected_signals)
+    observability_eval = _evaluate_observability(
+        case=case,
+        result=result,
+        qa_run=qa_run,
+        retrieval_candidates=retrieval_candidate_rows,
+        selected_signals=selected_signals,
+    )
     slices = {
         "query_type_route": route_type,
         "ambiguity": _ambiguity_slice(resolved_target),
         "recency_sensitivity": _recency_sensitivity_slice(case),
         "source_quality": _source_quality_slice(source_meta_by_chunk, case),
     }
+    if cluster_recall_eval.get("available") and case.get("min_cluster_recall") is not None:
+        passes.append(
+            (_to_float(cluster_recall_eval.get("recall")) or 0.0)
+            >= float(case["min_cluster_recall"])
+        )
+    if signal_ranking_eval.get("available") and case.get("min_signal_ranking_quality") is not None:
+        passes.append(
+            (_to_float(signal_ranking_eval.get("ndcg")) or 0.0)
+            >= float(case["min_signal_ranking_quality"])
+        )
+    if novelty_detection_eval.get("available") and case.get("min_novelty_detection") is not None:
+        passes.append(
+            (_to_float(novelty_detection_eval.get("accuracy")) or 0.0)
+            >= float(case["min_novelty_detection"])
+        )
+    if signal_market_feedback_eval.get("available") and case.get("min_signal_hit_rate") is not None:
+        passes.append(
+            (_to_float(signal_market_feedback_eval.get("hit_rate")) or 0.0)
+            >= float(case["min_signal_hit_rate"])
+        )
+    if case.get("require_observability"):
+        passes.append(bool(observability_eval.get("passed")))
 
     return {
         "id": case["id"],
@@ -1401,10 +1970,16 @@ def evaluate_case(case: dict[str, Any], runtime: dict[str, Any], *, skip_generat
             "target_resolution_eval": target_resolution_eval,
             "abstention_eval": abstention_eval,
             "source_trust_eval": source_trust_eval,
+            "selected_signals": selected_signals,
+            "cluster_recall_eval": cluster_recall_eval,
+            "signal_ranking_eval": signal_ranking_eval,
+            "novelty_detection_eval": novelty_detection_eval,
             "verifier_events": verifier_events,
             "verifier_precision_eval": verifier_precision_eval,
             "contradiction_eval": contradiction_eval,
             "unsupported_mechanism_eval": unsupported_mechanism_eval,
+            "signal_market_feedback_eval": signal_market_feedback_eval,
+            "observability_eval": observability_eval,
             "slices": slices,
         },
         "passed": all(passes),

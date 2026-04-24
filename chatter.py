@@ -141,6 +141,7 @@ SOURCE_KEYWORDS = {
 }
 
 ROUTE_TYPES = (
+    "signal_discovery",
     "latest_news",
     "daily_summary",
     "macro_causal",
@@ -177,6 +178,15 @@ UNIFIED_SCORING_WEIGHTS: dict[str, float] = {
 }
 
 ROUTE_WEIGHT_MULTIPLIERS: dict[str, dict[str, float]] = {
+    "signal_discovery": {
+        "semantic_score": 1.10,
+        "target_match_score": 1.15,
+        "source_quality_score": 1.20,
+        "recency_score": 1.30,
+        "graph_relevance_score": 1.20,
+        "event_support_score": 1.25,
+        "duplicate_penalty": 1.20,
+    },
     "latest_news": {"recency_score": 1.35, "source_quality_score": 1.15},
     "daily_summary": {"source_quality_score": 1.15, "duplicate_penalty": 1.25},
     "macro_causal": {"event_support_score": 1.35, "graph_relevance_score": 1.25},
@@ -187,6 +197,14 @@ ROUTE_WEIGHT_MULTIPLIERS: dict[str, dict[str, float]] = {
 }
 
 ROUTE_PROFILES: dict[str, dict[str, Any]] = {
+    "signal_discovery": {
+        "top_k": max(5, TOP_K + 2),
+        "expanded_k": max(12, EXPANDED_K + 4),
+        "recency_half_life_days": max(1.0, RECENCY_HALF_LIFE_DAYS * 0.6),
+        "candidate_cap": max(24, EXPANDED_K * 4),
+        "answer_strictness": "high",
+        "allowed_content_classes": ("news_report", "analysis", "official_release", "stream_brief"),
+    },
     "latest_news": {
         "top_k": max(4, TOP_K),
         "expanded_k": max(EXPANDED_K, TOP_K + 4),
@@ -291,7 +309,21 @@ AMBIGUITY_ROUTE_TERMS = (
     "versus",
 )
 
+SIGNAL_DISCOVERY_HINTS = (
+    "what matters today",
+    "what changed",
+    "top signals",
+    "knowledge arbitrage",
+    "emerging narratives",
+    "market-moving",
+    "market moving",
+    "what should i watch",
+    "top risks",
+    "top opportunities",
+)
+
 ROUTE_HINTS = {
+    "signal_discovery": SIGNAL_DISCOVERY_HINTS,
     "latest_news": ("latest", "recent", "new", "update", "today", "yesterday"),
     "daily_summary": SUMMARY_TERMS + SUMMARY_TIME_TERMS,
     "macro_causal": (
@@ -641,6 +673,17 @@ def _keyword_overlap_score(query: str, text: str) -> float:
     return len(query_terms & text_terms) / max(len(query_terms), 1)
 
 
+def _safe_json_loads(value: Any, default: Any) -> Any:
+    if value in (None, ""):
+        return default
+    if isinstance(value, (list, dict)):
+        return value
+    try:
+        return json.loads(value)
+    except (TypeError, json.JSONDecodeError):
+        return default
+
+
 def _safe_float(value: Any, default: float = 0.0) -> float:
     try:
         if value is None:
@@ -699,6 +742,8 @@ def classify_query_route(
         return "macro_causal"
     if target and target.needs_disambiguation:
         return "ambiguous"
+    if any(h in q for h in ROUTE_HINTS["signal_discovery"]):
+        return "signal_discovery"
     if any(h in q for h in ROUTE_HINTS["latest_news"]):
         return "latest_news"
     if target and target.canonical_name and any(h in q for h in ROUTE_HINTS["entity_profile"]):
@@ -763,6 +808,8 @@ def _target_match_component(row: dict[str, Any], target: QueryTarget | None) -> 
 
 def _graph_relevance_component(row: dict[str, Any]) -> float:
     kind = str(row.get("retrieval_kind") or "")
+    if kind == "signal_alert":
+        return 0.95
     if kind.startswith("macro_event"):
         return 0.90
     if kind == "entity_mentions":
@@ -816,7 +863,7 @@ def _apply_unified_scoring(
     scored: list[dict] = []
 
     for row in rows:
-        uid = row.get("chunk_uid")
+        uid = row.get("chunk_uid") or row.get("candidate_id") or row.get("signal_id") or row.get("cluster_id")
         if not uid:
             continue
 
@@ -825,7 +872,8 @@ def _apply_unified_scoring(
             semantic_score = _clamp01(_safe_float(row.get("semantic_score"), _safe_float(row.get("candidate_score"), 0.45)))
         else:
             semantic_score = _clamp01(cosine_sim(query_vec, np.array(emb, dtype=np.float32)))
-        keyword_overlap = _clamp01(_keyword_overlap_score(query, row.get("text", "")))
+        candidate_text = row.get("text") or row.get("summary") or row.get("headline") or row.get("title") or ""
+        keyword_overlap = _clamp01(_keyword_overlap_score(query, candidate_text))
         target_match = _target_match_component(row, target)
         source_quality = _source_quality_component(row, route_type=route_type)
 
@@ -836,7 +884,7 @@ def _apply_unified_scoring(
         graph_relevance = _graph_relevance_component(row)
         event_support = _event_support_component(row)
 
-        text_fingerprint = re.sub(r"\s+", " ", (row.get("text") or "").strip().lower())[:280]
+        text_fingerprint = re.sub(r"\s+", " ", str(candidate_text).strip().lower())[:280]
         duplicate_penalty = 1.0 if (uid in seen_uid or text_fingerprint in seen_text_fingerprints) else 0.0
         ambiguity_penalty = _clamp01(target.ambiguity_score if target else 0.0)
 
@@ -889,6 +937,505 @@ def _apply_unified_scoring(
 
     scored.sort(key=lambda item: item.get("final_score", item.get("score", 0.0)), reverse=True)
     return scored
+
+
+def _signal_candidate_text(row: dict[str, Any]) -> str:
+    asset_targets = _safe_json_loads(row.get("asset_targets_json"), [])
+    top_assets = _safe_json_loads(row.get("top_assets_json"), [])
+    asset_terms: list[str] = []
+    for payload in list(asset_targets) + list(top_assets):
+        if isinstance(payload, dict):
+            for key in ("target_id", "display_name", "asset_key", "ticker", "name"):
+                value = payload.get(key)
+                if value:
+                    asset_terms.append(str(value))
+        elif payload:
+            asset_terms.append(str(payload))
+    return " ".join(
+        part
+        for part in (
+            row.get("headline"),
+            row.get("signal_summary"),
+            row.get("canonical_summary"),
+            row.get("event_type"),
+            row.get("primary_shock_type"),
+            row.get("region"),
+            " ".join(asset_terms),
+        )
+        if part
+    ).strip()
+
+
+def _signal_target_match_component(
+    row: dict[str, Any],
+    target: QueryTarget | None,
+    asset_target: dict[str, Any] | None,
+) -> float:
+    expected_terms: list[str] = []
+    if target:
+        for value in (target.display_name, target.canonical_name, target.ticker):
+            if value:
+                expected_terms.append(str(value).lower())
+    if asset_target:
+        for value in (asset_target.get("display_name"), asset_target.get("target_id"), asset_target.get("asset_key")):
+            if value:
+                expected_terms.append(str(value).lower())
+    expected_terms = [term for term in expected_terms if term]
+    if not expected_terms:
+        return 0.45
+
+    text = _signal_candidate_text(row).lower()
+    asset_blob = (
+        json.dumps(_safe_json_loads(row.get("asset_targets_json"), []), ensure_ascii=False).lower()
+        + " "
+        + json.dumps(_safe_json_loads(row.get("top_assets_json"), []), ensure_ascii=False).lower()
+    )
+    score = 0.12
+    for term in expected_terms:
+        if term in text:
+            score += 0.42
+        if term in asset_blob:
+            score += 0.18
+    return _clamp01(score)
+
+
+def _signal_graph_relevance_component(row: dict[str, Any]) -> float:
+    event_count = min(max(_safe_float(row.get("supporting_event_count"), _safe_float(row.get("member_count"), 0.0)), 0.0), 5.0) / 5.0
+    source_count = min(max(_safe_float(row.get("supporting_source_count"), _safe_float(row.get("unique_source_count"), 0.0)), 0.0), 5.0) / 5.0
+    has_structure = 0.10 if row.get("event_type") else 0.0
+    has_shock = 0.08 if row.get("primary_shock_type") else 0.0
+    return _clamp01(0.42 + 0.20 * event_count + 0.20 * source_count + has_structure + has_shock)
+
+
+def _signal_event_support_component(row: dict[str, Any]) -> float:
+    base_signal = _clamp01(_safe_float(row.get("base_signal_score"), _safe_float(row.get("cluster_signal_score"), 0.0)))
+    confidence_score = _clamp01(_safe_float(row.get("confidence_score"), 0.0))
+    event_count = min(max(_safe_float(row.get("supporting_event_count"), _safe_float(row.get("member_count"), 0.0)), 0.0), 4.0) / 4.0
+    source_count = min(max(_safe_float(row.get("supporting_source_count"), _safe_float(row.get("unique_source_count"), 0.0)), 0.0), 4.0) / 4.0
+    return _clamp01(0.35 * base_signal + 0.25 * confidence_score + 0.20 * event_count + 0.20 * source_count)
+
+
+def _signal_source_quality_component(row: dict[str, Any]) -> float:
+    base_quality = _clamp01(_safe_float(row.get("cluster_source_quality_score"), 0.0))
+    unique_sources = min(max(_safe_float(row.get("unique_source_count"), _safe_float(row.get("supporting_source_count"), 0.0)), 0.0), 5.0) / 5.0
+    return _clamp01(max(base_quality, 0.35 + 0.45 * base_quality + 0.20 * unique_sources))
+
+
+def _synthesize_signal_headline(row: dict[str, Any]) -> str:
+    if row.get("headline"):
+        return str(row["headline"]).strip()
+    event_type = (row.get("event_type") or "macro signal").replace("_", " ").strip()
+    region = str(row.get("region") or "global").strip()
+    summary = str(row.get("signal_summary") or row.get("canonical_summary") or "").strip()
+    if summary:
+        summary = re.sub(r"\s+", " ", summary)[:120].rstrip(". ")
+        return f"{event_type.title()} in {region}: {summary}"
+    return f"{event_type.title()} in {region}"
+
+
+def _load_signal_evidence_chunks(
+    sqlite_conn: sqlite3.Connection,
+    cluster_ids: list[str],
+    *,
+    date_start: str | None = None,
+    date_end: str | None = None,
+    source_filter: str | None = None,
+    per_cluster_limit: int = 3,
+) -> dict[str, list[dict[str, Any]]]:
+    if not cluster_ids:
+        return {}
+
+    placeholders = ",".join("?" for _ in cluster_ids)
+    sql = f"""
+        SELECT
+            cm.cluster_id,
+            cm.macro_event_id,
+            COALESCE(cm.chunk_id, me.chunk_id) AS chunk_id,
+            COALESCE(cm.article_id, me.article_id, c.article_id) AS article_id,
+            cm.similarity_score,
+            me.summary AS macro_summary,
+            me.event_type,
+            me.region,
+            me.time_horizon,
+            me.confidence AS macro_confidence,
+            me.verification_status,
+            me.support_score,
+            me.novelty_hint,
+            me.urgency,
+            me.market_surprise,
+            c.text,
+            c.embedding_json,
+            c.published_date,
+            c.period_key,
+            a.title,
+            a.url,
+            a.source,
+            a.source_trust_tier,
+            a.content_class,
+            a.article_quality_score,
+            a.quality_flags_json
+        FROM cluster_members cm
+        JOIN macro_events me
+          ON me.macro_event_id = cm.macro_event_id
+        LEFT JOIN chunks c
+          ON c.chunk_id = COALESCE(cm.chunk_id, me.chunk_id)
+        JOIN articles a
+          ON a.article_id = COALESCE(cm.article_id, me.article_id, c.article_id)
+        WHERE cm.cluster_id IN ({placeholders})
+          AND c.chunk_id IS NOT NULL
+    """
+    params: list[Any] = list(cluster_ids)
+    if date_start:
+        sql += " AND c.published_date >= ?"
+        params.append(date_start)
+    if date_end:
+        sql += " AND c.published_date <= ?"
+        params.append(date_end)
+    if source_filter:
+        sql += " AND a.source = ?"
+        params.append(source_filter)
+    sql += """
+        ORDER BY
+            cm.cluster_id,
+            COALESCE(me.support_score, 0.0) DESC,
+            COALESCE(cm.similarity_score, 0.0) DESC,
+            c.published_date DESC
+    """
+
+    rows = sqlite_conn.execute(sql, params).fetchall()
+    grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    seen_by_cluster: dict[str, set[str]] = defaultdict(set)
+    for row in rows:
+        cluster_id = str(row["cluster_id"])
+        chunk_id = str(row["chunk_id"])
+        if not cluster_id or not chunk_id or chunk_id in seen_by_cluster[cluster_id]:
+            continue
+        if len(grouped[cluster_id]) >= max(per_cluster_limit, 1):
+            continue
+        item = _sqlite_row_to_chunk_dict(row)
+        item.update(
+            {
+                "cluster_id": cluster_id,
+                "macro_event_id": row["macro_event_id"],
+                "retrieval_kind": "signal_cluster_evidence",
+                "macro_summary": row["macro_summary"],
+                "event_type": row["event_type"],
+                "region": row["region"],
+                "time_horizon": row["time_horizon"],
+                "macro_confidence": row["macro_confidence"],
+                "verification_status": row["verification_status"],
+                "support_score": row["support_score"],
+                "novelty_hint": row["novelty_hint"],
+                "urgency": row["urgency"],
+                "market_surprise": row["market_surprise"],
+                "graph_relevance_score": 0.88,
+                "event_support_score": _clamp01(_safe_float(row["support_score"], _safe_float(row["macro_confidence"], 0.55))),
+            }
+        )
+        grouped[cluster_id].append(item)
+        seen_by_cluster[cluster_id].add(chunk_id)
+    return grouped
+
+
+def retrieve_top_signals(
+    *,
+    query: str,
+    embed_model: SentenceTransformer,
+    sqlite_conn: sqlite3.Connection,
+    alias_to_ticker: dict[str, str],
+    ticker_to_canonical: dict[str, str],
+    alias_to_fin_entity: dict[str, dict[str, Any]],
+    driver=None,
+    top_k: int | None = None,
+    expanded_k: int | None = None,
+    recency_half_life_days: float | None = None,
+    source_filter: str | None = None,
+    date_start: str | None = None,
+    date_end: str | None = None,
+) -> tuple[list[dict[str, Any]], QueryTarget, dict[str, Any]]:
+    target = resolve_query_target(
+        query,
+        alias_to_ticker,
+        ticker_to_canonical,
+        driver,
+        sqlite_conn=sqlite_conn,
+        alias_to_fin_entity=alias_to_fin_entity,
+    )
+    route_profile = _resolve_route_profile("signal_discovery")
+    top_limit = max(int(top_k or route_profile["top_k"]), 1)
+    expanded_limit = max(int(expanded_k or route_profile["expanded_k"]), top_limit)
+    recency_half_life = float(recency_half_life_days or route_profile["recency_half_life_days"])
+    candidate_limit = max(int(route_profile["candidate_cap"]), expanded_limit)
+    asset_target = _resolve_asset_target(sqlite_conn, query, target)
+    query_vec = embed_model.encode([query], normalize_embeddings=True)[0]
+
+    def _signal_filter(date_column: str, cluster_ref: str) -> tuple[str, list[Any]]:
+        clauses = ["1=1"]
+        params: list[Any] = []
+        if date_start:
+            clauses.append(f"{date_column} >= ?")
+            params.append(date_start)
+        if date_end:
+            clauses.append(f"{date_column} <= ?")
+            params.append(date_end)
+        if source_filter:
+            clauses.append(
+                f"""
+                EXISTS (
+                    SELECT 1
+                    FROM cluster_members cm2
+                    JOIN articles a2
+                      ON a2.article_id = COALESCE(
+                          cm2.article_id,
+                          (SELECT me2.article_id FROM macro_events me2 WHERE me2.macro_event_id = cm2.macro_event_id LIMIT 1)
+                      )
+                    WHERE cm2.cluster_id = {cluster_ref}
+                      AND a2.source = ?
+                )
+                """.strip()
+            )
+            params.append(source_filter)
+        return " AND ".join(clauses), params
+
+    primary_filter, primary_params = _signal_filter("sa.signal_date", "sa.cluster_id")
+    primary_sql = f"""
+        SELECT
+            sa.signal_id,
+            sa.cluster_id,
+            sa.signal_date,
+            sa.rank AS signal_rank,
+            sa.signal_score AS base_signal_score,
+            sa.headline,
+            sa.summary AS signal_summary,
+            sa.novelty_hint,
+            sa.urgency,
+            sa.market_surprise,
+            sa.top_assets_json,
+            ecs.score_id,
+            ecs.score_date,
+            ecs.novelty_score,
+            ecs.source_quality_score AS cluster_source_quality_score,
+            ecs.velocity_score,
+            ecs.asset_impact_score,
+            ecs.confidence_score,
+            ecs.recency_score AS cluster_recency_score,
+            ecs.signal_score AS cluster_signal_score,
+            ecs.supporting_event_count,
+            ecs.supporting_source_count,
+            ec.event_type,
+            ec.primary_shock_type,
+            ec.region,
+            ec.canonical_summary,
+            ec.first_event_time,
+            ec.last_event_time,
+            ec.member_count,
+            ec.unique_source_count,
+            ec.asset_targets_json
+        FROM signal_alerts sa
+        JOIN event_clusters ec
+          ON ec.cluster_id = sa.cluster_id
+        LEFT JOIN event_cluster_scores ecs
+          ON ecs.score_id = sa.score_id
+        WHERE {primary_filter}
+          AND COALESCE(sa.status, 'active') <> 'dismissed'
+        ORDER BY sa.signal_date DESC, sa.signal_score DESC, COALESCE(sa.rank, 9999) ASC
+        LIMIT ?
+    """
+    raw_rows = [dict(row) for row in sqlite_conn.execute(primary_sql, [*primary_params, candidate_limit]).fetchall()]
+
+    if not raw_rows:
+        fallback_filter, fallback_params = _signal_filter("ecs.score_date", "ecs.cluster_id")
+        fallback_sql = f"""
+            SELECT
+                COALESCE(ecs.score_id, ecs.cluster_id || '::' || ecs.score_date) AS signal_id,
+                ecs.cluster_id,
+                ecs.score_date AS signal_date,
+                NULL AS signal_rank,
+                ecs.signal_score AS base_signal_score,
+                NULL AS headline,
+                ec.canonical_summary AS signal_summary,
+                NULL AS novelty_hint,
+                NULL AS urgency,
+                NULL AS market_surprise,
+                NULL AS top_assets_json,
+                ecs.score_id,
+                ecs.score_date,
+                ecs.novelty_score,
+                ecs.source_quality_score AS cluster_source_quality_score,
+                ecs.velocity_score,
+                ecs.asset_impact_score,
+                ecs.confidence_score,
+                ecs.recency_score AS cluster_recency_score,
+                ecs.signal_score AS cluster_signal_score,
+                ecs.supporting_event_count,
+                ecs.supporting_source_count,
+                ec.event_type,
+                ec.primary_shock_type,
+                ec.region,
+                ec.canonical_summary,
+                ec.first_event_time,
+                ec.last_event_time,
+                ec.member_count,
+                ec.unique_source_count,
+                ec.asset_targets_json
+            FROM event_cluster_scores ecs
+            JOIN event_clusters ec
+              ON ec.cluster_id = ecs.cluster_id
+            WHERE {fallback_filter}
+            ORDER BY ecs.score_date DESC, ecs.signal_score DESC
+            LIMIT ?
+        """
+        raw_rows = [dict(row) for row in sqlite_conn.execute(fallback_sql, [*fallback_params, candidate_limit]).fetchall()]
+
+    if not raw_rows:
+        return [], target, {
+            "route_type": "signal_discovery",
+            "candidate_count": 0,
+            "ranked_count": 0,
+            "selected_signal_count": 0,
+            "date_start": date_start,
+            "date_end": date_end,
+            "source_filter": source_filter,
+            "target": {
+                "canonical_name": target.canonical_name,
+                "display_name": target.display_name,
+                "ticker": target.ticker,
+                "ambiguity_score": target.ambiguity_score,
+                "needs_disambiguation": target.needs_disambiguation,
+                "resolution_mode": target.resolution_mode,
+            },
+            "ranked_candidates": [],
+        }
+
+    texts = [_signal_candidate_text(row) for row in raw_rows]
+    embeddings = embed_model.encode(texts, normalize_embeddings=True)
+    weights = _resolve_scoring_weights("signal_discovery")
+    now_ts = int(datetime.now(timezone.utc).timestamp())
+    half_life_s = max(0.1, recency_half_life) * 86400.0
+    seen_ids: set[str] = set()
+    seen_texts: set[str] = set()
+    scored_rows: list[dict[str, Any]] = []
+
+    for row, emb in zip(raw_rows, embeddings):
+        signal_id = str(row.get("signal_id") or "")
+        cluster_id = str(row.get("cluster_id") or "")
+        if not signal_id or not cluster_id:
+            continue
+        text = _signal_candidate_text(row)
+        fingerprint = re.sub(r"\s+", " ", text.lower())[:280]
+        published_ts = _published_date_to_ts(row.get("signal_date"))
+        recency_score = float(np.exp(-max(0.0, float(now_ts - published_ts)) / half_life_s)) if published_ts is not None else 0.0
+        recency_score = _clamp01(max(recency_score, _safe_float(row.get("cluster_recency_score"), 0.0)))
+        semantic_score = _clamp01(cosine_sim(query_vec, np.array(emb, dtype=np.float32)))
+        keyword_overlap = _clamp01(_keyword_overlap_score(query, text))
+        target_match = _signal_target_match_component(row, target, asset_target)
+        source_quality = _signal_source_quality_component(row)
+        graph_relevance = _signal_graph_relevance_component(row)
+        event_support = _signal_event_support_component(row)
+        duplicate_penalty = 1.0 if (signal_id in seen_ids or cluster_id in seen_ids or fingerprint in seen_texts) else 0.0
+        ambiguity_penalty = _clamp01(target.ambiguity_score if target else 0.0)
+        cross_encoder_score = 0.0
+        final_score = (
+            weights["semantic_score"] * semantic_score
+            + weights["cross_encoder_score"] * cross_encoder_score
+            + weights["keyword_overlap_score"] * keyword_overlap
+            + weights["target_match_score"] * target_match
+            + weights["source_quality_score"] * source_quality
+            + weights["recency_score"] * recency_score
+            + weights["graph_relevance_score"] * graph_relevance
+            + weights["event_support_score"] * event_support
+            - weights["duplicate_penalty"] * duplicate_penalty
+            - weights["ambiguity_penalty"] * ambiguity_penalty
+        )
+        signal_score = _clamp01(_safe_float(row.get("base_signal_score"), _safe_float(row.get("cluster_signal_score"), 0.0)))
+        scored_rows.append(
+            {
+                **row,
+                "candidate_id": signal_id,
+                "candidate_kind": "signal_alert",
+                "retrieval_kind": "signal_alert",
+                "signal_id": signal_id,
+                "cluster_id": cluster_id,
+                "headline": _synthesize_signal_headline(row),
+                "title": _synthesize_signal_headline(row),
+                "summary": row.get("signal_summary") or row.get("canonical_summary") or "",
+                "text": text,
+                "published_date": row.get("signal_date"),
+                "semantic_score": semantic_score,
+                "cross_encoder_score": cross_encoder_score,
+                "keyword_overlap_score": keyword_overlap,
+                "target_match_score": target_match,
+                "source_quality_score": source_quality,
+                "recency_score": recency_score,
+                "graph_relevance_score": graph_relevance,
+                "event_support_score": event_support,
+                "duplicate_penalty": duplicate_penalty,
+                "ambiguity_penalty": ambiguity_penalty,
+                "signal_score": signal_score,
+                "final_score": float(final_score),
+                "score": float(final_score),
+                "score_components": {
+                    "semantic_score": semantic_score,
+                    "cross_encoder_score": cross_encoder_score,
+                    "keyword_overlap_score": keyword_overlap,
+                    "target_match_score": target_match,
+                    "source_quality_score": source_quality,
+                    "recency_score": recency_score,
+                    "graph_relevance_score": graph_relevance,
+                    "event_support_score": event_support,
+                    "duplicate_penalty": duplicate_penalty,
+                    "ambiguity_penalty": ambiguity_penalty,
+                    "signal_score": signal_score,
+                    "novelty_score": _clamp01(_safe_float(row.get("novelty_score"), 0.0)),
+                    "velocity_score": _clamp01(_safe_float(row.get("velocity_score"), 0.0)),
+                    "asset_impact_score": _clamp01(_safe_float(row.get("asset_impact_score"), 0.0)),
+                    "confidence_score": _clamp01(_safe_float(row.get("confidence_score"), 0.0)),
+                },
+                "scoring_weights": dict(weights),
+            }
+        )
+        seen_ids.add(signal_id)
+        seen_ids.add(cluster_id)
+        if fingerprint:
+            seen_texts.add(fingerprint)
+
+    scored_rows.sort(key=lambda item: item.get("final_score", 0.0), reverse=True)
+    evidence_map = _load_signal_evidence_chunks(
+        sqlite_conn,
+        [str(row["cluster_id"]) for row in scored_rows],
+        date_start=date_start,
+        date_end=date_end,
+        source_filter=source_filter,
+        per_cluster_limit=3,
+    )
+
+    selected_signals: list[dict[str, Any]] = []
+    for row in scored_rows:
+        evidence_chunks = evidence_map.get(str(row["cluster_id"]), [])
+        if not evidence_chunks:
+            continue
+        selected_signals.append({**row, "evidence_chunks": evidence_chunks})
+        if len(selected_signals) >= top_limit:
+            break
+
+    return selected_signals[:expanded_limit], target, {
+        "route_type": "signal_discovery",
+        "candidate_count": len(raw_rows),
+        "ranked_count": len(scored_rows),
+        "selected_signal_count": len(selected_signals),
+        "date_start": date_start,
+        "date_end": date_end,
+        "source_filter": source_filter,
+        "target": {
+            "canonical_name": target.canonical_name,
+            "display_name": target.display_name,
+            "ticker": target.ticker,
+            "ambiguity_score": target.ambiguity_score,
+            "needs_disambiguation": target.needs_disambiguation,
+            "resolution_mode": target.resolution_mode,
+        },
+        "ranked_candidates": scored_rows[:expanded_limit],
+    }
 
 
 def _cluster_summary_themes(chunks: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -1032,17 +1579,36 @@ def _log_observability(
     target: QueryTarget | None,
     candidates: list[dict[str, Any]],
     selected_chunks: list[dict[str, Any]],
+    selected_signals: list[dict[str, Any]] | None = None,
     answer_confidence: float,
     decision: str,
     latency_ms: float,
     retrieval_trace: dict[str, Any],
+    route_reason: dict[str, Any] | None = None,
+    answer_meta: dict[str, Any] | None = None,
 ) -> None:
     created_at = datetime.now(timezone.utc).isoformat()
-    selected_uids = {chunk.get("chunk_uid") for chunk in selected_chunks}
+    selected_keys = {
+        str(item)
+        for item in (
+            *(chunk.get("chunk_uid") for chunk in selected_chunks),
+            *(chunk.get("candidate_id") for chunk in selected_chunks),
+            *(chunk.get("signal_id") for chunk in selected_chunks),
+            *(chunk.get("cluster_id") for chunk in selected_chunks),
+        )
+        if item
+    }
+    selected_signal_payload = selected_signals or []
 
     for index, candidate in enumerate(candidates):
         chunk_uid = candidate.get("chunk_uid")
         candidate_id = str(candidate.get("candidate_id") or f"{run_id}::{chunk_uid or 'candidate'}::{index}")
+        selected = (
+            candidate_id in selected_keys
+            or str(candidate.get("signal_id") or "") in selected_keys
+            or str(candidate.get("cluster_id") or "") in selected_keys
+            or str(chunk_uid or "") in selected_keys
+        )
         _insert_row_if_columns_exist(
             conn,
             "retrieval_candidates",
@@ -1053,6 +1619,8 @@ def _log_observability(
                 "article_id": candidate.get("article_id"),
                 "chunk_id": chunk_uid,
                 "macro_event_id": candidate.get("macro_event_id"),
+                "cluster_id": candidate.get("cluster_id"),
+                "signal_id": candidate.get("signal_id"),
                 "semantic_score": candidate.get("semantic_score"),
                 "cross_encoder_score": candidate.get("cross_encoder_score"),
                 "keyword_overlap_score": candidate.get("keyword_overlap_score"),
@@ -1064,24 +1632,32 @@ def _log_observability(
                 "duplicate_penalty": candidate.get("duplicate_penalty"),
                 "ambiguity_penalty": candidate.get("ambiguity_penalty"),
                 "final_score": candidate.get("final_score"),
-                "score_trace_json": json.dumps(candidate.get("score_components", {}), ensure_ascii=False),
-                "selected": 1 if chunk_uid in selected_uids else 0,
+                "score_trace_json": json.dumps(
+                    {
+                        **(candidate.get("score_components") or {}),
+                        "signal_score": candidate.get("signal_score"),
+                    },
+                    ensure_ascii=False,
+                ),
+                "selected": 1 if selected else 0,
                 "created_at": created_at,
             },
         )
 
     _insert_row_if_columns_exist(
         conn,
-        "qa_runs",
-        {
-            "run_id": run_id,
-            "query": query,
-            "route_type": route_type,
-            "resolved_target_json": json.dumps(
-                {
-                    "canonical_name": target.canonical_name if target else None,
-                    "display_name": target.display_name if target else None,
-                    "ticker": target.ticker if target else None,
+            "qa_runs",
+            {
+                "run_id": run_id,
+                "query": query,
+                "route_type": route_type,
+                "route_reason": json.dumps(route_reason or {}, ensure_ascii=False),
+                "route_decision_json": json.dumps(route_reason or {}, ensure_ascii=False),
+                "resolved_target_json": json.dumps(
+                    {
+                        "canonical_name": target.canonical_name if target else None,
+                        "display_name": target.display_name if target else None,
+                        "ticker": target.ticker if target else None,
                     "entity_type": target.entity_type if target else None,
                     "best_candidate": target.best_candidate if target else None,
                     "candidates": target.candidates if target else [],
@@ -1120,8 +1696,12 @@ def _log_observability(
                 ],
                 ensure_ascii=False,
             ),
+            "selected_signals_json": json.dumps(selected_signal_payload, ensure_ascii=False),
+            "selected_signal_alerts_json": json.dumps(selected_signal_payload, ensure_ascii=False),
             "answer_confidence": answer_confidence,
             "decision": decision,
+            "answer_meta_json": json.dumps(answer_meta or {}, ensure_ascii=False),
+            "answer_decision_json": json.dumps(answer_meta or {}, ensure_ascii=False),
             "latency": latency_ms,
             "created_at": created_at,
         },
@@ -3393,6 +3973,87 @@ def retrieve(
 
 
 # ---------------------------------------------------------------------------
+# Signal discovery retrieval
+# ---------------------------------------------------------------------------
+
+def _build_signal_discovery_answer(
+    *,
+    query: str,
+    selected_signals: list[dict[str, Any]],
+    evidence_rows: list[dict[str, Any]],
+) -> str:
+    if not selected_signals:
+        return (
+            "Answer: I could not find sufficiently supported top signals in the current store.\n"
+            "Evidence: The retrieved signal tables did not yield enough corroborated cluster evidence.\n"
+            "Theory: Any interpretation would be speculative without corroborated signal evidence."
+        )
+    citation_map = build_citation_map(evidence_rows)
+    evidence_by_signal: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for row in evidence_rows:
+        if row.get("signal_id"):
+            evidence_by_signal[str(row["signal_id"])].append(row)
+
+    answer_lines: list[str] = []
+    evidence_lines: list[str] = []
+    theory_lines: list[str] = []
+    for index, signal in enumerate(selected_signals, start=1):
+        rows = evidence_by_signal.get(str(signal["signal_id"]), [])
+        citations = "".join(
+            citation_map.get(row.get("chunk_uid"), "")
+            and f"[{citation_map[row['chunk_uid']]}]"
+            for row in rows[:2]
+            if row.get("chunk_uid") in citation_map
+        )
+        components = signal.get("score_components") or {}
+        answer_lines.append(
+            f"{index}. {signal.get('headline') or signal.get('summary') or signal.get('text')} "
+            f"(signal_score={_safe_float(signal.get('signal_score'), 0.0):.2f}; "
+            f"recency={_safe_float(components.get('recency_score'), 0.0):.2f}; "
+            f"source_quality={_safe_float(components.get('source_quality_score'), 0.0):.2f}){citations}"
+        )
+        if rows:
+            supporting_sources = sorted({str(row.get("source") or "unknown") for row in rows})
+            support = _safe_float(signal.get("event_support_score"), 0.0)
+            evidence_citations = "".join(
+                f"[{citation_map[row['chunk_uid']]}]"
+                for row in rows[:2]
+                if row.get("chunk_uid") in citation_map
+            )
+            evidence_lines.append(
+                f"- {signal.get('headline') or signal.get('summary')}: "
+                f"sources={', '.join(supporting_sources[:3])}; "
+                f"event_support={support:.2f}; "
+                f"evidence={evidence_citations}"
+            )
+            if len(supporting_sources) <= 1:
+                theory_lines.append(
+                    f"- {signal.get('headline') or signal.get('summary')}: source concentration is high, so treat the ranking as provisional."
+                )
+            else:
+                theory_lines.append(
+                    f"- {signal.get('headline') or signal.get('summary')}: corroboration exists across {len(supporting_sources)} sources, but follow-through still needs confirmation."
+                )
+        else:
+            evidence_lines.append(
+                f"- {signal.get('headline') or signal.get('summary')} is ranked from clustered signal metadata."
+            )
+            theory_lines.append(
+                f"- {signal.get('headline') or signal.get('summary')}: theory is limited because no chunk-level evidence was materialized."
+            )
+
+    answer_lines = [line for line in answer_lines if line.strip()]
+    return (
+        "Answer:\n"
+        + "\n".join(answer_lines)
+        + "\nEvidence:\n"
+        + "\n".join(evidence_lines[: max(3, len(selected_signals))])
+        + "\nTheory:\n"
+        + "\n".join(theory_lines[: max(3, len(selected_signals))])
+    )
+
+
+# ---------------------------------------------------------------------------
 # Context builder
 # ---------------------------------------------------------------------------
 
@@ -3444,6 +4105,47 @@ def build_context(
         if ch.get("evidence_text"):
             lines.append(f"[EVIDENCE SPAN: {ch['evidence_text']}]")
         lines.append(ch.get("text", ""))
+        lines.append("")
+
+    return "\n".join(lines)
+
+
+def build_signal_context(
+    query: str,
+    target: QueryTarget,
+    signals: list[dict[str, Any]],
+) -> str:
+    lines = []
+    lines.append(f"QUERY: {query}")
+    lines.append(f"TARGET ENTITY : {target.display_name or 'general'}")
+    lines.append(f"TARGET CANONICAL: {target.canonical_name or 'general'}")
+    lines.append("")
+
+    if not signals:
+        lines.append("No ranked signals found.")
+        return "\n".join(lines)
+
+    for index, signal in enumerate(signals, start=1):
+        lines.append(f"SIGNAL {index}: {signal.get('headline') or signal.get('summary') or 'Untitled signal'}")
+        lines.append(f"[SIGNAL ID: {signal.get('signal_id', '?')}]")
+        lines.append(f"[CLUSTER ID: {signal.get('cluster_id', '?')}]")
+        lines.append(f"[SIGNAL SCORE: {_safe_float(signal.get('signal_score'), 0.0):.2f}]")
+        lines.append(f"[RANK SCORE: {_safe_float(signal.get('final_score'), _safe_float(signal.get('score'), 0.0)):.4f}]")
+        if signal.get("event_type"):
+            lines.append(f"[EVENT TYPE: {signal['event_type']}]")
+        if signal.get("region"):
+            lines.append(f"[REGION: {signal['region']}]")
+        if signal.get("novelty_hint") or signal.get("urgency") or signal.get("market_surprise"):
+            lines.append(
+                f"[QUALIFIERS: novelty={signal.get('novelty_hint') or '?'}, "
+                f"urgency={signal.get('urgency') or '?'}, surprise={signal.get('market_surprise') or '?'}]"
+            )
+        if signal.get("summary"):
+            lines.append(str(signal["summary"]))
+        for evidence in signal.get("evidence_chunks") or []:
+            snippet = re.sub(r"\s+", " ", str(evidence.get("text") or "")).strip()[:220]
+            lines.append(f"- Evidence: {evidence.get('source', '?')} | {evidence.get('title', '?')}")
+            lines.append(f"  {snippet}")
         lines.append("")
 
     return "\n".join(lines)
@@ -3526,6 +4228,7 @@ def run_query_once(
     all_contexts: list[str] = []
     all_urls: list[str] = []
     all_chunks: list[dict[str, Any]] = []
+    selected_signals: list[dict[str, Any]] = []
     summary_raw_candidates: list[dict[str, Any]] = []
     retrieval_traces: list[dict[str, Any]] = []
     observability_candidates: list[dict[str, Any]] = []
@@ -3545,14 +4248,20 @@ def run_query_once(
 
     def _compact_candidate(candidate: dict[str, Any]) -> dict[str, Any]:
         return {
+            "candidate_id": candidate.get("candidate_id"),
             "chunk_uid": candidate.get("chunk_uid"),
             "article_id": candidate.get("article_id"),
             "macro_event_id": candidate.get("macro_event_id"),
+            "cluster_id": candidate.get("cluster_id"),
+            "signal_id": candidate.get("signal_id"),
             "retrieval_kind": candidate.get("retrieval_kind"),
             "source": candidate.get("source"),
+            "title": candidate.get("title"),
+            "headline": candidate.get("headline"),
             "content_class": candidate.get("content_class"),
             "source_trust_tier": candidate.get("source_trust_tier"),
             "score": candidate.get("final_score", candidate.get("score")),
+            "signal_score": candidate.get("signal_score"),
             "semantic_score": candidate.get("semantic_score"),
             "cross_encoder_score": candidate.get("cross_encoder_score"),
             "keyword_overlap_score": candidate.get("keyword_overlap_score"),
@@ -3563,6 +4272,22 @@ def run_query_once(
             "event_support_score": candidate.get("event_support_score"),
             "duplicate_penalty": candidate.get("duplicate_penalty"),
             "ambiguity_penalty": candidate.get("ambiguity_penalty"),
+        }
+
+    def _compact_signal(signal: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "signal_id": signal.get("signal_id"),
+            "cluster_id": signal.get("cluster_id"),
+            "headline": signal.get("headline"),
+            "summary": signal.get("summary"),
+            "event_type": signal.get("event_type"),
+            "region": signal.get("region"),
+            "signal_score": signal.get("signal_score"),
+            "rank_score": signal.get("final_score", signal.get("score")),
+            "novelty_hint": signal.get("novelty_hint"),
+            "urgency": signal.get("urgency"),
+            "market_surprise": signal.get("market_surprise"),
+            "score_components": signal.get("score_components") or {},
         }
 
     def _empty_result(message: str, route_type: str) -> dict[str, Any]:
@@ -3612,6 +4337,7 @@ def run_query_once(
                 },
             },
             "selected_macro_events": [],
+            "selected_signals": [],
             "contradiction_signals": False,
             "date_start": primary_date_start,
             "date_end": primary_date_end,
@@ -3636,7 +4362,35 @@ def run_query_once(
             "date_end": date_end,
         }
 
-        if causal_intent and not market_data_intent:
+        if route_seed == "signal_discovery":
+            sub_selected_signals, target, retrieve_trace = retrieve_top_signals(
+                query=sub_query,
+                embed_model=embed_model,
+                sqlite_conn=sqlite_conn,
+                driver=driver,
+                alias_to_ticker=alias_to_ticker,
+                ticker_to_canonical=ticker_to_canonical,
+                alias_to_fin_entity=alias_to_fin_entity,
+                top_k=max(TOP_K, 5),
+                expanded_k=max(EXPANDED_K, 12),
+                recency_half_life_days=RECENCY_HALF_LIFE_DAYS,
+                source_filter=source_filter,
+                date_start=date_start,
+                date_end=date_end,
+            )
+            chunks = []
+            seen_chunk_ids: set[str] = set()
+            for signal in sub_selected_signals:
+                for evidence in signal.get("evidence_chunks") or []:
+                    chunk_uid = evidence.get("chunk_uid")
+                    if not chunk_uid or chunk_uid in seen_chunk_ids:
+                        continue
+                    seen_chunk_ids.add(chunk_uid)
+                    chunks.append({**evidence, "signal_id": signal.get("signal_id"), "cluster_id": signal.get("cluster_id")})
+            trace.update(retrieve_trace)
+            trace["sub_query"] = sub_query
+            selected_signals.extend(sub_selected_signals)
+        elif causal_intent and not market_data_intent:
             hops = decompose_causal_chain(sub_query, gen_client)
             if hops:
                 logs.append(f"  [causal chain: {' -> '.join(hops)}]")
@@ -3771,7 +4525,10 @@ def run_query_once(
             all_chunks.extend(chunks)
             observability_candidates.extend(trace.get("ranked_candidates") or chunks)
             period_label = f"[{date_start} -> {date_end}] " if (date_start or date_end) else ""
-            ctx = build_context(sub_query, target, chunks)
+            if route_seed == "signal_discovery":
+                ctx = build_signal_context(sub_query, target, sub_selected_signals)
+            else:
+                ctx = build_context(sub_query, target, chunks)
             if market_ctx:
                 ctx = ctx + "\n\n" + market_ctx
             all_contexts.append(period_label + ctx)
@@ -3789,6 +4546,17 @@ def run_query_once(
             entity_type=None,
             confidence=0.0,
         )
+
+    if selected_signals:
+        deduped_signals: list[dict[str, Any]] = []
+        seen_signal_ids: set[str] = set()
+        for signal in selected_signals:
+            signal_id = str(signal.get("signal_id") or "")
+            if not signal_id or signal_id in seen_signal_ids:
+                continue
+            seen_signal_ids.add(signal_id)
+            deduped_signals.append(signal)
+        selected_signals = deduped_signals
 
     if summary_mode:
         if not summary_raw_candidates:
@@ -3873,7 +4641,7 @@ def run_query_once(
             ctx = ctx + "\n\n" + market_ctx
         all_contexts = [ctx]
 
-    if not all_contexts:
+    if not all_contexts and route_seed != "signal_discovery":
         return _empty_result("No relevant chunks found.", route_seed)
 
     final_route = classify_query_route(
@@ -3899,7 +4667,13 @@ def run_query_once(
     final = ""
     market_data_note: str | None = None
 
-    if skip_generation or DEBUG_SKIP_GENERATION:
+    if final_route == "signal_discovery":
+        final = _build_signal_discovery_answer(
+            query=query,
+            selected_signals=selected_signals,
+            evidence_rows=all_chunks,
+        )
+    elif skip_generation or DEBUG_SKIP_GENERATION:
         final = "Generation skipped because DEBUG_SKIP_GENERATION is enabled."
     else:
         active_prompt = causal_system_prompt if causal_system_prompt else system_prompt
@@ -3969,6 +4743,7 @@ def run_query_once(
                 "ranked_count": trace.get("ranked_count"),
                 "date_start": trace.get("date_start"),
                 "date_end": trace.get("date_end"),
+                "signal_ids": trace.get("signal_ids"),
                 "top_candidates": [_compact_candidate(candidate) for candidate in ranked_candidates[:10]],
             }
         )
@@ -3983,7 +4758,14 @@ def run_query_once(
     deduped_obs_candidates: list[dict[str, Any]] = []
     seen_obs_keys: set[str] = set()
     for candidate in observability_candidates or all_chunks:
-        key = str(candidate.get("chunk_uid") or candidate.get("macro_event_id") or candidate.get("article_id") or uuid.uuid4())
+        key = str(
+            candidate.get("signal_id")
+            or candidate.get("cluster_id")
+            or candidate.get("chunk_uid")
+            or candidate.get("macro_event_id")
+            or candidate.get("article_id")
+            or uuid.uuid4()
+        )
         if key in seen_obs_keys:
             continue
         seen_obs_keys.add(key)
@@ -3999,10 +4781,22 @@ def run_query_once(
             target=primary_target,
             candidates=deduped_obs_candidates,
             selected_chunks=all_chunks,
+            selected_signals=selected_signals,
             answer_confidence=answer_confidence,
             decision=decision,
             latency_ms=latency_ms,
             retrieval_trace=retrieval_trace_payload,
+            route_reason={
+                "route_seed": route_seed,
+                "final_route": final_route,
+                "triggered_by": "signal_discovery_keywords" if final_route == "signal_discovery" else None,
+            },
+            answer_meta={
+                "answer_confidence": answer_confidence,
+                "decision": decision,
+                "route_type": final_route,
+                "selected_signal_count": len(selected_signals),
+            },
         )
     except Exception as exc:
         logs.append(f"  [observability] logging skipped: {exc}")
@@ -4031,6 +4825,7 @@ def run_query_once(
             "contradiction_signals": bool(confidence_signals.get("contradiction_signals")),
         },
         "selected_macro_events": selected_macro_events,
+        "selected_signals": selected_signals,
         "contradiction_signals": bool(confidence_signals.get("contradiction_signals")),
         "date_start": primary_date_start,
         "date_end": primary_date_end,

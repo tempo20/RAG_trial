@@ -1,0 +1,108 @@
+{
+  "schema_version": 1,
+  "cases": [
+    {
+      "id": "iran-latest",
+      "query": "latest news on Iran",
+      "expected_chunks": [
+        "ebec5deba113b792b5f5a208091bd0cf::chunk::0",
+        "42c5ded0400aebd4559458b22e9b6c9d::chunk::0",
+        "22c95d804343eff7b28bb4c8d2c3b1b3::chunk::0",
+        "ab7e822feab1d3ee00d648a2351c3a57::chunk::0"
+      ],
+      "expected_entities": [
+        "elena hargrove",
+        "elena vargas",
+        "elena vasquez",
+        "mexico",
+        "united states",
+        "us"
+      ],
+      "expected_macro_event_ids": [
+        "36cae79ea7fe0b8fbaaddcec02a02877",
+        "4a8ad2a0abe2ba9d1709d1fa430e7ba8"
+      ],
+      "expected_macro_event_types": [
+        "growth_upside_surprise",
+        "growth_upside_surprise"
+      ],
+      "expected_answer_grounding": {
+        "require_inline_citations": true,
+        "require_evidence_section": true,
+        "require_theory_section": true,
+        "min_cited_sources": 1
+      },
+      "min_chunk_recall": 0.5,
+      "min_entity_recall": 1.0,
+      "min_macro_type_recall": 0.5
+    },
+    {
+      "id": "china-latest",
+      "query": "latest news on China",
+      "expected_chunks": [
+        "1e890e709f48c8b785e496ff578c269c::chunk::5",
+        "1e890e709f48c8b785e496ff578c269c::chunk::4",
+        "1e890e709f48c8b785e496ff578c269c::chunk::1",
+        "47b57209d04bcfae9d42b2d98245a9a4::chunk::4"
+      ],
+      "expected_entities": [
+        "AMZN",
+        "GOOGL",
+        "KO",
+        "MRK",
+        "MSFT",
+        "australia"
+      ],
+      "expected_macro_event_ids": [
+        "487d323fc8f0b1d8e709f82ddaf2ba2a",
+        "7e5fc1b9f5f17174be623fd22d8984a4",
+        "7fb19169121719a6b35ef1d8501f0d4a",
+        "eaf473059d1058590877cceea634b2c6"
+      ],
+      "expected_macro_event_types": [
+        "inflation_upside_surprise",
+        "fiscal_contraction",
+        "trade_restriction_escalation",
+        "commodity_supply_disruption"
+      ],
+      "expected_answer_grounding": {
+        "require_inline_citations": true,
+        "require_evidence_section": true,
+        "require_theory_section": true,
+        "min_cited_sources": 1
+      },
+      "min_chunk_recall": 0.5,
+      "min_entity_recall": 1.0,
+      "min_macro_type_recall": 0.5
+    },
+    {
+      "id": "nvda-latest",
+      "query": "latest news on NVDA",
+      "expected_chunks": [
+        "4dff1961429cc32294248134425d5a0f::chunk::4",
+        "4dff1961429cc32294248134425d5a0f::chunk::2",
+        "4dff1961429cc32294248134425d5a0f::chunk::1",
+        "4dff1961429cc32294248134425d5a0f::chunk::3"
+      ],
+      "expected_entities": [
+        "AAPL",
+        "BAC",
+        "GOOGL",
+        "NVDA",
+        "jensen huang",
+        "us"
+      ],
+      "expected_macro_event_ids": [],
+      "expected_macro_event_types": [],
+      "expected_answer_grounding": {
+        "require_inline_citations": true,
+        "require_evidence_section": true,
+        "require_theory_section": true,
+        "min_cited_sources": 1
+      },
+      "min_chunk_recall": 0.5,
+      "min_entity_recall": 1.0,
+      "min_macro_type_recall": 0.5
+    }
+  ]
+}

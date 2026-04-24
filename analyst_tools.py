@@ -38,8 +38,7 @@ def show_latest_macro_events(db_path: str, limit: int, min_confidence: float | N
         params.append(min_confidence)
     sql += " ORDER BY coalesce(m.confidence, 0) DESC, c.published_date DESC LIMIT ?"
     params.append(limit)
-    rows = conn.execute(sql, params).fetchall()
-    for row in rows:
+    for row in conn.execute(sql, params).fetchall():
         print(
             f"- {row['macro_event_id']} confidence={row['confidence']} type={row['event_type']} "
             f"date={row['published_date']} source={row['source']}"
@@ -76,7 +75,6 @@ def show_event_evidence(db_path: str, event_id: str) -> None:
         print("[analyst] macro event not found")
         conn.close()
         return
-
     evidence_rows = conn.execute(
         """
         SELECT evidence_text
@@ -208,7 +206,6 @@ def show_latest_stream_briefs(db_path: str, limit: int = 20) -> None:
         print("[analyst] no TradingEconomics stream briefs found")
         conn.close()
         return
-
     for row in rows:
         flags = []
         try:
@@ -226,6 +223,241 @@ def show_latest_stream_briefs(db_path: str, limit: int = 20) -> None:
         print(f"  title: {row['title']}")
         print(f"  summary: {row['summary']}")
         print(f"  flags: {', '.join(str(flag) for flag in flags) or '-'}")
+    conn.close()
+
+
+def show_top_signals(db_path: str, limit: int) -> None:
+    conn = _connect(db_path)
+    rows = conn.execute(
+        """
+        SELECT
+            sa.signal_id,
+            sa.cluster_id,
+            sa.signal_date,
+            sa.rank,
+            sa.signal_score,
+            sa.headline,
+            sa.novelty_hint,
+            sa.urgency,
+            sa.market_surprise
+        FROM signal_alerts sa
+        WHERE sa.status = 'active'
+        ORDER BY sa.signal_score DESC, sa.signal_date DESC
+        LIMIT ?
+        """,
+        (limit,),
+    ).fetchall()
+    for row in rows:
+        print(
+            f"- signal={row['signal_id']} cluster={row['cluster_id']} score={row['signal_score']} "
+            f"rank={row['rank']} date={row['signal_date']}"
+        )
+        print(
+            f"  headline: {row['headline']} | novelty={row['novelty_hint'] or '-'} "
+            f"urgency={row['urgency'] or '-'} surprise={row['market_surprise'] or '-'}"
+        )
+    conn.close()
+
+
+def show_cluster(db_path: str, cluster_id: str) -> None:
+    conn = _connect(db_path)
+    cluster = conn.execute(
+        """
+        SELECT
+            cluster_id,
+            event_type,
+            primary_shock_type,
+            region,
+            canonical_summary,
+            first_event_time,
+            last_event_time,
+            member_count,
+            unique_source_count,
+            asset_targets_json
+        FROM event_clusters
+        WHERE cluster_id = ?
+        """,
+        (cluster_id,),
+    ).fetchone()
+    if not cluster:
+        print("[analyst] cluster not found")
+        conn.close()
+        return
+    print(
+        f"cluster={cluster['cluster_id']} type={cluster['event_type']} region={cluster['region']} "
+        f"members={cluster['member_count']} sources={cluster['unique_source_count']}"
+    )
+    print(f"summary: {cluster['canonical_summary']}")
+    print(f"window: {cluster['first_event_time']} -> {cluster['last_event_time']}")
+    assets = json.loads(cluster["asset_targets_json"] or "[]")
+    print(f"assets: {', '.join(assets) or '-'}")
+    members = conn.execute(
+        """
+        SELECT
+            cm.macro_event_id,
+            cm.similarity_score,
+            m.summary,
+            m.confidence,
+            m.support_score,
+            cm.source,
+            cm.event_time
+        FROM cluster_members cm
+        JOIN macro_events m ON m.macro_event_id = cm.macro_event_id
+        WHERE cm.cluster_id = ?
+        ORDER BY cm.event_time DESC, cm.similarity_score DESC
+        """,
+        (cluster_id,),
+    ).fetchall()
+    print("members:")
+    for row in members:
+        print(
+            f"- {row['macro_event_id']} sim={row['similarity_score']} confidence={row['confidence']} "
+            f"support={row['support_score']} source={row['source']} time={row['event_time']}"
+        )
+        print(f"  {row['summary']}")
+    conn.close()
+
+
+def show_signal_evidence(db_path: str, signal_id: str) -> None:
+    conn = _connect(db_path)
+    signal = conn.execute(
+        """
+        SELECT signal_id, cluster_id, signal_score, signal_date, headline, summary
+        FROM signal_alerts
+        WHERE signal_id = ?
+        """,
+        (signal_id,),
+    ).fetchone()
+    if not signal:
+        print("[analyst] signal not found")
+        conn.close()
+        return
+    print(
+        f"signal={signal['signal_id']} cluster={signal['cluster_id']} "
+        f"score={signal['signal_score']} date={signal['signal_date']}"
+    )
+    print(f"headline: {signal['headline']}")
+    print(f"summary: {signal['summary']}")
+    rows = conn.execute(
+        """
+        SELECT
+            m.macro_event_id,
+            m.event_type,
+            m.summary,
+            m.confidence,
+            a.source,
+            art.title,
+            e.evidence_text
+        FROM cluster_members cm
+        JOIN macro_events m ON m.macro_event_id = cm.macro_event_id
+        LEFT JOIN articles art ON art.article_id = m.article_id
+        LEFT JOIN cluster_members a ON a.cluster_id = cm.cluster_id AND a.macro_event_id = cm.macro_event_id
+        LEFT JOIN evidence_spans e
+          ON e.parent_kind = 'macro_event'
+         AND e.parent_id = m.macro_event_id
+        WHERE cm.cluster_id = ?
+        ORDER BY m.confidence DESC, m.macro_event_id, e.evidence_id
+        """,
+        (signal["cluster_id"],),
+    ).fetchall()
+    print("evidence:")
+    for row in rows:
+        print(
+            f"- event={row['macro_event_id']} type={row['event_type']} confidence={row['confidence']} "
+            f"source={row['source']}"
+        )
+        print(f"  title: {row['title']}")
+        print(f"  summary: {row['summary']}")
+        print(f"  evidence: {row['evidence_text'] or '-'}")
+    conn.close()
+
+
+def show_missed_signals(db_path: str, limit: int) -> None:
+    conn = _connect(db_path)
+    rows = conn.execute(
+        """
+        SELECT
+            mr.signal_id,
+            mr.cluster_id,
+            mr.target_type,
+            mr.target_id,
+            mr.predicted_direction,
+            mr.return_1d,
+            mr.return_3d,
+            mr.return_5d,
+            sa.signal_score,
+            sa.headline
+        FROM market_reactions mr
+        LEFT JOIN signal_alerts sa ON sa.signal_id = mr.signal_id
+        WHERE mr.outcome_label = 'miss'
+        ORDER BY sa.signal_score DESC, mr.created_at DESC
+        LIMIT ?
+        """,
+        (limit,),
+    ).fetchall()
+    for row in rows:
+        print(
+            f"- signal={row['signal_id']} target={row['target_type']}::{row['target_id']} "
+            f"predicted={row['predicted_direction']} score={row['signal_score']}"
+        )
+        print(
+            f"  returns: 1d={row['return_1d']} 3d={row['return_3d']} 5d={row['return_5d']}"
+        )
+        print(f"  headline: {row['headline']}")
+    conn.close()
+
+
+def show_best_performing_signals(db_path: str, limit: int) -> None:
+    conn = _connect(db_path)
+    rows = conn.execute(
+        """
+        SELECT
+            sa.signal_id,
+            sa.cluster_id,
+            sa.signal_score,
+            sa.headline,
+            COUNT(*) AS reaction_count,
+            AVG(coalesce(mr.return_5d, mr.return_3d, mr.return_1d)) AS avg_forward_return
+        FROM signal_alerts sa
+        JOIN market_reactions mr ON mr.signal_id = sa.signal_id
+        WHERE mr.outcome_label = 'hit'
+        GROUP BY sa.signal_id, sa.cluster_id, sa.signal_score, sa.headline
+        ORDER BY avg_forward_return DESC, sa.signal_score DESC
+        LIMIT ?
+        """,
+        (limit,),
+    ).fetchall()
+    for row in rows:
+        print(
+            f"- signal={row['signal_id']} score={row['signal_score']} hits={row['reaction_count']} "
+            f"avg_forward_return={row['avg_forward_return']}"
+        )
+        print(f"  headline: {row['headline']}")
+    conn.close()
+
+
+def show_source_quality(db_path: str, limit: int) -> None:
+    conn = _connect(db_path)
+    rows = conn.execute(
+        """
+        SELECT
+            source_name,
+            source_trust_tier,
+            quality_score,
+            reliability_label,
+            article_count,
+            last_article_at
+        FROM source_quality
+        ORDER BY quality_score DESC, article_count DESC, source_name
+        LIMIT ?
+        """,
+        (limit,),
+    ).fetchall()
+    for row in rows:
+        print(
+            f"- source={row['source_name']} tier={row['source_trust_tier']} quality={row['quality_score']} "
+            f"label={row['reliability_label']} articles={row['article_count']} last={row['last_article_at']}"
+        )
     conn.close()
 
 
@@ -250,6 +482,24 @@ def main() -> None:
     stream_parser = subparsers.add_parser("latest-stream-briefs", help="Show latest TradingEconomics stream briefs")
     stream_parser.add_argument("--limit", type=int, default=20, help="Rows to print")
 
+    top_signals_parser = subparsers.add_parser("top-signals", help="Show top ranked signals")
+    top_signals_parser.add_argument("--limit", type=int, default=10, help="Rows to print")
+
+    cluster_parser = subparsers.add_parser("cluster", help="Inspect one event cluster")
+    cluster_parser.add_argument("--cluster-id", required=True, help="Event cluster id")
+
+    signal_evidence_parser = subparsers.add_parser("signal-evidence", help="Show signal -> cluster -> evidence")
+    signal_evidence_parser.add_argument("--signal-id", required=True, help="Signal id")
+
+    missed_parser = subparsers.add_parser("missed-signals", help="Show missed signal outcomes")
+    missed_parser.add_argument("--limit", type=int, default=10, help="Rows to print")
+
+    best_parser = subparsers.add_parser("best-performing-signals", help="Show best-performing signals")
+    best_parser.add_argument("--limit", type=int, default=10, help="Rows to print")
+
+    source_quality_parser = subparsers.add_parser("source-quality", help="Show source quality scores")
+    source_quality_parser.add_argument("--limit", type=int, default=20, help="Rows to print")
+
     args = parser.parse_args()
     if args.command == "latest-events":
         show_latest_macro_events(args.db, args.limit, args.min_confidence)
@@ -261,6 +511,18 @@ def main() -> None:
         show_questionable_events(args.db, args.limit)
     elif args.command == "latest-stream-briefs":
         show_latest_stream_briefs(args.db, args.limit)
+    elif args.command == "top-signals":
+        show_top_signals(args.db, args.limit)
+    elif args.command == "cluster":
+        show_cluster(args.db, args.cluster_id)
+    elif args.command == "signal-evidence":
+        show_signal_evidence(args.db, args.signal_id)
+    elif args.command == "missed-signals":
+        show_missed_signals(args.db, args.limit)
+    elif args.command == "best-performing-signals":
+        show_best_performing_signals(args.db, args.limit)
+    elif args.command == "source-quality":
+        show_source_quality(args.db, args.limit)
 
 
 if __name__ == "__main__":
