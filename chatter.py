@@ -598,6 +598,34 @@ def connect_sqlite(db_path: str = SQLITE_DB) -> sqlite3.Connection:
     return conn
 
 
+def _table_columns(conn: sqlite3.Connection, table_name: str) -> set[str]:
+    rows = conn.execute(f"PRAGMA table_info({table_name})").fetchall()
+    out: set[str] = set()
+    for row in rows:
+        if isinstance(row, sqlite3.Row):
+            out.add(str(row["name"]))
+        else:
+            out.add(str(row[1]))
+    return out
+
+
+def _articles_join_select_extras(conn: sqlite3.Connection) -> str:
+    """Optional article columns (newer scraper schema); omit when absent."""
+    cols = _table_columns(conn, "articles")
+    parts: list[str] = []
+    if "source_trust_tier" in cols:
+        parts.append("a.source_trust_tier")
+    if "content_class" in cols:
+        parts.append("a.content_class")
+    if "article_quality_score" in cols:
+        parts.append("a.article_quality_score")
+    if "quality_flags_json" in cols:
+        parts.append("a.quality_flags_json")
+    if not parts:
+        return ""
+    return ",\n            " + ",\n            ".join(parts)
+
+
 def _parse_embedding_json(raw: str | None) -> list[float] | None:
     if not raw:
         return None
@@ -1326,6 +1354,7 @@ def _fetch_chunk_rows_by_ids(
         return {}
 
     placeholders = ",".join("?" for _ in chunk_ids)
+    _art_extras = _articles_join_select_extras(conn)
     sql = f"""
         SELECT
             c.chunk_id,
@@ -1336,11 +1365,7 @@ def _fetch_chunk_rows_by_ids(
             c.embedding_json,
             a.title,
             a.url,
-            a.source,
-            a.source_trust_tier,
-            a.content_class,
-            a.article_quality_score,
-            a.quality_flags_json
+            a.source{_art_extras}
         FROM chunks c
         JOIN articles a ON a.article_id = c.article_id
         WHERE c.chunk_id IN ({placeholders})
@@ -2534,7 +2559,8 @@ def retrieve_entity_chunks(
     if not target.canonical_name:
         return []
 
-    sql = """
+    _art_extras = _articles_join_select_extras(sqlite_conn)
+    sql = f"""
         SELECT
             c.chunk_id,
             c.article_id,
@@ -2544,11 +2570,7 @@ def retrieve_entity_chunks(
             c.embedding_json,
             a.title,
             a.url,
-            a.source,
-            a.source_trust_tier,
-            a.content_class,
-            a.article_quality_score,
-            a.quality_flags_json,
+            a.source{_art_extras},
             em.display_name AS entity_display,
             em.confidence AS mention_confidence
         FROM entity_mentions em
@@ -2838,6 +2860,7 @@ def retrieve_cooccurrence_chunks(
 
     neighbor_ids = [row["neighbor_id"] for row in neighbor_rows]
     placeholders = ",".join("?" for _ in neighbor_ids)
+    _art_extras = _articles_join_select_extras(sqlite_conn)
     sql = f"""
         SELECT
             c.chunk_id,
@@ -2848,11 +2871,7 @@ def retrieve_cooccurrence_chunks(
             c.embedding_json,
             a.title,
             a.url,
-            a.source,
-            a.source_trust_tier,
-            a.content_class,
-            a.article_quality_score,
-            a.quality_flags_json,
+            a.source{_art_extras},
             em.canonical_entity_id AS neighbor_id,
             em.display_name AS neighbor_display
         FROM entity_mentions em
@@ -2898,7 +2917,8 @@ def retrieve_semantic_chunks(
     top_k: int = 6,
 ) -> list[dict]:
     """SQLite semantic fallback over chunk embeddings."""
-    sql = """
+    _art_extras = _articles_join_select_extras(sqlite_conn)
+    sql = f"""
         SELECT
             c.chunk_id,
             c.article_id,
@@ -2908,11 +2928,7 @@ def retrieve_semantic_chunks(
             c.embedding_json,
             a.title,
             a.url,
-            a.source,
-            a.source_trust_tier,
-            a.content_class,
-            a.article_quality_score,
-            a.quality_flags_json
+            a.source{_art_extras}
         FROM chunks c
         JOIN articles a ON a.article_id = c.article_id
         WHERE c.embedding_json IS NOT NULL
@@ -2999,7 +3015,8 @@ def retrieve_summary_chunks(
     #    Date filtering exclusively uses c.published_date (ISO format).
     #    articles is joined only for metadata (source, title, url).
     # ------------------------------------------------------------------
-    sql = """
+    _art_extras = _articles_join_select_extras(sqlite_conn)
+    sql = f"""
         SELECT
             c.chunk_id,
             c.article_id,
@@ -3009,11 +3026,7 @@ def retrieve_summary_chunks(
             c.embedding_json,
             a.title,
             a.url,
-            a.source,
-            a.source_trust_tier,
-            a.content_class,
-            a.article_quality_score,
-            a.quality_flags_json
+            a.source{_art_extras}
         FROM chunks c
         JOIN articles a ON a.article_id = c.article_id
         WHERE 1=1
