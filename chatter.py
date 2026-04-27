@@ -2507,6 +2507,222 @@ def fetch_market_context(
 
     return "\n".join(lines)
 
+
+def _append_statement_rows(
+    lines: list[str],
+    df,
+    ticker: str,
+    max_rows: int = 8,
+) -> None:
+    """
+    Extract rows from a financetoolkit financial statement DataFrame and
+    append compact formatted lines. Handles both MultiIndex (ticker × period)
+    and flat (metric-indexed, period-columned) shapes.
+    """
+    try:
+        import pandas as pd
+
+        sub = df
+        if hasattr(df.columns, "levels"):
+            top = df.columns.get_level_values(0).unique().tolist()
+            if ticker in top:
+                sub = df[ticker]
+
+        if sub is None or sub.empty:
+            return
+
+        period_col = sub.columns[-1]
+        lines.append(f"  Period: {str(period_col)[:10]}")
+
+        count = 0
+        for metric, value in sub[period_col].items():
+            if count >= max_rows:
+                break
+            if pd.isna(value):
+                continue
+            try:
+                value_fmt = f"{value:,.4g}" if isinstance(value, float) else str(value)
+            except Exception:
+                value_fmt = str(value)
+            lines.append(f"  {metric}: {value_fmt}")
+            count += 1
+    except Exception as exc:
+        lines.append(f"  (parse error: {exc})")
+
+
+def fetch_financial_context(
+    ticker: str,
+    date_start: str | None,
+    date_end: str | None,
+    lookback_days: int = 365,
+) -> str:
+    """
+    For a resolved stock ticker, fetch core financial context using FinanceToolkit:
+    historical price trend, income statement, balance sheet, cash flow, and
+    key ratios. Returns a FINANCIAL DATA [F] block for injection into the
+    generation prompt, or empty string on any failure or missing API key.
+
+    Each sub-fetch is wrapped individually so premium-gated or unavailable
+    endpoints degrade gracefully without breaking the caller.
+    """
+    api_key = os.getenv("FMP_API_KEY", "").strip()
+    if not api_key:
+        return ""
+
+    try:
+        from financetoolkit import Toolkit
+    except ImportError:
+        return ""
+
+    from datetime import datetime, timezone, timedelta
+    now = datetime.now(timezone.utc)
+    end_dt = date_end or now.strftime("%Y-%m-%d")
+    start_dt = date_start or (now - timedelta(days=lookback_days)).strftime("%Y-%m-%d")
+
+    lines: list[str] = [
+        "FINANCIAL DATA [F] — cite any fact from this block as [F], NOT as [Sx] or [M]:",
+        f"(Source: FinancialModelingPrep via FinanceToolkit | Ticker: {ticker})",
+    ]
+
+    try:
+        toolkit = Toolkit([ticker], api_key=api_key, start_date=start_dt, end_date=end_dt)
+    except Exception as exc:
+        print(f"  [financial data] Toolkit init failed for {ticker}: {exc}")
+        return ""
+
+    # Track successful fetches so we can suppress an empty/header-only [F]
+    # block when the ticker is unknown to FMP (e.g. user-typed ticker pattern
+    # that resolves locally but has no FMP coverage).
+    fetched_blocks = 0
+
+    # Company profile — static metadata (name, sector, CEO, description, etc.)
+    _PROFILE_FIELDS = [
+        ("Company Name", "Company Name"),
+        ("Sector", "Sector"),
+        ("Industry", "Industry"),
+        ("CEO", "CEO"),
+        ("Country", "Country"),
+        ("Exchange Full Name", "Exchange"),
+        ("Market Capitalization", "Market Cap"),
+        ("Beta", "Beta"),
+        ("Full Time Employees", "Employees"),
+        ("IPO Date", "IPO Date"),
+        ("Website", "Website"),
+        ("Description", "Description"),
+    ]
+    try:
+        profile = toolkit.get_profile()
+        if profile is not None and not profile.empty:
+            lines.append(f"\n[COMPANY PROFILE | {ticker}]")
+            col = ticker if ticker in profile.columns else profile.columns[0]
+            for src_key, label in _PROFILE_FIELDS:
+                if src_key in profile.index:
+                    val = profile.loc[src_key, col]
+                    if val and str(val).strip() not in ("", "nan", "None"):
+                        val_str = str(val).strip()
+                        # Truncate very long descriptions to keep context tight
+                        if label == "Description" and len(val_str) > 400:
+                            val_str = val_str[:400].rstrip() + "…"
+                        lines.append(f"  {label}: {val_str}")
+            fetched_blocks += 1
+    except Exception as exc:
+        lines.append(f"[COMPANY PROFILE] Unavailable: {exc}")
+
+    # Historical price trend
+    try:
+        hist = toolkit.get_historical_data()
+        if hist is not None and not hist.empty:
+            if hasattr(hist.columns, "levels"):
+                try:
+                    df_hist = hist.xs(ticker, axis=1, level=1)
+                except KeyError:
+                    df_hist = hist
+            else:
+                df_hist = hist
+            if not df_hist.empty and "Close" in df_hist.columns:
+                close_series = df_hist["Close"].tail(10).dropna()
+                if not close_series.empty:
+                    lines.append(f"\n[PRICE HISTORY | {ticker}]")
+                    for i, (date_idx, close_val) in enumerate(close_series.items()):
+                        date_str = str(date_idx)[:10]
+                        if i == 0:
+                            ret_str = ""
+                        else:
+                            prev_val = close_series.iloc[i - 1]
+                            ret = (close_val - prev_val) / prev_val * 100
+                            ret_str = f"  ({ret:+.2f}%)"
+                        lines.append(f"  {date_str}: {close_val:.2f}{ret_str}")
+                    fetched_blocks += 1
+    except Exception as exc:
+        lines.append(f"[PRICE HISTORY] Unavailable: {exc}")
+
+    # Income statement
+    try:
+        income = toolkit.get_income_statement()
+        if income is not None and not income.empty:
+            lines.append("\n[INCOME STATEMENT | Most Recent Period]")
+            _append_statement_rows(lines, income, ticker, max_rows=8)
+            fetched_blocks += 1
+    except Exception as exc:
+        lines.append(f"[INCOME STATEMENT] Unavailable: {exc}")
+
+    # Balance sheet
+    try:
+        balance = toolkit.get_balance_sheet_statement()
+        if balance is not None and not balance.empty:
+            lines.append("\n[BALANCE SHEET | Most Recent Period]")
+            _append_statement_rows(lines, balance, ticker, max_rows=8)
+            fetched_blocks += 1
+    except Exception as exc:
+        lines.append(f"[BALANCE SHEET] Unavailable: {exc}")
+
+    # Cash flow statement
+    try:
+        cashflow = toolkit.get_cash_flow_statement()
+        if cashflow is not None and not cashflow.empty:
+            lines.append("\n[CASH FLOW | Most Recent Period]")
+            _append_statement_rows(lines, cashflow, ticker, max_rows=6)
+            fetched_blocks += 1
+    except Exception as exc:
+        lines.append(f"[CASH FLOW] Unavailable: {exc}")
+
+    # Profitability ratios
+    try:
+        prof = toolkit.ratios.collect_profitability_ratios()
+        if prof is not None and not prof.empty:
+            lines.append("\n[PROFITABILITY RATIOS]")
+            _append_statement_rows(lines, prof, ticker, max_rows=6)
+            fetched_blocks += 1
+    except Exception:
+        pass
+
+    # Liquidity ratios
+    try:
+        liq = toolkit.ratios.collect_liquidity_ratios()
+        if liq is not None and not liq.empty:
+            lines.append("\n[LIQUIDITY RATIOS]")
+            _append_statement_rows(lines, liq, ticker, max_rows=4)
+            fetched_blocks += 1
+    except Exception:
+        pass
+
+    # Valuation ratios
+    try:
+        val = toolkit.ratios.collect_valuation_ratios()
+        if val is not None and not val.empty:
+            lines.append("\n[VALUATION RATIOS]")
+            _append_statement_rows(lines, val, ticker, max_rows=4)
+            fetched_blocks += 1
+    except Exception:
+        pass
+
+    if fetched_blocks == 0:
+        print(f"  [financial data] no usable FMP data for {ticker} (ticker may be unsupported or premium-gated)")
+        return ""
+
+    return "\n".join(lines)
+
+
 def _is_planning_only_text(text: str) -> bool:
     t = text.lower().strip()
     planning_markers = (
@@ -2967,9 +3183,48 @@ def resolve_query_target(
     q_norm = _normalize_for_matching(query)
     collected: list[dict[str, Any]] = []
 
-    # Tier 1: explicit ticker tokens (1-5 uppercase letters).
+    # Tier 1a: dotted-suffix ticker patterns (e.g. BRK.A, SPAX.PVT, SHOP.TO,
+    # RDS.B). The plain `\b([A-Z]{1,5})\b` regex below treats `.` as a word
+    # boundary and so splits `SPAX.PVT` into `SPAX` + `PVT`, neither of which
+    # matches the local map. Capture the full suffixed form first and pass
+    # well-formed but unmapped patterns through to downstream FinanceToolkit /
+    # FMP lookups with moderate confidence.
+    dotted_ticker_tokens = re.findall(r"\b([A-Z]{1,6}\.[A-Z]{1,5})\b", query)
+    dotted_parts: set[str] = set()
+    for token in dotted_ticker_tokens:
+        dotted_parts.update(token.split("."))
+        if token in ticker_to_canonical:
+            collected.append(
+                _build_resolution_candidate(
+                    canonical_name=token,
+                    display_name=ticker_to_canonical[token],
+                    ticker=token,
+                    entity_type="ORG",
+                    confidence=0.99,
+                    match_source="ticker_token_dotted",
+                    matched_alias=token.lower(),
+                    category="equities",
+                )
+            )
+        else:
+            collected.append(
+                _build_resolution_candidate(
+                    canonical_name=token,
+                    display_name=token,
+                    ticker=token,
+                    entity_type="ORG",
+                    confidence=0.85,
+                    match_source="ticker_token_dotted_unmapped",
+                    matched_alias=token.lower(),
+                    category="equities",
+                )
+            )
+
+    # Tier 1b: explicit ticker tokens (1-5 uppercase letters).
     ticker_tokens = re.findall(r"\b([A-Z]{1,5})\b", query)
     for token in ticker_tokens:
+        if token in dotted_parts:
+            continue  # already absorbed into a dotted ticker above
         if token in ticker_to_canonical:
             collected.append(
                 _build_resolution_candidate(
@@ -4234,6 +4489,7 @@ def run_query_once(
     observability_candidates: list[dict[str, Any]] = []
     summary_used_date_ranges: list[tuple[str | None, str | None]] = []
     market_ctx = ""
+    fin_ctx = ""
     logs: list[str] = []
     primary_target: QueryTarget | None = None
     primary_date_start: str | None = None
@@ -4547,6 +4803,21 @@ def run_query_once(
             confidence=0.0,
         )
 
+    # Fetch financial context for stock-specific queries with a resolved ticker
+    if (
+        primary_target.ticker
+        and not summary_mode
+        and route_seed != "signal_discovery"
+    ):
+        fin_ctx = fetch_financial_context(
+            ticker=primary_target.ticker,
+            date_start=primary_date_start,
+            date_end=primary_date_end,
+        )
+        if fin_ctx:
+            logs.append(f"  [financial data] fetched [F] block for {primary_target.ticker}")
+            all_contexts.append(fin_ctx)
+
     if selected_signals:
         deduped_signals: list[dict[str, Any]] = []
         seen_signal_ids: set[str] = set()
@@ -4639,6 +4910,8 @@ def run_query_once(
         ctx = date_resolution_block + "\n\n" + theme_context + "\n\n" + build_context(query, primary_target, all_chunks)
         if market_ctx:
             ctx = ctx + "\n\n" + market_ctx
+        if fin_ctx:
+            ctx = ctx + "\n\n" + fin_ctx
         all_contexts = [ctx]
 
     if not all_contexts and route_seed != "signal_discovery":

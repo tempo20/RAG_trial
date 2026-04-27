@@ -76,6 +76,25 @@
       "min_macro_type_recall": 0.5
     },
     {
+      "id": "nvda-financial-context",
+      "query": "What is NVDA's financial performance and recent stock trend?",
+      "expected_chunks": [],
+      "expected_entities": ["NVDA"],
+      "expected_macro_event_ids": [],
+      "expected_macro_event_types": [],
+      "expected_answer_grounding": {
+        "require_inline_citations": true,
+        "require_evidence_section": true,
+        "require_theory_section": true,
+        "min_cited_sources": 1
+      },
+      "min_chunk_recall": 0.0,
+      "min_entity_recall": 0.5,
+      "min_macro_type_recall": 0.0,
+      "tags": ["financial_context", "stock_query"],
+      "notes": "Validates that FINANCIAL DATA [F] block is fetched and cited for a ticker-resolved stock query."
+    },
+    {
       "id": "nvda-latest",
       "query": "latest news on NVDA",
       "expected_chunks": [
