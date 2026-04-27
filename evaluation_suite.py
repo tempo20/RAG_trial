@@ -1707,6 +1707,10 @@ def build_runtime(*, enable_reranker: bool, need_generation: bool) -> dict[str, 
         date_min=date_min,
         date_max=date_max,
     )
+    base_single_ticker_financial_prompt = chatter.SINGLE_TICKER_FINANCIAL_PROMPT_TEMPLATE.format(
+        date_min=date_min,
+        date_max=date_max,
+    )
 
     gen_client = None
     if need_generation:
@@ -1727,6 +1731,7 @@ def build_runtime(*, enable_reranker: bool, need_generation: bool) -> dict[str, 
         "base_system_prompt": base_system_prompt,
         "base_causal_system_prompt": base_causal_system_prompt,
         "base_daily_summary_prompt": base_daily_summary_prompt,
+        "base_single_ticker_financial_prompt": base_single_ticker_financial_prompt,
         "gen_client": gen_client,
     }
 
@@ -1786,14 +1791,23 @@ def _score_set(expected: list[str], observed: list[str]) -> dict[str, Any]:
 
 
 def _answer_grounding(answer: str, citation_map: dict[str, str]) -> dict[str, Any]:
-    labels = set(citation_map.values())
-    used = re.findall(r"\[(S\d+)\]", answer or "")
-    used_unique = sorted({label for label in used if label in labels})
+    labels = {str(label) for label in citation_map.values() if str(label).strip()}
+    special_labels = {"F", "M"}
+    used = re.findall(r"\[([A-Za-z0-9]+)\]", answer or "")
+    used_unique = sorted(
+        {
+            label
+            for label in used
+            if label in labels or label in special_labels
+        }
+    )
     normalized = (answer or "").lower()
     return {
         "citation_count": len(used_unique),
         "used_citations": used_unique,
         "has_inline_citations": bool(used_unique),
+        "has_financial_citation": "F" in used_unique,
+        "has_market_citation": "M" in used_unique,
         "has_evidence_section": "evidence" in normalized,
         "has_theory_section": "theory" in normalized,
         "has_answer_section": "answer" in normalized,
@@ -1814,6 +1828,7 @@ def evaluate_case(case: dict[str, Any], runtime: dict[str, Any], *, skip_generat
         base_system_prompt=runtime["base_system_prompt"],
         base_causal_system_prompt=runtime["base_causal_system_prompt"],
         base_daily_summary_prompt=runtime["base_daily_summary_prompt"],
+        base_single_ticker_financial_prompt=runtime["base_single_ticker_financial_prompt"],
         memory=ConversationMemory(),
         skip_generation=skip_generation,
     )
@@ -1859,6 +1874,16 @@ def evaluate_case(case: dict[str, Any], runtime: dict[str, Any], *, skip_generat
         (
             grounding["citation_count"] >= int(required_grounding.get("min_cited_sources", 1))
             if not skip_generation
+            else True
+        ),
+        (
+            grounding["has_financial_citation"]
+            if (required_grounding.get("require_financial_citation", False) and not skip_generation)
+            else True
+        ),
+        (
+            grounding["has_market_citation"]
+            if (required_grounding.get("require_market_citation", False) and not skip_generation)
             else True
         ),
     ]
@@ -2063,6 +2088,7 @@ def bootstrap_case(gold_path: Path, case_id: str, query: str, *, skip_generation
             base_system_prompt=runtime["base_system_prompt"],
             base_causal_system_prompt=runtime["base_causal_system_prompt"],
             base_daily_summary_prompt=runtime["base_daily_summary_prompt"],
+            base_single_ticker_financial_prompt=runtime["base_single_ticker_financial_prompt"],
             memory=ConversationMemory(),
             skip_generation=skip_generation,
         )

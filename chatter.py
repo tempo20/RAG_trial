@@ -146,6 +146,7 @@ ROUTE_TYPES = (
     "daily_summary",
     "macro_causal",
     "entity_profile",
+    "single_ticker_financial",
     "live_market_data",
     "broad_exploration",
     "ambiguous",
@@ -191,6 +192,7 @@ ROUTE_WEIGHT_MULTIPLIERS: dict[str, dict[str, float]] = {
     "daily_summary": {"source_quality_score": 1.15, "duplicate_penalty": 1.25},
     "macro_causal": {"event_support_score": 1.35, "graph_relevance_score": 1.25},
     "entity_profile": {"target_match_score": 1.35, "recency_score": 0.85},
+    "single_ticker_financial": {},
     "live_market_data": {"recency_score": 1.25, "target_match_score": 1.20},
     "broad_exploration": {"semantic_score": 1.10, "keyword_overlap_score": 1.10},
     "ambiguous": {"ambiguity_penalty": 1.50, "target_match_score": 0.85},
@@ -236,6 +238,14 @@ ROUTE_PROFILES: dict[str, dict[str, Any]] = {
         "candidate_cap": max(36, EXPANDED_K * 8),
         "answer_strictness": "medium",
         "allowed_content_classes": ("news_report", "analysis", "official_release", "stream_brief", "evergreen_explainer"),
+    },
+    "single_ticker_financial": {
+        "top_k": 0,
+        "expanded_k": 0,
+        "recency_half_life_days": max(1.0, RECENCY_HALF_LIFE_DAYS),
+        "candidate_cap": 0,
+        "answer_strictness": "very_high",
+        "allowed_content_classes": (),
     },
     "live_market_data": {
         "top_k": max(4, TOP_K),
@@ -394,7 +404,7 @@ def _coerce_prompt_template(value: Any, key: str) -> str:
         f"Prompt template '{key}' must be either a string or a list of strings."
     )
 
-def load_prompt_templates(path: Path) -> tuple[str, str, str]:
+def load_prompt_templates(path: Path) -> tuple[str, str, str, str]:
     if not path.exists():
         raise FileNotFoundError(
             f"Prompt templates file not found: {path}. "
@@ -429,30 +439,100 @@ def load_prompt_templates(path: Path) -> tuple[str, str, str]:
             "DAILY_SUMMARY_PROMPT_TEMPLATE",
         )
 
-    return system_prompt, causal_prompt, daily_summary_prompt
+    single_ticker_financial_raw = data.get("SINGLE_TICKER_FINANCIAL_PROMPT_TEMPLATE")
+    if single_ticker_financial_raw is None:
+        single_ticker_financial_prompt = (
+            "You are a grounded single-ticker financial analyst. "
+            "Use only the FINANCIAL DATA [F] block provided in the context. "
+            "Do not use outside knowledge or article/news evidence. "
+            "Structure your response with these exact section headers: Answer, Evidence, Theory. "
+            "Every factual sentence in Answer and Evidence must include [F]. "
+            "Theory may contain cautious inference from [F] and must not contain citations. "
+            "If FINANCIAL DATA [F] is missing or unusable, state that there is insufficient financial data [F] to answer. "
+            "Your article database covers {date_min} to {date_max}."
+        )
+    else:
+        single_ticker_financial_prompt = _coerce_prompt_template(
+            single_ticker_financial_raw,
+            "SINGLE_TICKER_FINANCIAL_PROMPT_TEMPLATE",
+        )
+
+    return system_prompt, causal_prompt, daily_summary_prompt, single_ticker_financial_prompt
 
 MARKET_INTENT_HINTS = (
     "price",
     "quote",
     "trading at",
     "market cap",
-    "valuation",
-    "p/e",
-    "pe ratio",
-    "eps",
-    "fundamental",
-    "balance sheet",
-    "cash flow",
-    "income statement",
     "company overview",
     "daily close",
     "open price",
     "high",
     "low",
     "volume",
-    "performance",
-    "return",
 )
+
+SINGLE_TICKER_FINANCIAL_INTENT_HINTS = (
+    "performance",
+    "trend",
+    "valuation",
+    "fundamental",
+    "balance sheet",
+    "cash flow",
+    "income statement",
+    "return",
+    "eps",
+    "earnings per share",
+    "p/e",
+    "pe ratio",
+)
+
+UNMAPPED_TICKER_CONTEXT_HINTS = (
+    "stock",
+    "ticker",
+    "share",
+    "shares",
+    "equity",
+    "valuation",
+    "earnings",
+    "eps",
+    "income statement",
+    "balance sheet",
+    "cash flow",
+    "financial performance",
+    "market cap",
+    "price target",
+)
+
+UNMAPPED_TICKER_BLOCKLIST = {
+    "US",
+    "USA",
+    "UK",
+    "EU",
+    "UAE",
+    "UN",
+    "IMF",
+    "CPI",
+    "PPI",
+    "PCE",
+    "GDP",
+    "PMI",
+    "ISM",
+    "FOMC",
+    "ECB",
+    "BOE",
+    "BOJ",
+    "SNB",
+    "RBA",
+    "RBNZ",
+    "OPEC",
+    "OECD",
+    "BIS",
+    "NATO",
+    "ASEAN",
+    "EPS",
+    "PE",
+}
 
 CAUSAL_ENTITY_TICKER_MAP = {
     # ------------------------------------------------------------------
@@ -732,17 +812,29 @@ def classify_query_route(
     causal_intent: bool,
     market_data_intent: bool,
     target: QueryTarget | None = None,
+    financial_intent: bool = False,
+    explicit_latest_news_intent: bool = False,
 ) -> str:
     q = (query or "").strip().lower()
     if summary_mode:
         return "daily_summary"
-    if market_data_intent:
-        return "live_market_data"
     if causal_intent:
         return "macro_causal"
     if target and target.needs_disambiguation:
         return "ambiguous"
-    if any(h in q for h in ROUTE_HINTS["signal_discovery"]):
+    signal_discovery_intent = has_signal_discovery_intent(query)
+    if (
+        target
+        and target.query_type == QUERY_TYPE_SINGLE
+        and target.ticker
+        and financial_intent
+        and not explicit_latest_news_intent
+        and not signal_discovery_intent
+    ):
+        return "single_ticker_financial"
+    if market_data_intent:
+        return "live_market_data"
+    if signal_discovery_intent:
         return "signal_discovery"
     if any(h in q for h in ROUTE_HINTS["latest_news"]):
         return "latest_news"
@@ -1963,6 +2055,23 @@ def extract_source_filter(query: str) -> str | None:
     return None
 
 
+def has_signal_discovery_intent(query: str) -> bool:
+    q = (query or "").strip().lower()
+    return any(h in q for h in ROUTE_HINTS["signal_discovery"])
+
+
+def is_explicit_latest_news_query(query: str) -> bool:
+    q = (query or "").strip().lower()
+    has_news_term = any(term in q for term in (" news", "news ", "headline", "headlines", "news update"))
+    has_latest_term = any(h in q for h in ROUTE_HINTS["latest_news"])
+    return has_news_term and has_latest_term
+
+
+def is_single_ticker_financial_intent(query: str) -> bool:
+    q = (query or "").strip().lower()
+    return any(hint in q for hint in SINGLE_TICKER_FINANCIAL_INTENT_HINTS)
+
+
 def is_market_data_intent(query: str) -> bool:
     q = query.lower()
     return any(hint in q for hint in MARKET_INTENT_HINTS)
@@ -2235,7 +2344,12 @@ def is_causal_analysis_intent(query: str) -> bool:
     has_usd_anchor = any(anchor in q for anchor in CAUSAL_USD_ANCHORS)
     return has_causal_verb and has_usd_anchor
 
-SYSTEM_PROMPT_TEMPLATE, CAUSAL_SYSTEM_PROMPT_TEMPLATE, DAILY_SUMMARY_PROMPT_TEMPLATE = load_prompt_templates(PROMPT_TEMPLATES_PATH)
+(
+    SYSTEM_PROMPT_TEMPLATE,
+    CAUSAL_SYSTEM_PROMPT_TEMPLATE,
+    DAILY_SUMMARY_PROMPT_TEMPLATE,
+    SINGLE_TICKER_FINANCIAL_PROMPT_TEMPLATE,
+) = load_prompt_templates(PROMPT_TEMPLATES_PATH)
 
 # ---------------------------------------------------------------------------
 # Causal chain decomposition + multi-hop retrieval
@@ -3162,6 +3276,20 @@ def _domain_alias_candidates(q_norm: str) -> list[dict[str, Any]]:
     return hits
 
 
+def _has_unmapped_ticker_context(query: str) -> bool:
+    q = (query or "").strip().lower()
+    return any(hint in q for hint in UNMAPPED_TICKER_CONTEXT_HINTS)
+
+
+def _is_probable_unmapped_ticker_token(token: str, query: str) -> bool:
+    token_norm = (token or "").strip().upper()
+    if len(token_norm) < 2 or len(token_norm) > 5:
+        return False
+    if token_norm in UNMAPPED_TICKER_BLOCKLIST:
+        return False
+    return _has_unmapped_ticker_context(query)
+
+
 def resolve_query_target(
     query: str,
     alias_to_ticker: dict[str, str],
@@ -3183,16 +3311,17 @@ def resolve_query_target(
     q_norm = _normalize_for_matching(query)
     collected: list[dict[str, Any]] = []
 
-    # Tier 1a: dotted-suffix ticker patterns (e.g. BRK.A, SPAX.PVT, SHOP.TO,
-    # RDS.B). The plain `\b([A-Z]{1,5})\b` regex below treats `.` as a word
-    # boundary and so splits `SPAX.PVT` into `SPAX` + `PVT`, neither of which
-    # matches the local map. Capture the full suffixed form first and pass
-    # well-formed but unmapped patterns through to downstream FinanceToolkit /
-    # FMP lookups with moderate confidence.
-    dotted_ticker_tokens = re.findall(r"\b([A-Z]{1,6}\.[A-Z]{1,5})\b", query)
-    dotted_parts: set[str] = set()
-    for token in dotted_ticker_tokens:
-        dotted_parts.update(token.split("."))
+    # Tier 1a: compound ticker patterns (e.g. BRK.A, BRK-B, DX-Y.NYB, CL=F).
+    # The plain `\b([A-Z]{1,5})\b` regex below treats separators as boundaries
+    # and can split one ticker into many partial tokens (e.g. `DX-Y.NYB` ->
+    # `DX`, `Y`, `NYB`). Capture full compound forms first, then suppress
+    # sub-token matches in Tier 1b.
+    compound_pattern = r"(?<![A-Z0-9^.=\-])((?:\^)?[A-Z0-9]{1,6}(?:[.=\-][A-Z0-9]{1,6})+)(?![A-Z0-9.=\-])"
+    compound_ticker_tokens = re.findall(compound_pattern, query)
+    compound_parts: set[str] = set()
+    for token in compound_ticker_tokens:
+        core_token = token.lstrip("^")
+        compound_parts.update(part for part in re.split(r"[.=\-]", core_token) if part)
         if token in ticker_to_canonical:
             collected.append(
                 _build_resolution_candidate(
@@ -3201,12 +3330,14 @@ def resolve_query_target(
                     ticker=token,
                     entity_type="ORG",
                     confidence=0.99,
-                    match_source="ticker_token_dotted",
+                    match_source="ticker_token_compound",
                     matched_alias=token.lower(),
                     category="equities",
                 )
             )
         else:
+            if not _has_unmapped_ticker_context(query):
+                continue
             collected.append(
                 _build_resolution_candidate(
                     canonical_name=token,
@@ -3214,7 +3345,7 @@ def resolve_query_target(
                     ticker=token,
                     entity_type="ORG",
                     confidence=0.85,
-                    match_source="ticker_token_dotted_unmapped",
+                    match_source="ticker_token_compound_unmapped",
                     matched_alias=token.lower(),
                     category="equities",
                 )
@@ -3223,8 +3354,8 @@ def resolve_query_target(
     # Tier 1b: explicit ticker tokens (1-5 uppercase letters).
     ticker_tokens = re.findall(r"\b([A-Z]{1,5})\b", query)
     for token in ticker_tokens:
-        if token in dotted_parts:
-            continue  # already absorbed into a dotted ticker above
+        if token in compound_parts:
+            continue  # already absorbed into a compound ticker above
         if token in ticker_to_canonical:
             collected.append(
                 _build_resolution_candidate(
@@ -3236,6 +3367,19 @@ def resolve_query_target(
                     match_source="ticker_token",
                     matched_alias=token.lower(),
                     category="etfs" if token in {"QQQ", "SPY", "IWM", "DIA"} else "equities",
+                )
+            )
+        elif _is_probable_unmapped_ticker_token(token, query):
+            collected.append(
+                _build_resolution_candidate(
+                    canonical_name=token,
+                    display_name=token,
+                    ticker=token,
+                    entity_type="ORG",
+                    confidence=0.84,
+                    match_source="ticker_token_unmapped",
+                    matched_alias=token.lower(),
+                    category="equities",
                 )
             )
 
@@ -4365,6 +4509,25 @@ def build_context(
     return "\n".join(lines)
 
 
+def build_financial_only_context(
+    query: str,
+    target: QueryTarget,
+    financial_context: str,
+) -> str:
+    lines = []
+    lines.append(f"QUERY: {query}")
+    lines.append(f"TARGET ENTITY : {target.display_name or 'unknown'}")
+    lines.append(f"TARGET CANONICAL: {target.canonical_name or 'unknown'}")
+    lines.append(f"TARGET TICKER : {target.ticker or 'N/A'}")
+    lines.append(f"ENTITY TYPE   : {target.entity_type or 'unknown'}")
+    lines.append(f"CONFIDENCE    : {target.confidence:.2f}")
+    lines.append("")
+    lines.append("Use only the FINANCIAL DATA [F] block below.")
+    lines.append("")
+    lines.append(financial_context.strip())
+    return "\n".join(lines)
+
+
 def build_signal_context(
     query: str,
     target: QueryTarget,
@@ -4460,6 +4623,7 @@ def run_query_once(
     base_system_prompt: str,
     base_causal_system_prompt: str,
     base_daily_summary_prompt: str,
+    base_single_ticker_financial_prompt: str,
     memory: ConversationMemory,
     skip_generation: bool = False,
 ) -> dict[str, Any]:
@@ -4469,15 +4633,31 @@ def run_query_once(
     market_data_intent = is_market_data_intent(query)
     causal_intent = is_causal_analysis_intent(query)
     summary_mode = is_summary_query(query)
+    financial_intent = is_single_ticker_financial_intent(query)
+    explicit_latest_news_intent = is_explicit_latest_news_query(query)
     forced_summary_start, forced_summary_end = infer_summary_date_range(query)
     source_filter = extract_source_filter(query)
-    sub_queries = resolve_temporal_carryover(decompose_query(query, gen_client), memory)
+    early_target = resolve_query_target(
+        query,
+        alias_to_ticker,
+        ticker_to_canonical,
+        driver,
+        sqlite_conn=sqlite_conn,
+        alias_to_fin_entity=alias_to_fin_entity,
+    )
     route_seed = classify_query_route(
         query=query,
         summary_mode=summary_mode,
         causal_intent=causal_intent,
         market_data_intent=market_data_intent,
-        target=None,
+        target=early_target,
+        financial_intent=financial_intent,
+        explicit_latest_news_intent=explicit_latest_news_intent,
+    )
+    sub_queries = (
+        [_extract_single_time_range(query)]
+        if route_seed == "single_ticker_financial"
+        else resolve_temporal_carryover(decompose_query(query, gen_client), memory)
     )
 
     all_contexts: list[str] = []
@@ -4501,6 +4681,8 @@ def run_query_once(
         logs.append(f"  [source filter: {source_filter}]")
     if len(sub_queries) > 1:
         logs.append(f"  [decomposed into {len(sub_queries)} sub-queries]")
+    if route_seed == "single_ticker_financial":
+        logs.append("  [route_type=single_ticker_financial]")
 
     def _compact_candidate(candidate: dict[str, Any]) -> dict[str, Any]:
         return {
@@ -4574,7 +4756,13 @@ def run_query_once(
             "route_type": route_type,
             "retrieval_trace": {
                 "route_type": route_type,
+                "route_profile": _resolve_route_profile(route_type),
                 "scoring_weights": _resolve_scoring_weights(route_type),
+                "selected_chunk_count": 0,
+                "finance_context_present": any(
+                    bool(trace.get("finance_context_present")) for trace in retrieval_traces
+                ),
+                "sub_trace_count": len(retrieval_traces),
                 "sub_traces": retrieval_traces,
             },
             "answer_confidence": 0.0,
@@ -4598,6 +4786,79 @@ def run_query_once(
             "date_start": primary_date_start,
             "date_end": primary_date_end,
         }
+
+    if route_seed == "single_ticker_financial":
+        financial_sub_query = sub_queries[0] if sub_queries else {"query": query, "time_start": None, "time_end": None}
+        primary_date_start = financial_sub_query.get("time_start")
+        primary_date_end = financial_sub_query.get("time_end")
+        if primary_date_start or primary_date_end:
+            logs.append(f"  [time filter: {primary_date_start} -> {primary_date_end}]")
+
+        if primary_target is None:
+            primary_target = early_target
+        if primary_target is None:
+            primary_target = QueryTarget(
+                query_type=QUERY_TYPE_GENERAL,
+                canonical_name=None,
+                display_name="general news",
+                ticker=None,
+                entity_type=None,
+                confidence=0.0,
+            )
+
+        if not primary_target.ticker:
+            retrieval_traces.append(
+                {
+                    "sub_query": query,
+                    "date_start": primary_date_start,
+                    "date_end": primary_date_end,
+                    "route_type": "single_ticker_financial",
+                    "candidate_count": 0,
+                    "ranked_count": 0,
+                    "ranked_candidates": [],
+                    "finance_context_present": False,
+                }
+            )
+            return _empty_result(
+                (
+                    "Answer: Insufficient financial data [F] is available to answer this ticker query.\n"
+                    "Evidence: The FINANCIAL DATA [F] block is missing or unusable.\n"
+                    "Theory: None."
+                ),
+                "single_ticker_financial",
+            )
+
+        fin_ctx = fetch_financial_context(
+            ticker=primary_target.ticker,
+            date_start=primary_date_start,
+            date_end=primary_date_end,
+        )
+        finance_context_present = bool((fin_ctx or "").strip())
+        retrieval_traces.append(
+            {
+                "sub_query": query,
+                "date_start": primary_date_start,
+                "date_end": primary_date_end,
+                "route_type": "single_ticker_financial",
+                "candidate_count": 0,
+                "ranked_count": 0,
+                "ranked_candidates": [],
+                "finance_context_present": finance_context_present,
+            }
+        )
+        if not finance_context_present:
+            logs.append(f"  [financial data] no usable [F] block for {primary_target.ticker}")
+            return _empty_result(
+                (
+                    "Answer: Insufficient financial data [F] is available to answer this ticker query.\n"
+                    "Evidence: The FINANCIAL DATA [F] block is missing or unusable.\n"
+                    "Theory: None."
+                ),
+                "single_ticker_financial",
+            )
+        logs.append(f"  [financial data] fetched [F] block for {primary_target.ticker}")
+        all_contexts.append(build_financial_only_context(query, primary_target, fin_ctx))
+        sub_queries = []
 
     for sq in sub_queries:
         sub_query = sq["query"]
@@ -4808,6 +5069,7 @@ def run_query_once(
         primary_target.ticker
         and not summary_mode
         and route_seed != "signal_discovery"
+        and route_seed != "single_ticker_financial"
     ):
         fin_ctx = fetch_financial_context(
             ticker=primary_target.ticker,
@@ -4917,12 +5179,18 @@ def run_query_once(
     if not all_contexts and route_seed != "signal_discovery":
         return _empty_result("No relevant chunks found.", route_seed)
 
-    final_route = classify_query_route(
-        query=query,
-        summary_mode=summary_mode,
-        causal_intent=causal_intent,
-        market_data_intent=market_data_intent,
-        target=primary_target,
+    final_route = (
+        "single_ticker_financial"
+        if route_seed == "single_ticker_financial"
+        else classify_query_route(
+            query=query,
+            summary_mode=summary_mode,
+            causal_intent=causal_intent,
+            market_data_intent=market_data_intent,
+            target=primary_target,
+            financial_intent=financial_intent,
+            explicit_latest_news_intent=explicit_latest_news_intent,
+        )
     )
     if primary_target.needs_disambiguation:
         final_route = "ambiguous"
@@ -4933,6 +5201,11 @@ def run_query_once(
     causal_system_prompt = (
         build_system_prompt(base_causal_system_prompt, memory)
         if causal_intent and not market_data_intent and not summary_mode
+        else None
+    )
+    single_ticker_financial_system_prompt = (
+        build_system_prompt(base_single_ticker_financial_prompt, memory)
+        if final_route == "single_ticker_financial"
         else None
     )
     merged_context = "\n\n---\n\n".join(all_contexts)
@@ -4949,24 +5222,45 @@ def run_query_once(
     elif skip_generation or DEBUG_SKIP_GENERATION:
         final = "Generation skipped because DEBUG_SKIP_GENERATION is enabled."
     else:
-        active_prompt = causal_system_prompt if causal_system_prompt else system_prompt
+        if single_ticker_financial_system_prompt:
+            active_prompt = single_ticker_financial_system_prompt
+        else:
+            active_prompt = causal_system_prompt if causal_system_prompt else system_prompt
         final = generate_answer(query, merged_context, gen_client, active_prompt)
 
     if market_data_note:
         final = f"{final}\n\nNote: {market_data_note}"
 
-    answer_confidence, confidence_signals = _compute_answer_confidence(
-        all_chunks,
-        primary_target,
-        decision_hint="ambiguous" if final_route == "ambiguous" else None,
-        route_type=final_route,
-    )
-    decision = _decide_answer_mode(answer_confidence)
-    stream_brief_share = _safe_float(confidence_signals.get("stream_brief_share"), 0.0)
-    if stream_brief_share >= STREAM_BRIEF_DOMINANT_THRESHOLD:
-        decision = "abstain"
-    elif stream_brief_share > STREAM_BRIEF_CONFIDENCE_PENALTY_THRESHOLD and decision == "answer":
-        decision = "cautious_answer"
+    if final_route == "single_ticker_financial":
+        finance_context_present = bool((fin_ctx or "").strip())
+        answer_confidence = 78.0 if finance_context_present else 0.0
+        decision = "answer" if finance_context_present else "abstain"
+        confidence_signals = {
+            "relevant_chunks": 0.0,
+            "source_diversity": 0.0,
+            "retrieval_margin": 0.0,
+            "verifier_support": 0.0,
+            "recency_coverage": 0.0,
+            "ambiguity_score": _clamp01(primary_target.ambiguity_score if primary_target else 0.0),
+            "contradiction_signals": 0.0,
+            "stream_brief_count": 0,
+            "stream_brief_share": 0.0,
+            "finance_context_present": finance_context_present,
+            "route_type": final_route,
+        }
+    else:
+        answer_confidence, confidence_signals = _compute_answer_confidence(
+            all_chunks,
+            primary_target,
+            decision_hint="ambiguous" if final_route == "ambiguous" else None,
+            route_type=final_route,
+        )
+        decision = _decide_answer_mode(answer_confidence)
+        stream_brief_share = _safe_float(confidence_signals.get("stream_brief_share"), 0.0)
+        if stream_brief_share >= STREAM_BRIEF_DOMINANT_THRESHOLD:
+            decision = "abstain"
+        elif stream_brief_share > STREAM_BRIEF_CONFIDENCE_PENALTY_THRESHOLD and decision == "answer":
+            decision = "cautious_answer"
 
     if decision == "abstain" and not (skip_generation or DEBUG_SKIP_GENERATION):
         final = (
@@ -5017,6 +5311,7 @@ def run_query_once(
                 "date_start": trace.get("date_start"),
                 "date_end": trace.get("date_end"),
                 "signal_ids": trace.get("signal_ids"),
+                "finance_context_present": bool(trace.get("finance_context_present")),
                 "top_candidates": [_compact_candidate(candidate) for candidate in ranked_candidates[:10]],
             }
         )
@@ -5024,6 +5319,8 @@ def run_query_once(
         "route_type": final_route,
         "route_profile": route_profile,
         "scoring_weights": _resolve_scoring_weights(final_route),
+        "selected_chunk_count": len(all_chunks),
+        "finance_context_present": bool((fin_ctx or "").strip()) if final_route == "single_ticker_financial" else False,
         "sub_trace_count": len(sub_trace_payloads),
         "sub_traces": sub_trace_payloads,
     }
@@ -5082,7 +5379,11 @@ def run_query_once(
         "urls": all_urls,
         "logs": logs,
         "citation_map": build_citation_map(all_chunks),
-        "provenance": format_provenance(all_chunks),
+        "provenance": (
+            "Why this answer: FINANCIAL DATA [F] only."
+            if final_route == "single_ticker_financial"
+            else format_provenance(all_chunks)
+        ),
         "target": primary_target,
         "resolved_target": resolved_target,
         "resolved_target_json": resolved_target,
@@ -5140,6 +5441,10 @@ def main():
     base_system_prompt = SYSTEM_PROMPT_TEMPLATE.format(date_min=date_min, date_max=date_max)
     base_causal_system_prompt = CAUSAL_SYSTEM_PROMPT_TEMPLATE.format(date_min=date_min, date_max=date_max)
     base_daily_summary_prompt = DAILY_SUMMARY_PROMPT_TEMPLATE.format(date_min=date_min, date_max=date_max)
+    base_single_ticker_financial_prompt = SINGLE_TICKER_FINANCIAL_PROMPT_TEMPLATE.format(
+        date_min=date_min,
+        date_max=date_max,
+    )
 
     # ── Memory: load from disk if available ──────────────────────────────────
     memory = load_memory(MEMORY_PATH)
@@ -5178,6 +5483,7 @@ def main():
             base_system_prompt=base_system_prompt,
             base_causal_system_prompt=base_causal_system_prompt,
             base_daily_summary_prompt=base_daily_summary_prompt,
+            base_single_ticker_financial_prompt=base_single_ticker_financial_prompt,
             memory=memory,
         )
         for log_line in result["logs"]:
