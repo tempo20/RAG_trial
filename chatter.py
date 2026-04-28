@@ -1,4 +1,4 @@
-"""
+﻿"""
 chatter.py - Hybrid QA chatbot using lean Neo4j plus SQLite evidence.
 
 Neo4j stores structured macro objects only:
@@ -2520,109 +2520,74 @@ def fetch_market_context(
     hops: list[str],
     date_start: str | None,
     date_end: str | None,
-    lookback_days: int = 7,
+    lookback_days: int = 365,
+    query: str | None = None,
 ) -> str:
     """
     For any hop in the causal chain that maps to a known market symbol,
-    fetch recent historical price data and format it as a context string
-    for injection into the generation prompt.
+    fetch FinanceToolkit financial context and format it as supplemental
+    [F]-citable context for injection into mixed retrieval prompts.
 
-    Returns an empty string if FMP_API_KEY is not set or financetoolkit
-    is not installed.
+    Unlike the single-ticker financial route, this function must not tell the
+    model to use only [F] data because causal prompts can also include article
+    evidence that remains citable as [Sx].
     """
-    api_key = os.getenv("FMP_API_KEY", "").strip()
-    if not api_key:
-        return ""
-
-    try:
-        from financetoolkit import Toolkit
-    except ImportError:
-        return ""
-
-    # Resolve which hops have known symbols
-    symbols = []
-    symbol_to_hop = {}
+    symbols: list[str] = []
+    symbol_to_hop: dict[str, str] = {}
     for hop in hops:
-        symbol = CAUSAL_ENTITY_TICKER_MAP.get(hop)
+        hop_text = str(hop or "").strip()
+        if not hop_text:
+            continue
+        normalized_hop = hop_text.lower().replace(" ", "-")
+        symbol = (
+            CAUSAL_ENTITY_TICKER_MAP.get(hop_text)
+            or CAUSAL_ENTITY_TICKER_MAP.get(hop_text.lower())
+            or CAUSAL_ENTITY_TICKER_MAP.get(normalized_hop)
+        )
         if symbol and symbol not in symbols:
             symbols.append(symbol)
-            symbol_to_hop[symbol] = hop
+            symbol_to_hop[symbol] = hop_text
 
     if not symbols:
         return ""
 
-    # Determine date range — use query dates if present, else last N days
-    from datetime import datetime, timezone, timedelta
-    now = datetime.now(timezone.utc)
-    if date_end:
-        end_dt = date_end
-    else:
-        end_dt = now.strftime("%Y-%m-%d")
-    if date_start:
-        start_dt = date_start
-    else:
-        start_dt = (now - timedelta(days=lookback_days)).strftime("%Y-%m-%d")
+    fetched_blocks: list[tuple[str, str, str]] = []
+    safe_lookback_days = max(int(lookback_days or 365), 365)
+    for symbol in symbols:
+        hop = symbol_to_hop[symbol]
+        try:
+            block = fetch_financial_context(
+                ticker=symbol,
+                date_start=date_start,
+                date_end=date_end,
+                lookback_days=safe_lookback_days,
+                include_technicals=True,
+            )
+        except Exception as exc:
+            print(f"  [market data] financial context fetch failed for {symbol}: {exc}")
+            continue
+        if (block or "").strip():
+            fetched_blocks.append((hop, symbol, block.strip()))
 
-    # The header tells the LLM this is [M]-citable price data, not article text.
-    lines = [
-        "MARKET DATA [M] — cite any fact from this block as [M], NOT as [Sx]:",
-        "(Source: FinancialModelingPrep / YahooFinance price feed, NOT from the article database)",
-    ]
-
-    try:
-        toolkit = Toolkit(symbols, api_key=api_key, start_date=start_dt, end_date=end_dt)
-        hist = toolkit.get_historical_data()
-        print(f"  [market debug] columns type: {type(hist.columns).__name__}, shape: {hist.shape}")
-        print(f"  [market debug] top-level keys: {hist.columns.get_level_values(0).unique().tolist()[:5]}")
-
-        # hist is a DataFrame with MultiIndex columns (symbol, OHLCV fields)
-        # or a flat DataFrame if single symbol — handle both
-        for symbol in symbols:
-            hop = symbol_to_hop[symbol]
-            try:
-                # financetoolkit MultiIndex: top level = field, second level = symbol
-                # e.g. hist["Close"]["CL=F"] or hist["Close"] if single symbol
-                if hasattr(hist.columns, "levels"):
-                    # MultiIndex — fields are top level, symbols are second level
-                    top_level = hist.columns.get_level_values(0).unique().tolist()
-                    if "Close" not in top_level:
-                        lines.append(f"[{hop.upper()}] No Close data for {symbol}")
-                        continue
-                    close_col = hist["Close"]
-                    if symbol not in close_col.columns:
-                        lines.append(f"[{hop.upper()}] Symbol {symbol} not in results")
-                        continue
-                    df = hist.xs(symbol, axis=1, level=1)
-                else:
-                    # Flat DataFrame — single symbol case
-                    df = hist
-
-                if df is None or df.empty:
-                    lines.append(f"[{hop.upper()}] No data returned for {symbol}")
-                    continue
-
-                lines.append(f"\n[{hop.upper()} | {symbol}]")
-                close_series = df["Close"].tail(5).dropna()
-
-                for i, (date_idx, close_val) in enumerate(close_series.items()):
-                    date_str = str(date_idx)[:10]
-                    close_fmt = f"{close_val:.2f}"
-
-                    if i == 0:
-                        ret_str = ""
-                    else:
-                        prev_val = close_series.iloc[i - 1]
-                        ret = (close_val - prev_val) / prev_val * 100
-                        ret_str = f"({ret:+.2f}%)"
-
-                    lines.append(f"  {date_str}: {close_fmt} {ret_str}".strip())
-
-            except Exception as e:
-                lines.append(f"[{hop.upper()}] Parse error: {e}")
-
-    except Exception as e:
-        print(f"  [market data] fetch failed: {e}")
+    if not fetched_blocks:
         return ""
+
+    lines: list[str] = []
+    if query and query.strip():
+        lines.append(f"QUERY: {query.strip()}")
+        lines.append("")
+    lines.extend(
+        [
+            "SUPPLEMENTAL FINANCIAL DATA [F]",
+            "Cite facts from these FinanceToolkit blocks as [F]. Continue to cite retrieved article/news evidence as [Sx].",
+            "Source: FinancialModelingPrep via FinanceToolkit. These blocks supplement, not replace, retrieved evidence.",
+        ]
+    )
+
+    for hop, symbol, block in fetched_blocks:
+        lines.append("")
+        lines.append(f"[{hop.upper()} | {symbol}]")
+        lines.append(block)
 
     return "\n".join(lines)
 
@@ -3392,12 +3357,13 @@ def fetch_financial_context(
 ) -> str:
     """
     Fetch financial data for *ticker* via FinanceToolkit and return an
-    analysis-ready FINANCIAL DATA [F] block structured in 13 sections:
+    analysis-ready FINANCIAL DATA [F] block structured in 13 sections plus a quarterly snapshot:
 
       1. DATA AVAILABILITY       8. CASH FLOW
       2. COMPANY PROFILE         9. VALUATION
       3. FINANCIAL SNAPSHOT     10. STOCK PRICE TREND
-      4. GROWTH                 11. TECHNICAL INDICATORS
+      3A. QUARTERLY SNAPSHOT    11. TECHNICAL INDICATORS
+      4. GROWTH
       5. PROFITABILITY          12. DERIVED CLASSIFICATIONS
       6. EXPENSE STRUCTURE      13. DATA LIMITATIONS
       7. LIQUIDITY & LEVERAGE
@@ -3422,12 +3388,59 @@ def fetch_financial_context(
     now      = datetime.now(timezone.utc)
     end_dt   = date_end   or now.strftime("%Y-%m-%d")
     start_dt = date_start or (now - timedelta(days=lookback_days)).strftime("%Y-%m-%d")
+    statement_lookback_days = max(int(lookback_days or 365), 365 * 4)
+    default_statement_start_dt = (now - timedelta(days=statement_lookback_days)).strftime("%Y-%m-%d")
+    statement_start_dt = (
+        date_start
+        if date_start and date_start < default_statement_start_dt
+        else default_statement_start_dt
+    )
+    quarterly_lookback_days = max(int(lookback_days or 365), 365 * 2)
+    default_quarterly_start_dt = (now - timedelta(days=quarterly_lookback_days)).strftime("%Y-%m-%d")
+    quarterly_start_dt = (
+        date_start
+        if date_start and date_start < default_quarterly_start_dt
+        else default_quarterly_start_dt
+    )
+
+    def _init_toolkit(start_date: str, *, quarterly: bool | None = None):
+        kwargs = {
+            "api_key": api_key,
+            "start_date": start_date,
+            "end_date": end_dt,
+        }
+        if quarterly is not None:
+            kwargs["quarterly"] = quarterly
+        try:
+            return Toolkit([ticker], **kwargs)
+        except TypeError:
+            # Older FinanceToolkit versions may not expose the quarterly kwarg.
+            if quarterly is None:
+                raise
+            kwargs.pop("quarterly", None)
+            return Toolkit([ticker], **kwargs)
 
     try:
-        toolkit = Toolkit([ticker], api_key=api_key, start_date=start_dt, end_date=end_dt)
+        toolkit = _init_toolkit(start_dt)
     except Exception as exc:
         print(f"  [financial data] Toolkit init failed for {ticker}: {exc}")
         return ""
+
+    try:
+        statement_toolkit = _init_toolkit(statement_start_dt, quarterly=False)
+        statement_period_request = "annual (quarterly=False)"
+    except Exception as exc:
+        print(f"  [financial data] annual Toolkit init failed for {ticker}: {exc}; falling back to price Toolkit")
+        statement_toolkit = toolkit
+        statement_period_request = "default (annual Toolkit unavailable)"
+
+    try:
+        quarterly_toolkit = _init_toolkit(quarterly_start_dt, quarterly=True)
+        quarterly_period_request = "quarterly (quarterly=True)"
+    except Exception as exc:
+        print(f"  [financial data] quarterly Toolkit init failed for {ticker}: {exc}; quarterly statements unavailable")
+        quarterly_toolkit = None
+        quarterly_period_request = "unavailable"
 
     # ------------------------------------------------------------------ #
     # 1. Raw data fetches — each individually guarded                     #
@@ -3461,24 +3474,56 @@ def fetch_financial_context(
 
     income_raw = None
     try:
-        income_raw = toolkit.get_income_statement()
+        income_raw = statement_toolkit.get_income_statement()
         fetch_status["income"] = "ok" if (income_raw is not None and not income_raw.empty) else "empty"
     except Exception as e:
         fetch_status["income"] = f"error: {e}"
 
     balance_raw = None
     try:
-        balance_raw = toolkit.get_balance_sheet_statement()
+        balance_raw = statement_toolkit.get_balance_sheet_statement()
         fetch_status["balance"] = "ok" if (balance_raw is not None and not balance_raw.empty) else "empty"
     except Exception as e:
         fetch_status["balance"] = f"error: {e}"
 
     cashflow_raw = None
     try:
-        cashflow_raw = toolkit.get_cash_flow_statement()
+        cashflow_raw = statement_toolkit.get_cash_flow_statement()
         fetch_status["cashflow"] = "ok" if (cashflow_raw is not None and not cashflow_raw.empty) else "empty"
     except Exception as e:
         fetch_status["cashflow"] = f"error: {e}"
+
+    quarterly_income_raw = None
+    quarterly_balance_raw = None
+    quarterly_cashflow_raw = None
+    if quarterly_toolkit is not None:
+        try:
+            quarterly_income_raw = quarterly_toolkit.get_income_statement()
+            fetch_status["income_quarterly"] = (
+                "ok" if (quarterly_income_raw is not None and not quarterly_income_raw.empty) else "empty"
+            )
+        except Exception as e:
+            fetch_status["income_quarterly"] = f"error: {e}"
+
+        try:
+            quarterly_balance_raw = quarterly_toolkit.get_balance_sheet_statement()
+            fetch_status["balance_quarterly"] = (
+                "ok" if (quarterly_balance_raw is not None and not quarterly_balance_raw.empty) else "empty"
+            )
+        except Exception as e:
+            fetch_status["balance_quarterly"] = f"error: {e}"
+
+        try:
+            quarterly_cashflow_raw = quarterly_toolkit.get_cash_flow_statement()
+            fetch_status["cashflow_quarterly"] = (
+                "ok" if (quarterly_cashflow_raw is not None and not quarterly_cashflow_raw.empty) else "empty"
+            )
+        except Exception as e:
+            fetch_status["cashflow_quarterly"] = f"error: {e}"
+    else:
+        fetch_status["income_quarterly"] = "skipped (quarterly Toolkit unavailable)"
+        fetch_status["balance_quarterly"] = "skipped (quarterly Toolkit unavailable)"
+        fetch_status["cashflow_quarterly"] = "skipped (quarterly Toolkit unavailable)"
 
     indicators_df = None
     if include_technicals:
@@ -3507,6 +3552,9 @@ def fetch_financial_context(
     income   = _normalize_fin_df(income_raw,   ticker)
     balance  = _normalize_fin_df(balance_raw,  ticker)
     cashflow = _normalize_fin_df(cashflow_raw, ticker)
+    quarterly_income = _normalize_fin_df(quarterly_income_raw, ticker)
+    quarterly_balance = _normalize_fin_df(quarterly_balance_raw, ticker)
+    quarterly_cashflow = _normalize_fin_df(quarterly_cashflow_raw, ticker)
 
     # Detect period type for financial statements
     period_type = "annual"
@@ -3526,6 +3574,13 @@ def fetch_financial_context(
     # 3. Compute analytical layers                                        #
     # ------------------------------------------------------------------ #
     derived   = _compute_derived_metrics(income, balance, cashflow, profile, ticker)
+    quarterly_derived = _compute_derived_metrics(
+        quarterly_income,
+        quarterly_balance,
+        quarterly_cashflow,
+        profile,
+        ticker,
+    )
     price_m   = _compute_price_trend(hist_df)
     tech_m    = _compute_technical_trend(hist_df, indicators_df, ticker)
     cls       = _classify_financial_metrics(derived, price_m, tech_m)
@@ -3560,6 +3615,41 @@ def fetch_financial_context(
                 fmt = _fmt_val(val, pct=pct, scale=scale, decimals=decimals)
                 _row(label, fmt, period, unit=unit)
 
+    def _latest_periods(df, field: str, limit: int = 4) -> list[tuple[str, object]]:
+        if df is None or field not in df.index:
+            return []
+        try:
+            import pandas as pd
+        except Exception:
+            pd = None
+        periods: list[tuple[str, object]] = []
+        for col in reversed(list(df.columns)):
+            try:
+                val = df.loc[field, col]
+                is_valid = pd.notna(val) if pd is not None else val is not None
+                if is_valid:
+                    periods.append((str(col)[:10], val))
+            except Exception:
+                continue
+            if len(periods) >= limit:
+                break
+        return periods
+
+    def _growth_between_latest_periods(df, field: str, periods_back: int = 1):
+        periods = _latest_periods(df, field, limit=periods_back + 1)
+        if len(periods) <= periods_back:
+            return None, None, "insufficient periods"
+        latest_period, latest_val = periods[0]
+        _, prior_val = periods[periods_back]
+        try:
+            latest_num = float(latest_val)
+            prior_num = float(prior_val)
+            if prior_num == 0:
+                return None, latest_period, "prior-period value is zero"
+            return (latest_num / abs(prior_num) - 1) * 100, latest_period, None
+        except Exception as exc:
+            return None, latest_period, f"calculation error: {exc}"
+
     # ---- Header -----------------------------------------------------------
     _ln("FINANCIAL DATA [F]")
     _ln("Cite any fact from this block as [F], NOT as [Sx] or [M].")
@@ -3570,6 +3660,10 @@ def fetch_financial_context(
     _ln("1. DATA AVAILABILITY")
     for src, status in fetch_status.items():
         _ln(f"  {src}: {status}")
+    _ln(f"  statement_period_request: {statement_period_request}")
+    _ln(f"  statement_start_date: {statement_start_dt}")
+    _ln(f"  quarterly_period_request: {quarterly_period_request}")
+    _ln(f"  quarterly_start_date: {quarterly_start_dt}")
     _ln(f"  period_type_detected: {period_type}")
 
     # ---- Section 2: COMPANY PROFILE ---------------------------------------
@@ -3597,8 +3691,6 @@ def fetch_financial_context(
                     val = profile.loc[src_key, col]
                     if val and str(val).strip() not in ("", "nan", "None"):
                         val_str = str(val).strip()
-                        if label == "Description" and len(val_str) > 400:
-                            val_str = val_str[:400].rstrip() + "…"
                         _ln(f"  {label}: {val_str}")
                     else:
                         _ln(f"  {label}: unavailable")
@@ -3625,7 +3717,58 @@ def fetch_financial_context(
 
     mc_entry = derived.get("market_cap", (None, None, "missing"))
     mc_val   = mc_entry[0]
-    _row("Market Cap", _fmt_val(mc_val) if mc_val is not None else f"unavailable — {mc_entry[2]}", mc_entry[1])
+    _row("Market Cap", _fmt_val(mc_val) if mc_val is not None else f"unavailable - {mc_entry[2]}", mc_entry[1])
+
+    # ---- Section 3A: QUARTERLY SNAPSHOT -----------------------------------
+    _ln()
+    _ln("3A. QUARTERLY SNAPSHOT")
+    if quarterly_income is not None or quarterly_balance is not None or quarterly_cashflow is not None:
+        _ln("  Period Type: quarterly")
+        q_revenue, q_rev_p = _safe_metric(quarterly_income, "Revenue")
+        _row("Latest Quarter Revenue", _fmt_val(q_revenue), q_rev_p)
+        q_net_inc, q_ni_p = _safe_metric(quarterly_income, "Net Income")
+        _row("Latest Quarter Net Income", _fmt_val(q_net_inc), q_ni_p)
+        q_ocf, q_ocf_p = _safe_metric(quarterly_cashflow, "Operating Cash Flow")
+        _row("Latest Quarter Operating Cash Flow", _fmt_val(q_ocf), q_ocf_p)
+        q_fcf_entry = quarterly_derived.get("free_cash_flow", (None, None, "missing OCF or CapEx"))
+        q_fcf_val, q_fcf_p, q_fcf_reason = q_fcf_entry
+        _row(
+            "Latest Quarter Free Cash Flow",
+            _fmt_val(q_fcf_val) if q_fcf_val is not None else f"unavailable - {q_fcf_reason}",
+            q_fcf_p,
+        )
+        q_cur_ratio = quarterly_derived.get("current_ratio", (None, None, "missing Current Assets or Liabilities"))
+        _row(
+            "Latest Quarter Current Ratio",
+            f"{q_cur_ratio[0]:.2f}" if q_cur_ratio[0] is not None else f"unavailable - {q_cur_ratio[2]}",
+            q_cur_ratio[1],
+        )
+        q_rev_qoq, q_rev_growth_p, q_rev_qoq_reason = _growth_between_latest_periods(quarterly_income, "Revenue", 1)
+        _row(
+            "Revenue QoQ Growth",
+            f"{q_rev_qoq:+.1f}%" if q_rev_qoq is not None else f"unavailable - {q_rev_qoq_reason}",
+            q_rev_growth_p,
+        )
+        q_rev_yoy, q_rev_yoy_p, q_rev_yoy_reason = _growth_between_latest_periods(quarterly_income, "Revenue", 4)
+        _row(
+            "Revenue YoY Growth (quarter)",
+            f"{q_rev_yoy:+.1f}%" if q_rev_yoy is not None else f"unavailable - {q_rev_yoy_reason}",
+            q_rev_yoy_p,
+        )
+        revenue_periods = _latest_periods(quarterly_income, "Revenue", 4)
+        if revenue_periods:
+            _ln(
+                "  Recent Quarterly Revenue: "
+                + "; ".join(f"{period}: {_fmt_val(value)}" for period, value in revenue_periods)
+            )
+        net_income_periods = _latest_periods(quarterly_income, "Net Income", 4)
+        if net_income_periods:
+            _ln(
+                "  Recent Quarterly Net Income: "
+                + "; ".join(f"{period}: {_fmt_val(value)}" for period, value in net_income_periods)
+            )
+    else:
+        _ln(f"  unavailable - {fetch_status.get('income_quarterly', 'quarterly statements not fetched')}")
 
     # ---- Section 4: GROWTH ------------------------------------------------
     _ln()
@@ -6087,6 +6230,7 @@ def run_query_once(
                     hops=hops,
                     date_start=date_start,
                     date_end=date_end,
+                    query=sub_query,
                 )
             else:
                 logs.append("  [causal chain] decomposition empty, falling back to standard retrieve")
@@ -6361,6 +6505,26 @@ def run_query_once(
     )
     merged_context = "\n\n---\n\n".join(all_contexts)
 
+    # Dump the full context fed to the model on every query so it can be inspected.
+    try:
+        import datetime as _dt
+        _ts = _dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+        _safe_q = re.sub(r"[^\w\s-]", "", query)[:60].strip().replace(" ", "_")
+        _dump_path = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)),
+            f"query_fin_context.txt",
+        )
+        with open(_dump_path, "w", encoding="utf-8") as _f:
+            _f.write(f"QUERY      : {query}\n")
+            _f.write(f"ROUTE      : {final_route}\n")
+            _f.write(f"TIMESTAMP  : {_ts}\n")
+            _f.write(f"FIN_CTX    : {'present' if (fin_ctx or '').strip() else 'absent'}\n")
+            _f.write("=" * 80 + "\n\n")
+            _f.write(merged_context)
+        print(f"  [context dump] {_dump_path}")
+    except Exception as _dump_exc:
+        print(f"  [context dump] failed: {_dump_exc}")
+
     final = ""
     market_data_note: str | None = None
 
@@ -6443,7 +6607,8 @@ def run_query_once(
             "Evidence: Retrieved support is limited, ambiguous, contradictory, or too weak for a reliable conclusion.\n"
             "Theory: The query likely needs tighter target disambiguation and/or stronger corroborated sources."
         )
-    final = ensure_structured_answer(final, all_chunks)
+    if final_route != "single_ticker_financial":
+        final = ensure_structured_answer(final, all_chunks)
 
     resolved_target = {
         "canonical_name": primary_target.canonical_name,
