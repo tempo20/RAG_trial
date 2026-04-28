@@ -76,6 +76,7 @@ from convo_memory import (
 # ---------------------------------------------------------------------------
 
 DEBUG_SKIP_GENERATION = os.getenv("DEBUG_SKIP_GENERATION", "0").strip() in {"1", "true", "yes"}
+SINGLE_TICKER_OUTLOOK_ENFORCEMENT_VERSION = "v1"
 GEN_MODEL_NAME = os.getenv("GEN_MODEL_NAME")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
 TICKER_MAP_PATH = Path(os.getenv("TICKER_MAP_PATH", "ticker_company_map.csv"))
@@ -124,6 +125,8 @@ SUMMARY_DOMAIN_TERMS = (
 SQLITE_SEMANTIC_CANDIDATE_LIMIT = int(os.getenv("SQLITE_SEMANTIC_CANDIDATE_LIMIT", "0"))
 MACRO_EVENT_CANDIDATE_LIMIT = int(os.getenv("MACRO_EVENT_CANDIDATE_LIMIT", "600"))
 GEN_MAX_TOKENS = int(os.getenv("GEN_MAX_TOKENS", "650"))
+SINGLE_TICKER_GEN_MAX_TOKENS = int(os.getenv("SINGLE_TICKER_GEN_MAX_TOKENS", "1000"))
+GEN_CONTINUATION_MAX_ROUNDS = int(os.getenv("GEN_CONTINUATION_MAX_ROUNDS", "1"))
 RERANKER_MODEL_NAME = os.getenv("RERANKER_MODEL_NAME", "cross-encoder/ms-marco-MiniLM-L-6-v2")
 ENABLE_CROSS_ENCODER_RERANK = os.getenv("ENABLE_CROSS_ENCODER_RERANK", "1").strip().lower() in {"1", "true", "yes", "on"}
 RERANK_CANDIDATE_LIMIT = int(os.getenv("RERANK_CANDIDATE_LIMIT", "10"))
@@ -445,8 +448,10 @@ def load_prompt_templates(path: Path) -> tuple[str, str, str, str]:
             "You are a grounded single-ticker financial analyst. "
             "Use only the FINANCIAL DATA [F] block provided in the context. "
             "Do not use outside knowledge or article/news evidence. "
-            "Structure your response with these exact section headers: Answer, Evidence, Theory. "
+            "Structure your response with these exact section headers: Answer, Evidence, Outlook, Outlook Confidence (0-1), Theory. "
             "Every factual sentence in Answer and Evidence must include [F]. "
+            "Outlook must be exactly one of: Bullish, Bearish, or Neutral. "
+            "Outlook Confidence (0-1) must be a single number from 0.00 to 1.00, where 0.00 is fully bearish and 1.00 is fully bullish; use 0.50 for neutral/mixed. "
             "Theory may contain cautious inference from [F] and must not contain citations. "
             "If FINANCIAL DATA [F] is missing or unusable, state that there is insufficient financial data [F] to answer. "
             "Your article database covers {date_min} to {date_max}."
@@ -2664,20 +2669,745 @@ def _append_statement_rows(
         lines.append(f"  (parse error: {exc})")
 
 
+def _append_latest_technical_indicators(
+    lines: list[str],
+    indicators_df,
+    ticker: str,
+    max_indicators: int = 14,
+) -> int:
+    """
+    Append a compact latest snapshot of technical indicators.
+
+    `collect_all_indicators()` usually returns index=date, columns=indicators
+    for a single ticker, but this helper also tolerates MultiIndex columns.
+    Returns the number of indicator rows appended.
+    """
+    try:
+        import pandas as pd
+
+        if indicators_df is None or indicators_df.empty:
+            return 0
+
+        sub = indicators_df
+
+        # Multi-ticker safety: isolate the requested ticker if present in columns.
+        if hasattr(sub, "columns") and hasattr(sub.columns, "levels"):
+            for level in range(sub.columns.nlevels):
+                try:
+                    level_values = {str(v) for v in sub.columns.get_level_values(level)}
+                except Exception:
+                    continue
+                if ticker in level_values:
+                    try:
+                        sub = sub.xs(ticker, axis=1, level=level)
+                    except Exception:
+                        pass
+                    break
+
+        if sub is None or sub.empty:
+            return 0
+
+        # Keep only rows with at least one non-null metric and use latest row.
+        if hasattr(sub, "dropna"):
+            sub = sub.dropna(how="all")
+        if sub is None or sub.empty:
+            return 0
+
+        latest_idx = sub.index[-1]
+        latest_row = sub.iloc[-1]
+        if hasattr(latest_row, "empty") and latest_row.empty:
+            return 0
+
+        lines.append(f"  As Of: {str(latest_idx)[:10]}")
+
+        appended = 0
+        for metric, value in latest_row.items():
+            if appended >= max_indicators:
+                break
+            if pd.isna(value):
+                continue
+            if isinstance(value, (int, float, np.floating)) and not isinstance(value, bool):
+                value_fmt = f"{float(value):.4g}"
+            else:
+                value_fmt = str(value)
+            lines.append(f"  {metric}: {value_fmt}")
+            appended += 1
+        return appended
+    except Exception as exc:
+        lines.append(f"  (parse error: {exc})")
+        return 0
+
+
+# ---------------------------------------------------------------------------
+# Financial context v2 — normalization and analytical helpers
+# ---------------------------------------------------------------------------
+
+def _normalize_fin_df(df, ticker: str):
+    """
+    Normalize a FinanceToolkit statement/ratio DataFrame into a flat
+    (metric × period) frame with string index and string column labels.
+
+    Handles:
+    - None / empty input → returns None
+    - MultiIndex columns where level-0 is ticker → slice to ticker sub-frame
+    - MultiIndex rows → flatten by joining tuple levels with " | "
+    """
+    import pandas as pd
+
+    if df is None:
+        return None
+    try:
+        if df.empty:
+            return None
+    except Exception:
+        return None
+
+    sub = df
+    try:
+        if hasattr(sub.columns, "levels"):
+            top = list(sub.columns.get_level_values(0).unique())
+            if ticker in top:
+                sub = sub[ticker]
+            elif len(top) == 1:
+                sub = sub[top[0]]
+    except Exception:
+        pass
+
+    try:
+        if hasattr(sub.index, "levels"):
+            sub = sub.copy()
+            sub.index = [
+                " | ".join(str(l) for l in idx) if isinstance(idx, tuple) else str(idx)
+                for idx in sub.index
+            ]
+    except Exception:
+        pass
+
+    try:
+        if sub.empty:
+            return None
+    except Exception:
+        return None
+
+    return sub
+
+
+def _safe_metric(df, field: str):
+    """
+    Return (value, period_label) for the latest non-null column of *field* in
+    a normalized statement DataFrame.  Returns (None, None) on any miss.
+    """
+    import pandas as pd
+
+    if df is None or field not in df.index:
+        return None, None
+    for col in reversed(list(df.columns)):
+        try:
+            v = df.loc[field, col]
+            if pd.notna(v):
+                return v, str(col)[:10]
+        except Exception:
+            continue
+    return None, None
+
+
+def _fmt_val(val, *, pct: bool = False, scale: str = "auto", decimals: int = 2) -> str:
+    """
+    Format a numeric metric value for display in the [F] block.
+
+    scale: "auto" | "B" | "M" | "K" | "raw"
+    Returns "unavailable" for None / NaN / Inf.
+    """
+    if val is None:
+        return "unavailable"
+    try:
+        v = float(val)
+    except Exception:
+        return str(val)
+    if v != v or v in (float("inf"), float("-inf")):
+        return "unavailable"
+
+    if pct:
+        return f"{v:.{decimals}f}%"
+
+    if scale == "auto":
+        abs_v = abs(v)
+        if abs_v >= 1e9:
+            return f"${v / 1e9:.{decimals}f}B"
+        if abs_v >= 1e6:
+            return f"${v / 1e6:.{decimals}f}M"
+        if abs_v >= 1e3:
+            return f"${v / 1e3:.{decimals}f}K"
+        return f"${v:.{decimals}f}"
+    if scale == "B":
+        return f"${v / 1e9:.{decimals}f}B"
+    if scale == "M":
+        return f"${v / 1e6:.{decimals}f}M"
+    if scale == "K":
+        return f"${v / 1e3:.{decimals}f}K"
+    return f"{v:.{decimals}f}"
+
+
+def _compute_derived_metrics(
+    income, balance, cashflow, profile, ticker: str
+) -> dict:
+    """
+    Compute all derived analytical metrics from normalized statement DataFrames.
+
+    Returns: dict[str, (value, period_label, unavail_reason)]
+    value is None when unavailable; unavail_reason explains why.
+    """
+    import pandas as pd
+
+    m: dict = {}
+
+    # --- raw inputs ---------------------------------------------------------
+    revenue, rev_p    = _safe_metric(income,   "Revenue")
+    cogs,    _        = _safe_metric(income,   "Cost of Goods Sold")
+    gross,   _        = _safe_metric(income,   "Gross Profit")
+    op_inc,  _        = _safe_metric(income,   "Operating Income")
+    net_inc, _        = _safe_metric(income,   "Net Income")
+    sga,     _        = _safe_metric(income,   "Selling, General and Administrative Expenses")
+    rnd,     _        = _safe_metric(income,   "Research and Development Expenses")
+
+    cur_assets, _     = _safe_metric(balance,  "Total Current Assets")
+    cur_liabs,  _     = _safe_metric(balance,  "Total Current Liabilities")
+    tot_equity, _     = _safe_metric(balance,  "Total Stockholders Equity")
+    cash,       _     = _safe_metric(balance,  "Cash and Cash Equivalents")
+    tot_debt,   _     = _safe_metric(balance,  "Total Debt")
+    lt_debt,    _     = _safe_metric(balance,  "Long Term Debt")
+
+    ocf,   _          = _safe_metric(cashflow, "Operating Cash Flow")
+    capex, _          = _safe_metric(cashflow, "Capital Expenditure")
+
+    # store raw for classification use
+    m["_revenue"]           = (revenue,   rev_p, None)
+    m["_net_income"]        = (net_inc,   rev_p, None)
+    m["_ocf"]               = (ocf,       rev_p, None)
+    m["_cur_assets"]        = (cur_assets, rev_p, None)
+    m["_cur_liabs"]         = (cur_liabs,  rev_p, None)
+    m["_tot_debt"]          = (tot_debt,   rev_p, None)
+    m["_cash"]              = (cash,       rev_p, None)
+
+    # --- revenue YoY growth -------------------------------------------------
+    if income is not None and "Revenue" in income.index:
+        rev_cols = [c for c in income.columns if pd.notna(income.loc["Revenue", c])]
+        if len(rev_cols) >= 2:
+            r_now  = income.loc["Revenue", rev_cols[-1]]
+            r_prev = income.loc["Revenue", rev_cols[-2]]
+            if r_prev and r_prev != 0:
+                m["revenue_yoy_growth"] = (
+                    (r_now - r_prev) / abs(r_prev) * 100,
+                    f"{str(rev_cols[-2])[:7]}→{str(rev_cols[-1])[:7]}",
+                    None,
+                )
+            else:
+                m["revenue_yoy_growth"] = (None, None, "prior-period revenue is zero")
+        else:
+            m["revenue_yoy_growth"] = (None, None, "insufficient periods")
+    else:
+        m["revenue_yoy_growth"] = (None, None, "no Revenue history")
+
+    # --- 3Y revenue CAGR ----------------------------------------------------
+    if income is not None and "Revenue" in income.index:
+        rev_cols = [c for c in income.columns if pd.notna(income.loc["Revenue", c])]
+        if len(rev_cols) >= 4:
+            r_end   = income.loc["Revenue", rev_cols[-1]]
+            r_start = income.loc["Revenue", rev_cols[-4]]
+            if r_start and r_start > 0 and r_end and r_end > 0:
+                m["revenue_3y_cagr"] = (
+                    ((r_end / r_start) ** (1 / 3) - 1) * 100,
+                    f"{str(rev_cols[-4])[:7]}→{str(rev_cols[-1])[:7]}",
+                    None,
+                )
+            else:
+                m["revenue_3y_cagr"] = (None, None, "non-positive revenue endpoints")
+        else:
+            m["revenue_3y_cagr"] = (None, None, "fewer than 4 periods available")
+    else:
+        m["revenue_3y_cagr"] = (None, None, "no Revenue history")
+
+    # --- margin metrics -----------------------------------------------------
+    def margin(numerator, label):
+        if revenue is None or revenue == 0:
+            return (None, None, "missing Revenue")
+        if numerator is None:
+            return (None, None, f"missing {label}")
+        return (numerator / revenue * 100, rev_p, None)
+
+    if gross is not None:
+        m["gross_margin"] = margin(gross, "Gross Profit")
+    elif cogs is not None and revenue is not None:
+        m["gross_margin"] = margin(revenue - cogs, "Gross Profit")
+    else:
+        m["gross_margin"] = (None, None, "missing Gross Profit and COGS")
+
+    m["operating_margin"] = margin(op_inc,  "Operating Income")
+    m["net_margin"]        = margin(net_inc, "Net Income")
+    m["ocf_margin"]        = margin(ocf,     "Operating Cash Flow")
+
+    # --- FCF ----------------------------------------------------------------
+    if ocf is not None and capex is not None:
+        fcf = ocf - abs(capex)
+        m["free_cash_flow"]   = (fcf,  rev_p, None)
+        m["fcf_margin"]       = margin(fcf, "FCF")
+    else:
+        reason = "missing OCF" if ocf is None else "missing CapEx"
+        m["free_cash_flow"] = (None, None, reason)
+        m["fcf_margin"]     = (None, None, reason)
+
+    # --- expense ratios -----------------------------------------------------
+    m["sga_pct_revenue"] = (
+        (abs(sga) / revenue * 100, rev_p, None)
+        if sga is not None and revenue and revenue != 0
+        else (None, None, "missing SG&A" if sga is None else "missing Revenue")
+    )
+    m["rnd_pct_revenue"] = (
+        (abs(rnd) / revenue * 100, rev_p, None)
+        if rnd is not None and revenue and revenue != 0
+        else (None, None, "missing R&D" if rnd is None else "missing Revenue")
+    )
+
+    # --- liquidity ----------------------------------------------------------
+    if cur_assets is not None and cur_liabs and cur_liabs != 0:
+        m["current_ratio"] = (cur_assets / cur_liabs, rev_p, None)
+    else:
+        m["current_ratio"] = (None, None, "missing Current Assets or Liabilities")
+
+    if cash is not None and cur_liabs and cur_liabs != 0:
+        m["cash_ratio"] = (cash / cur_liabs, rev_p, None)
+    else:
+        m["cash_ratio"] = (None, None, "missing Cash or Current Liabilities")
+
+    # --- leverage -----------------------------------------------------------
+    debt = tot_debt if tot_debt is not None else lt_debt
+    if debt is not None and tot_equity and tot_equity != 0:
+        m["debt_to_equity"] = (debt / tot_equity, rev_p, None)
+    else:
+        m["debt_to_equity"] = (None, None, "missing Debt or Equity")
+
+    if cash is not None and debt is not None:
+        m["net_cash_position"] = (cash - debt, rev_p, None)
+    else:
+        m["net_cash_position"] = (None, None, "missing Cash or Debt")
+
+    # --- operating cash flow (explicit) -------------------------------------
+    m["operating_cash_flow"] = (ocf, rev_p, None if ocf is not None else "missing OCF")
+
+    # --- cash burn ----------------------------------------------------------
+    if ocf is not None:
+        if ocf >= 0:
+            m["cash_burn_status"] = ("positive OCF — not burning cash", rev_p, None)
+        else:
+            if cash is not None and ocf != 0:
+                months = abs(cash / (ocf / 12))
+                m["cash_burn_status"] = (
+                    f"burning cash; ~{months:.0f} months runway at current rate",
+                    rev_p, None,
+                )
+            else:
+                m["cash_burn_status"] = ("burning cash; runway unknown", rev_p, None)
+    else:
+        m["cash_burn_status"] = (None, None, "missing OCF")
+
+    # --- market cap, EV, Price/Sales, EV/Sales ------------------------------
+    market_cap = None
+    if profile is not None:
+        try:
+            if not profile.empty:
+                col = ticker if ticker in profile.columns else profile.columns[0]
+                if "Market Capitalization" in profile.index:
+                    mc_raw = profile.loc["Market Capitalization", col]
+                    if pd.notna(mc_raw):
+                        market_cap = float(mc_raw)
+        except Exception:
+            pass
+
+    if market_cap is not None:
+        m["market_cap"] = (market_cap, "current", None)
+        if debt is not None and cash is not None:
+            m["enterprise_value"] = (market_cap + debt - cash, "current", None)
+        else:
+            m["enterprise_value"] = (None, None, "missing Debt or Cash for EV")
+
+        if revenue and revenue != 0:
+            m["price_to_sales"] = (market_cap / revenue, rev_p, None)
+            ev_v = m["enterprise_value"][0]
+            m["ev_to_sales"] = (
+                (ev_v / revenue, rev_p, None)
+                if ev_v is not None
+                else (None, None, "missing EV")
+            )
+        else:
+            m["price_to_sales"] = (None, None, "missing Revenue")
+            m["ev_to_sales"]    = (None, None, "missing Revenue or EV")
+    else:
+        for k in ("market_cap", "enterprise_value", "price_to_sales", "ev_to_sales"):
+            m[k] = (None, None, "missing Market Cap from profile")
+
+    return m
+
+
+def _compute_price_trend(hist_df) -> dict:
+    """
+    Compute price trend metrics from an OHLCV DataFrame (index=date).
+
+    Returns: dict[str, (value, date_label, unavail_reason)]
+    """
+    import pandas as pd
+
+    _KEYS = [
+        "latest_close", "latest_date", "return_1d", "return_5d",
+        "return_1m", "return_3m", "return_6m", "return_ytd", "return_1y",
+        "high_52w", "low_52w", "dist_52w_high", "dist_52w_low",
+        "latest_volume", "avg_volume_20d", "volume_ratio",
+    ]
+
+    def _unavail(reason):
+        return {k: (None, None, reason) for k in _KEYS}
+
+    if hist_df is None or hist_df.empty:
+        return _unavail("no historical data")
+    if "Close" not in hist_df.columns:
+        return _unavail("Close column missing in historical data")
+
+    close = hist_df["Close"].dropna()
+    if close.empty:
+        return _unavail("all Close prices are null")
+
+    latest_close = float(close.iloc[-1])
+    latest_date  = str(close.index[-1])[:10]
+    m: dict = {}
+    m["latest_close"] = (latest_close, latest_date, None)
+    m["latest_date"]  = (latest_date,  latest_date, None)
+
+    def _ret(n):
+        if len(close) > n:
+            return (float(close.iloc[-1]) / float(close.iloc[-1 - n]) - 1) * 100
+        return None
+
+    for key, n in [
+        ("return_1d", 1), ("return_5d", 5), ("return_1m", 21),
+        ("return_3m", 63), ("return_6m", 126), ("return_1y", 252),
+    ]:
+        v = _ret(n)
+        m[key] = (v, latest_date, None if v is not None else "insufficient history")
+
+    # YTD
+    try:
+        yr = pd.to_datetime(close.index[-1]).year
+        ytd_slice = close[pd.to_datetime(close.index) >= pd.Timestamp(f"{yr}-01-01")]
+        if len(ytd_slice) >= 2:
+            m["return_ytd"] = (
+                (float(ytd_slice.iloc[-1]) / float(ytd_slice.iloc[0]) - 1) * 100,
+                latest_date, None,
+            )
+        else:
+            m["return_ytd"] = (None, None, "insufficient data for YTD")
+    except Exception as e:
+        m["return_ytd"] = (None, None, f"YTD error: {e}")
+
+    # 52-week window
+    w52   = close.tail(252)
+    h52   = float(w52.max())
+    l52   = float(w52.min())
+    m["high_52w"]      = (h52, latest_date, None)
+    m["low_52w"]       = (l52, latest_date, None)
+    m["dist_52w_high"] = ((latest_close / h52 - 1) * 100, latest_date, None)
+    m["dist_52w_low"]  = ((latest_close / l52 - 1) * 100, latest_date, None)
+
+    # Volume
+    if "Volume" in hist_df.columns:
+        vol = hist_df["Volume"].dropna()
+        if not vol.empty:
+            lv    = float(vol.iloc[-1])
+            avg20 = float(vol.tail(20).mean())
+            m["latest_volume"]  = (lv,    latest_date, None)
+            m["avg_volume_20d"] = (avg20, latest_date, None)
+            m["volume_ratio"]   = (
+                (lv / avg20, latest_date, None) if avg20 != 0
+                else (None, None, "zero avg volume")
+            )
+        else:
+            for k in ("latest_volume", "avg_volume_20d", "volume_ratio"):
+                m[k] = (None, None, "no Volume data")
+    else:
+        for k in ("latest_volume", "avg_volume_20d", "volume_ratio"):
+            m[k] = (None, None, "Volume column missing")
+
+    return m
+
+
+def _compute_technical_trend(hist_df, indicators_df, ticker: str) -> dict:
+    """
+    Compute technical trend metrics: SMAs from raw close prices, and
+    RSI / MACD / Bollinger position from collect_all_indicators() output.
+
+    Returns: dict[str, (value, date_label, unavail_reason)]
+    """
+    import pandas as pd
+
+    m: dict = {}
+
+    close: "pd.Series | None" = None
+    latest_date = None
+    if hist_df is not None and not hist_df.empty and "Close" in hist_df.columns:
+        close = hist_df["Close"].dropna()
+        if not close.empty:
+            latest_date = str(close.index[-1])[:10]
+
+    # SMAs computed from raw close prices
+    for period, key in [(20, "sma_20"), (50, "sma_50"), (200, "sma_200")]:
+        vs_key = f"price_vs_{key}"
+        if close is not None and len(close) >= period:
+            sma = float(close.tail(period).mean())
+            m[key]    = (sma, latest_date, None)
+            m[vs_key] = ((float(close.iloc[-1]) / sma - 1) * 100, latest_date, None)
+        else:
+            reason = f"fewer than {period} trading days available"
+            m[key]    = (None, None, reason)
+            m[vs_key] = (None, None, reason)
+
+    # Indicators from collect_all_indicators()
+    sub = None
+    if indicators_df is not None and not indicators_df.empty:
+        try:
+            sub = indicators_df
+            if hasattr(sub.columns, "levels"):
+                for lvl in range(sub.columns.nlevels):
+                    lvl_vals = {str(v) for v in sub.columns.get_level_values(lvl)}
+                    if ticker in lvl_vals:
+                        try:
+                            sub = sub.xs(ticker, axis=1, level=lvl)
+                        except Exception:
+                            pass
+                        break
+            sub = sub.dropna(how="all")
+        except Exception:
+            sub = None
+
+    if sub is not None and not sub.empty:
+        latest_row = sub.iloc[-1]
+        ind_date   = str(sub.index[-1])[:10]
+
+        # RSI
+        rsi_col = next(
+            (c for c in latest_row.index if "RSI" in str(c).upper()), None
+        )
+        if rsi_col and pd.notna(latest_row[rsi_col]):
+            m["rsi"] = (float(latest_row[rsi_col]), ind_date, None)
+        else:
+            m["rsi"] = (None, None, "RSI not found in indicators")
+
+        # MACD line (exclude Signal and Histogram columns)
+        macd_col = next(
+            (
+                c for c in latest_row.index
+                if "MACD" in str(c).upper()
+                and "SIGNAL" not in str(c).upper()
+                and "HIST" not in str(c).upper()
+            ),
+            None,
+        )
+        if macd_col and pd.notna(latest_row[macd_col]):
+            m["macd"] = (float(latest_row[macd_col]), ind_date, None)
+        else:
+            m["macd"] = (None, None, "MACD not found in indicators")
+
+        # Bollinger Band position: (price − lower) / (upper − lower) × 100
+        bb_upper_col = next(
+            (c for c in latest_row.index
+             if "BOLLINGER" in str(c).upper() and "UPPER" in str(c).upper()),
+            None,
+        )
+        bb_lower_col = next(
+            (c for c in latest_row.index
+             if "BOLLINGER" in str(c).upper() and "LOWER" in str(c).upper()),
+            None,
+        )
+        if (
+            bb_upper_col and bb_lower_col
+            and pd.notna(latest_row[bb_upper_col])
+            and pd.notna(latest_row[bb_lower_col])
+            and close is not None and not close.empty
+        ):
+            u = float(latest_row[bb_upper_col])
+            lo = float(latest_row[bb_lower_col])
+            band_width = u - lo
+            if band_width != 0:
+                bb_pos = (float(close.iloc[-1]) - lo) / band_width * 100
+                m["bb_position"] = (bb_pos, ind_date, None)
+            else:
+                m["bb_position"] = (None, None, "Bollinger Band width is zero")
+        else:
+            m["bb_position"] = (None, None, "Bollinger Bands not found in indicators")
+    else:
+        for k in ("rsi", "macd", "bb_position"):
+            m[k] = (None, None, "no indicator data available")
+
+    return m
+
+
+def _classify_financial_metrics(derived: dict, price: dict, technical: dict) -> dict:
+    """
+    Produce deterministic plain-English classifications from computed metrics.
+    All thresholds are hard-coded; no LLM inference is involved.
+    """
+    cls: dict = {}
+
+    def _v(d, key):
+        return d.get(key, (None,))[0]
+
+    # profitability
+    nm = _v(derived, "net_margin")
+    if nm is not None:
+        if nm > 15:
+            cls["profitability_status"] = f"highly profitable (net margin {nm:.1f}%)"
+        elif nm > 5:
+            cls["profitability_status"] = f"moderately profitable (net margin {nm:.1f}%)"
+        elif nm > 0:
+            cls["profitability_status"] = f"marginally profitable (net margin {nm:.1f}%)"
+        else:
+            cls["profitability_status"] = f"unprofitable (net margin {nm:.1f}%)"
+    else:
+        cls["profitability_status"] = "unavailable — missing net margin"
+
+    # liquidity
+    cr = _v(derived, "current_ratio")
+    if cr is not None:
+        if cr >= 2.0:
+            cls["liquidity_status"] = f"strong (current ratio {cr:.2f})"
+        elif cr >= 1.0:
+            cls["liquidity_status"] = f"adequate (current ratio {cr:.2f})"
+        else:
+            cls["liquidity_status"] = f"tight (current ratio {cr:.2f})"
+    else:
+        cls["liquidity_status"] = "unavailable — missing current ratio"
+
+    # leverage
+    de = _v(derived, "debt_to_equity")
+    if de is not None:
+        if de < 0.3:
+            cls["leverage_status"] = f"low leverage (D/E {de:.2f})"
+        elif de < 1.0:
+            cls["leverage_status"] = f"moderate leverage (D/E {de:.2f})"
+        elif de < 2.0:
+            cls["leverage_status"] = f"elevated leverage (D/E {de:.2f})"
+        else:
+            cls["leverage_status"] = f"high leverage (D/E {de:.2f})"
+    else:
+        cls["leverage_status"] = "unavailable — missing D/E ratio"
+
+    # cash flow
+    ocf_v = _v(derived, "_ocf")
+    fcf_v = _v(derived, "free_cash_flow")
+    if ocf_v is not None and fcf_v is not None:
+        if fcf_v > 0 and ocf_v > 0:
+            cls["cash_flow_status"] = "FCF positive — self-funding"
+        elif ocf_v > 0:
+            cls["cash_flow_status"] = "OCF positive, FCF negative — heavy CapEx cycle"
+        else:
+            cls["cash_flow_status"] = "OCF negative — cash consuming"
+    elif ocf_v is not None:
+        cls["cash_flow_status"] = (
+            "OCF positive (FCF unknown)" if ocf_v > 0
+            else "OCF negative — cash consuming (FCF unknown)"
+        )
+    else:
+        cls["cash_flow_status"] = "unavailable — missing OCF"
+
+    # valuation
+    ps = _v(derived, "price_to_sales")
+    if ps is not None:
+        if ps < 1:
+            cls["valuation_status"] = f"low valuation (P/S {ps:.1f}x)"
+        elif ps < 5:
+            cls["valuation_status"] = f"moderate valuation (P/S {ps:.1f}x)"
+        elif ps < 15:
+            cls["valuation_status"] = f"elevated valuation (P/S {ps:.1f}x)"
+        else:
+            cls["valuation_status"] = f"high valuation (P/S {ps:.1f}x)"
+    else:
+        cls["valuation_status"] = "unavailable — missing P/S ratio"
+
+    # short-term trend
+    r5d   = _v(price,     "return_5d")
+    vs_20 = _v(technical, "price_vs_sma_20")
+    if r5d is not None and vs_20 is not None:
+        if r5d > 2 and vs_20 > 0:
+            cls["short_term_trend_status"] = "bullish (5D gain + above 20D SMA)"
+        elif r5d < -2 and vs_20 < 0:
+            cls["short_term_trend_status"] = "bearish (5D loss + below 20D SMA)"
+        else:
+            cls["short_term_trend_status"] = "neutral / mixed short-term signals"
+    else:
+        cls["short_term_trend_status"] = "unavailable — missing 5D return or 20D SMA"
+
+    # medium-term trend
+    vs_50  = _v(technical, "price_vs_sma_50")
+    vs_200 = _v(technical, "price_vs_sma_200")
+    if vs_50 is not None and vs_200 is not None:
+        if vs_50 > 0 and vs_200 > 0:
+            cls["medium_term_trend_status"] = "uptrend (above both 50D and 200D SMA)"
+        elif vs_50 < 0 and vs_200 < 0:
+            cls["medium_term_trend_status"] = "downtrend (below both 50D and 200D SMA)"
+        else:
+            cls["medium_term_trend_status"] = "mixed medium-term trend signals"
+    else:
+        cls["medium_term_trend_status"] = "unavailable — missing SMA data"
+
+    # overall profile
+    flags = []
+    p_stat = cls["profitability_status"]
+    if p_stat.startswith("highly") or p_stat.startswith("moderately"):
+        flags.append("profitable")
+    if cls["cash_flow_status"].startswith("FCF positive"):
+        flags.append("FCF-generative")
+    if cls["liquidity_status"].startswith("strong"):
+        flags.append("strong liquidity")
+    if cls["leverage_status"].startswith("low"):
+        flags.append("low leverage")
+    mt = cls["medium_term_trend_status"]
+    if mt.startswith("uptrend"):
+        flags.append("uptrend")
+    elif mt.startswith("downtrend"):
+        flags.append("downtrend")
+    cls["overall_stock_profile"] = (
+        "; ".join(flags) if flags else "insufficient data for overall profile"
+    )
+
+    return cls
+
+
+# ---------------------------------------------------------------------------
+# Public entry point
+# ---------------------------------------------------------------------------
+
 def fetch_financial_context(
     ticker: str,
     date_start: str | None,
     date_end: str | None,
     lookback_days: int = 365,
+    include_technicals: bool = False,
 ) -> str:
     """
-    For a resolved stock ticker, fetch core financial context using FinanceToolkit:
-    historical price trend, income statement, balance sheet, cash flow, and
-    key ratios. Returns a FINANCIAL DATA [F] block for injection into the
-    generation prompt, or empty string on any failure or missing API key.
+    Fetch financial data for *ticker* via FinanceToolkit and return an
+    analysis-ready FINANCIAL DATA [F] block structured in 13 sections:
 
-    Each sub-fetch is wrapped individually so premium-gated or unavailable
-    endpoints degrade gracefully without breaking the caller.
+      1. DATA AVAILABILITY       8. CASH FLOW
+      2. COMPANY PROFILE         9. VALUATION
+      3. FINANCIAL SNAPSHOT     10. STOCK PRICE TREND
+      4. GROWTH                 11. TECHNICAL INDICATORS
+      5. PROFITABILITY          12. DERIVED CLASSIFICATIONS
+      6. EXPENSE STRUCTURE      13. DATA LIMITATIONS
+      7. LIQUIDITY & LEVERAGE
+
+    Every metric includes its ticker, period/date, units, and an explicit
+    "unavailable — <reason>" marker when the value cannot be computed.
+    No LLM inference is used to fill gaps.
+
+    Returns empty string when FMP_API_KEY is absent, FinanceToolkit is not
+    installed, Toolkit init fails, or no usable data is returned for ticker.
     """
     api_key = os.getenv("FMP_API_KEY", "").strip()
     if not api_key:
@@ -2689,14 +3419,9 @@ def fetch_financial_context(
         return ""
 
     from datetime import datetime, timezone, timedelta
-    now = datetime.now(timezone.utc)
-    end_dt = date_end or now.strftime("%Y-%m-%d")
+    now      = datetime.now(timezone.utc)
+    end_dt   = date_end   or now.strftime("%Y-%m-%d")
     start_dt = date_start or (now - timedelta(days=lookback_days)).strftime("%Y-%m-%d")
-
-    lines: list[str] = [
-        "FINANCIAL DATA [F] — cite any fact from this block as [F], NOT as [Sx] or [M]:",
-        f"(Source: FinancialModelingPrep via FinanceToolkit | Ticker: {ticker})",
-    ]
 
     try:
         toolkit = Toolkit([ticker], api_key=api_key, start_date=start_dt, end_date=end_dt)
@@ -2704,135 +3429,385 @@ def fetch_financial_context(
         print(f"  [financial data] Toolkit init failed for {ticker}: {exc}")
         return ""
 
-    # Track successful fetches so we can suppress an empty/header-only [F]
-    # block when the ticker is unknown to FMP (e.g. user-typed ticker pattern
-    # that resolves locally but has no FMP coverage).
-    fetched_blocks = 0
+    # ------------------------------------------------------------------ #
+    # 1. Raw data fetches — each individually guarded                     #
+    # ------------------------------------------------------------------ #
+    fetch_status: dict[str, str] = {}
 
-    # Company profile — static metadata (name, sector, CEO, description, etc.)
-    _PROFILE_FIELDS = [
-        ("Company Name", "Company Name"),
-        ("Sector", "Sector"),
-        ("Industry", "Industry"),
-        ("CEO", "CEO"),
-        ("Country", "Country"),
-        ("Exchange Full Name", "Exchange"),
-        ("Market Capitalization", "Market Cap"),
-        ("Beta", "Beta"),
-        ("Full Time Employees", "Employees"),
-        ("IPO Date", "IPO Date"),
-        ("Website", "Website"),
-        ("Description", "Description"),
-    ]
+    profile = None
     try:
         profile = toolkit.get_profile()
-        if profile is not None and not profile.empty:
-            lines.append(f"\n[COMPANY PROFILE | {ticker}]")
+        fetch_status["profile"] = "ok" if (profile is not None and not profile.empty) else "empty"
+    except Exception as e:
+        fetch_status["profile"] = f"error: {e}"
+
+    hist_raw = None
+    hist_df: "object | None" = None
+    try:
+        hist_raw = toolkit.get_historical_data()
+        if hist_raw is not None and not hist_raw.empty:
+            if hasattr(hist_raw.columns, "levels"):
+                try:
+                    hist_df = hist_raw.xs(ticker, axis=1, level=1)
+                except KeyError:
+                    hist_df = hist_raw
+            else:
+                hist_df = hist_raw
+            fetch_status["historical"] = "ok"
+        else:
+            fetch_status["historical"] = "empty"
+    except Exception as e:
+        fetch_status["historical"] = f"error: {e}"
+
+    income_raw = None
+    try:
+        income_raw = toolkit.get_income_statement()
+        fetch_status["income"] = "ok" if (income_raw is not None and not income_raw.empty) else "empty"
+    except Exception as e:
+        fetch_status["income"] = f"error: {e}"
+
+    balance_raw = None
+    try:
+        balance_raw = toolkit.get_balance_sheet_statement()
+        fetch_status["balance"] = "ok" if (balance_raw is not None and not balance_raw.empty) else "empty"
+    except Exception as e:
+        fetch_status["balance"] = f"error: {e}"
+
+    cashflow_raw = None
+    try:
+        cashflow_raw = toolkit.get_cash_flow_statement()
+        fetch_status["cashflow"] = "ok" if (cashflow_raw is not None and not cashflow_raw.empty) else "empty"
+    except Exception as e:
+        fetch_status["cashflow"] = f"error: {e}"
+
+    indicators_df = None
+    if include_technicals:
+        try:
+            indicators_df = toolkit.technicals.collect_all_indicators()
+            fetch_status["indicators"] = (
+                "ok" if (indicators_df is not None and not indicators_df.empty) else "empty"
+            )
+        except Exception as e:
+            fetch_status["indicators"] = f"error: {e}"
+    else:
+        fetch_status["indicators"] = "skipped (include_technicals=False)"
+
+    # Bail early if nothing at all came back
+    useful = [s for s in fetch_status.values() if s == "ok"]
+    if not useful:
+        print(
+            f"  [financial data] no usable FMP data for {ticker} "
+            "(ticker may be unsupported or premium-gated)"
+        )
+        return ""
+
+    # ------------------------------------------------------------------ #
+    # 2. Normalise DataFrames                                             #
+    # ------------------------------------------------------------------ #
+    income   = _normalize_fin_df(income_raw,   ticker)
+    balance  = _normalize_fin_df(balance_raw,  ticker)
+    cashflow = _normalize_fin_df(cashflow_raw, ticker)
+
+    # Detect period type for financial statements
+    period_type = "annual"
+    if income is not None and not income.empty:
+        cols = list(income.columns)
+        if len(cols) >= 2:
+            try:
+                import pandas as pd
+                dt0 = pd.to_datetime(str(cols[-2]))
+                dt1 = pd.to_datetime(str(cols[-1]))
+                if abs((dt1 - dt0).days) < 120:
+                    period_type = "quarterly"
+            except Exception:
+                pass
+
+    # ------------------------------------------------------------------ #
+    # 3. Compute analytical layers                                        #
+    # ------------------------------------------------------------------ #
+    derived   = _compute_derived_metrics(income, balance, cashflow, profile, ticker)
+    price_m   = _compute_price_trend(hist_df)
+    tech_m    = _compute_technical_trend(hist_df, indicators_df, ticker)
+    cls       = _classify_financial_metrics(derived, price_m, tech_m)
+
+    # ------------------------------------------------------------------ #
+    # 4. Format [F] block                                                 #
+    # ------------------------------------------------------------------ #
+    lines: list[str] = []
+    generated_at = now.strftime("%Y-%m-%d")
+
+    def _ln(text: str = "") -> None:
+        lines.append(text)
+
+    def _row(label, val, period=None, unit="", note=None):
+        """Append one metric row with consistent formatting."""
+        period_str = f" [{period}]" if period else ""
+        unit_str   = f" {unit}"    if unit   else ""
+        note_str   = f"  ({note})" if note   else ""
+        lines.append(f"  {label}{period_str}: {val}{unit_str}{note_str}")
+
+    def _m(key, label, *, d=None, pct=False, scale="auto", unit="", decimals=2):
+        """Render a single derived/price/tech metric row."""
+        src = d if d is not None else derived
+        entry = src.get(key, (None, None, "key not found"))
+        val, period, reason = entry[0], entry[1], entry[2]
+        if val is None:
+            _row(label, f"unavailable — {reason}", period)
+        else:
+            if isinstance(val, str):
+                _row(label, val, period)
+            else:
+                fmt = _fmt_val(val, pct=pct, scale=scale, decimals=decimals)
+                _row(label, fmt, period, unit=unit)
+
+    # ---- Header -----------------------------------------------------------
+    _ln("FINANCIAL DATA [F]")
+    _ln("Cite any fact from this block as [F], NOT as [Sx] or [M].")
+    _ln(f"Source: FinancialModelingPrep via FinanceToolkit | Ticker: {ticker} | Generated: {generated_at}")
+
+    # ---- Section 1: DATA AVAILABILITY ------------------------------------
+    _ln()
+    _ln("1. DATA AVAILABILITY")
+    for src, status in fetch_status.items():
+        _ln(f"  {src}: {status}")
+    _ln(f"  period_type_detected: {period_type}")
+
+    # ---- Section 2: COMPANY PROFILE ---------------------------------------
+    _ln()
+    _ln("2. COMPANY PROFILE")
+    _PROFILE_FIELDS = [
+        ("Company Name",        "Company Name"),
+        ("Sector",              "Sector"),
+        ("Industry",            "Industry"),
+        ("CEO",                 "CEO"),
+        ("Country",             "Country"),
+        ("Exchange Full Name",  "Exchange"),
+        ("Market Capitalization","Market Cap (profile)"),
+        ("Beta",                "Beta"),
+        ("Full Time Employees", "Employees"),
+        ("IPO Date",            "IPO Date"),
+        ("Website",             "Website"),
+        ("Description",         "Description"),
+    ]
+    if profile is not None and not profile.empty:
+        try:
             col = ticker if ticker in profile.columns else profile.columns[0]
             for src_key, label in _PROFILE_FIELDS:
                 if src_key in profile.index:
                     val = profile.loc[src_key, col]
                     if val and str(val).strip() not in ("", "nan", "None"):
                         val_str = str(val).strip()
-                        # Truncate very long descriptions to keep context tight
                         if label == "Description" and len(val_str) > 400:
                             val_str = val_str[:400].rstrip() + "…"
-                        lines.append(f"  {label}: {val_str}")
-            fetched_blocks += 1
-    except Exception as exc:
-        lines.append(f"[COMPANY PROFILE] Unavailable: {exc}")
+                        _ln(f"  {label}: {val_str}")
+                    else:
+                        _ln(f"  {label}: unavailable")
+                else:
+                    _ln(f"  {label}: unavailable")
+        except Exception as e:
+            _ln(f"  (profile parse error: {e})")
+    else:
+        _ln(f"  unavailable — {fetch_status.get('profile', 'not fetched')}")
 
-    # Historical price trend
-    try:
-        hist = toolkit.get_historical_data()
-        if hist is not None and not hist.empty:
-            if hasattr(hist.columns, "levels"):
-                try:
-                    df_hist = hist.xs(ticker, axis=1, level=1)
-                except KeyError:
-                    df_hist = hist
+    # ---- Section 3: FINANCIAL SNAPSHOT ------------------------------------
+    _ln()
+    _ln("3. FINANCIAL SNAPSHOT")
+    _ln(f"  Ticker: {ticker}")
+    _ln(f"  Period Type: {period_type}")
+    revenue, rev_p = _safe_metric(income, "Revenue")
+    _row("Revenue", _fmt_val(revenue), rev_p)
+    net_inc, ni_p = _safe_metric(income, "Net Income")
+    _row("Net Income", _fmt_val(net_inc), ni_p)
+    ta, ta_p = _safe_metric(balance, "Total Assets")
+    _row("Total Assets", _fmt_val(ta), ta_p)
+    te, te_p = _safe_metric(balance, "Total Stockholders Equity")
+    _row("Total Equity", _fmt_val(te), te_p)
+
+    mc_entry = derived.get("market_cap", (None, None, "missing"))
+    mc_val   = mc_entry[0]
+    _row("Market Cap", _fmt_val(mc_val) if mc_val is not None else f"unavailable — {mc_entry[2]}", mc_entry[1])
+
+    # ---- Section 4: GROWTH ------------------------------------------------
+    _ln()
+    _ln("4. GROWTH")
+    _m("revenue_yoy_growth", "Revenue YoY Growth",  pct=True,  scale="raw", decimals=1)
+    _m("revenue_3y_cagr",    "Revenue 3Y CAGR",     pct=True,  scale="raw", decimals=1)
+
+    # ---- Section 5: PROFITABILITY -----------------------------------------
+    _ln()
+    _ln("5. PROFITABILITY")
+    _m("gross_margin",    "Gross Margin",     pct=True, scale="raw", decimals=1)
+    _m("operating_margin","Operating Margin", pct=True, scale="raw", decimals=1)
+    _m("net_margin",      "Net Margin",       pct=True, scale="raw", decimals=1)
+    _m("ocf_margin",      "OCF Margin",       pct=True, scale="raw", decimals=1)
+    _m("fcf_margin",      "FCF Margin",       pct=True, scale="raw", decimals=1)
+
+    # ---- Section 6: EXPENSE STRUCTURE ------------------------------------
+    _ln()
+    _ln("6. EXPENSE STRUCTURE")
+    _m("sga_pct_revenue", "SG&A % of Revenue", pct=True, scale="raw", decimals=1)
+    _m("rnd_pct_revenue", "R&D % of Revenue",  pct=True, scale="raw", decimals=1)
+    sga_v, sga_p = _safe_metric(income, "Selling, General and Administrative Expenses")
+    _row("SG&A (absolute)", _fmt_val(sga_v), sga_p)
+    rnd_v, rnd_p = _safe_metric(income, "Research and Development Expenses")
+    _row("R&D (absolute)",  _fmt_val(rnd_v), rnd_p)
+
+    # ---- Section 7: LIQUIDITY & LEVERAGE ----------------------------------
+    _ln()
+    _ln("7. LIQUIDITY & LEVERAGE")
+    _m("current_ratio",    "Current Ratio",    scale="raw", decimals=2)
+    _m("cash_ratio",       "Cash Ratio",       scale="raw", decimals=2)
+    _m("debt_to_equity",   "Debt-to-Equity",   scale="raw", decimals=2)
+    _m("net_cash_position","Net Cash Position")
+    ca_v, ca_p = _safe_metric(balance, "Cash and Cash Equivalents")
+    _row("Cash & Equivalents", _fmt_val(ca_v), ca_p)
+    td_v, td_p = _safe_metric(balance, "Total Debt")
+    _row("Total Debt",         _fmt_val(td_v) if td_v is not None else "unavailable — not in balance sheet", td_p)
+
+    # ---- Section 8: CASH FLOW ---------------------------------------------
+    _ln()
+    _ln("8. CASH FLOW")
+    _m("operating_cash_flow","Operating Cash Flow")
+    _m("free_cash_flow",     "Free Cash Flow")
+    _m("ocf_margin",         "OCF Margin",   pct=True, scale="raw", decimals=1)
+    _m("fcf_margin",         "FCF Margin",   pct=True, scale="raw", decimals=1)
+    capex_v, capex_p = _safe_metric(cashflow, "Capital Expenditure")
+    _row("CapEx", _fmt_val(capex_v), capex_p)
+
+    burn_entry = derived.get("cash_burn_status", (None, None, "missing OCF"))
+    burn_val, burn_p, burn_reason = burn_entry
+    if burn_val is None:
+        _row("Cash Burn Status", f"unavailable — {burn_reason}", burn_p)
+    else:
+        _row("Cash Burn Status", str(burn_val), burn_p)
+
+    # ---- Section 9: VALUATION ---------------------------------------------
+    _ln()
+    _ln("9. VALUATION")
+    _m("market_cap",        "Market Cap")
+    _m("enterprise_value",  "Enterprise Value")
+    _m("price_to_sales",    "Price/Sales",    scale="raw", decimals=2, unit="x")
+    _m("ev_to_sales",       "EV/Sales",       scale="raw", decimals=2, unit="x")
+
+    # ---- Section 10: STOCK PRICE TREND ------------------------------------
+    _ln()
+    _ln("10. STOCK PRICE TREND")
+    lc_entry = price_m.get("latest_close", (None, None, "no historical data"))
+    lc_val, lc_date, lc_reason = lc_entry
+    _row("Latest Close", f"${lc_val:.2f}" if lc_val is not None else f"unavailable — {lc_reason}", lc_date)
+
+    for key, label in [
+        ("return_1d",  "1D Return"),
+        ("return_5d",  "5D Return"),
+        ("return_1m",  "1M Return"),
+        ("return_3m",  "3M Return"),
+        ("return_6m",  "6M Return"),
+        ("return_ytd", "YTD Return"),
+        ("return_1y",  "1Y Return"),
+    ]:
+        entry = price_m.get(key, (None, None, "no data"))
+        v, p, r = entry
+        if v is not None:
+            _row(label, f"{v:+.2f}%", p)
+        else:
+            _row(label, f"unavailable — {r}", p)
+
+    for key, label in [
+        ("high_52w",      "52-Week High"),
+        ("low_52w",       "52-Week Low"),
+        ("dist_52w_high", "Distance from 52W High"),
+        ("dist_52w_low",  "Distance from 52W Low"),
+    ]:
+        entry = price_m.get(key, (None, None, "no data"))
+        v, p, r = entry
+        if v is not None:
+            if "dist" in key:
+                _row(label, f"{v:+.2f}%", p)
             else:
-                df_hist = hist
-            if not df_hist.empty and "Close" in df_hist.columns:
-                close_series = df_hist["Close"].tail(10).dropna()
-                if not close_series.empty:
-                    lines.append(f"\n[PRICE HISTORY | {ticker}]")
-                    for i, (date_idx, close_val) in enumerate(close_series.items()):
-                        date_str = str(date_idx)[:10]
-                        if i == 0:
-                            ret_str = ""
-                        else:
-                            prev_val = close_series.iloc[i - 1]
-                            ret = (close_val - prev_val) / prev_val * 100
-                            ret_str = f"  ({ret:+.2f}%)"
-                        lines.append(f"  {date_str}: {close_val:.2f}{ret_str}")
-                    fetched_blocks += 1
-    except Exception as exc:
-        lines.append(f"[PRICE HISTORY] Unavailable: {exc}")
+                _row(label, f"${v:.2f}", p)
+        else:
+            _row(label, f"unavailable — {r}", p)
 
-    # Income statement
-    try:
-        income = toolkit.get_income_statement()
-        if income is not None and not income.empty:
-            lines.append("\n[INCOME STATEMENT | Most Recent Period]")
-            _append_statement_rows(lines, income, ticker, max_rows=8)
-            fetched_blocks += 1
-    except Exception as exc:
-        lines.append(f"[INCOME STATEMENT] Unavailable: {exc}")
+    for key, label in [
+        ("latest_volume",  "Latest Volume"),
+        ("avg_volume_20d", "20D Avg Volume"),
+        ("volume_ratio",   "Volume Ratio (vs 20D avg)"),
+    ]:
+        entry = price_m.get(key, (None, None, "no data"))
+        v, p, r = entry
+        if v is not None:
+            if key == "volume_ratio":
+                _row(label, f"{v:.2f}x", p)
+            else:
+                _row(label, f"{v:,.0f}", p)
+        else:
+            _row(label, f"unavailable — {r}", p)
 
-    # Balance sheet
-    try:
-        balance = toolkit.get_balance_sheet_statement()
-        if balance is not None and not balance.empty:
-            lines.append("\n[BALANCE SHEET | Most Recent Period]")
-            _append_statement_rows(lines, balance, ticker, max_rows=8)
-            fetched_blocks += 1
-    except Exception as exc:
-        lines.append(f"[BALANCE SHEET] Unavailable: {exc}")
+    # ---- Section 11: TECHNICAL INDICATORS ---------------------------------
+    _ln()
+    _ln("11. TECHNICAL INDICATORS")
+    for key, label, is_pct in [
+        ("sma_20",         "20D SMA",              False),
+        ("sma_50",         "50D SMA",              False),
+        ("sma_200",        "200D SMA",             False),
+        ("price_vs_sma_20", "Price vs 20D SMA",   True),
+        ("price_vs_sma_50", "Price vs 50D SMA",   True),
+        ("price_vs_sma_200","Price vs 200D SMA",  True),
+    ]:
+        entry = tech_m.get(key, (None, None, "no data"))
+        v, p, r = entry
+        if v is not None:
+            if is_pct:
+                _row(label, f"{v:+.2f}%", p)
+            else:
+                _row(label, f"${v:.2f}", p)
+        else:
+            _row(label, f"unavailable — {r}", p)
 
-    # Cash flow statement
-    try:
-        cashflow = toolkit.get_cash_flow_statement()
-        if cashflow is not None and not cashflow.empty:
-            lines.append("\n[CASH FLOW | Most Recent Period]")
-            _append_statement_rows(lines, cashflow, ticker, max_rows=6)
-            fetched_blocks += 1
-    except Exception as exc:
-        lines.append(f"[CASH FLOW] Unavailable: {exc}")
+    for key, label, fmt_fn in [
+        ("rsi",         "RSI",                    lambda v: f"{v:.1f}"),
+        ("macd",        "MACD",                   lambda v: f"{v:.4f}"),
+        ("bb_position", "Bollinger Band Position", lambda v: f"{v:.1f}% of band"),
+    ]:
+        entry = tech_m.get(key, (None, None, "no data"))
+        v, p, r = entry
+        if v is not None:
+            _row(label, fmt_fn(v), p)
+        else:
+            _row(label, f"unavailable — {r}", p)
 
-    # Profitability ratios
-    try:
-        prof = toolkit.ratios.collect_profitability_ratios()
-        if prof is not None and not prof.empty:
-            lines.append("\n[PROFITABILITY RATIOS]")
-            _append_statement_rows(lines, prof, ticker, max_rows=6)
-            fetched_blocks += 1
-    except Exception:
-        pass
+    # ---- Section 12: DERIVED CLASSIFICATIONS ------------------------------
+    _ln()
+    _ln("12. DERIVED CLASSIFICATIONS")
+    for key, label in [
+        ("profitability_status",    "Profitability"),
+        ("liquidity_status",        "Liquidity"),
+        ("leverage_status",         "Leverage"),
+        ("cash_flow_status",        "Cash Flow"),
+        ("valuation_status",        "Valuation"),
+        ("short_term_trend_status", "Short-Term Trend"),
+        ("medium_term_trend_status","Medium-Term Trend"),
+        ("overall_stock_profile",   "Overall Profile"),
+    ]:
+        _ln(f"  {label}: {cls.get(key, 'unavailable')}")
 
-    # Liquidity ratios
-    try:
-        liq = toolkit.ratios.collect_liquidity_ratios()
-        if liq is not None and not liq.empty:
-            lines.append("\n[LIQUIDITY RATIOS]")
-            _append_statement_rows(lines, liq, ticker, max_rows=4)
-            fetched_blocks += 1
-    except Exception:
-        pass
+    # ---- Section 13: DATA LIMITATIONS -------------------------------------
+    _ln()
+    _ln("13. DATA LIMITATIONS")
+    limitations = []
+    for src, status in fetch_status.items():
+        if status != "ok" and not status.startswith("skipped"):
+            limitations.append(f"  - {src}: {status}")
+    if period_type == "quarterly":
+        limitations.append("  - Statements are quarterly; YoY growth and CAGR use sequential quarters, not fiscal years.")
+    if not include_technicals:
+        limitations.append("  - Technical indicator data was not requested (include_technicals=False); RSI/MACD/BB unavailable.")
 
-    # Valuation ratios
-    try:
-        val = toolkit.ratios.collect_valuation_ratios()
-        if val is not None and not val.empty:
-            lines.append("\n[VALUATION RATIOS]")
-            _append_statement_rows(lines, val, ticker, max_rows=4)
-            fetched_blocks += 1
-    except Exception:
-        pass
-
-    if fetched_blocks == 0:
-        print(f"  [financial data] no usable FMP data for {ticker} (ticker may be unsupported or premium-gated)")
-        return ""
+    if limitations:
+        for lim in limitations:
+            _ln(lim)
+    else:
+        _ln("  None — all requested data sources returned successfully.")
 
     return "\n".join(lines)
 
@@ -4585,28 +5560,201 @@ def build_system_prompt(base: str, memory: "ConversationMemory") -> str:
     return base + f"\n\n{ctx}"
 
 
-def generate_answer(query: str, context: str, gen_client: Any, system_prompt: str) -> str:
+def _append_non_overlapping_text(base: str, extra: str, max_overlap: int = 240) -> str:
+    if not base:
+        return extra
+    if not extra:
+        return base
+
+    b = base.strip()
+    e = extra.strip()
+    overlap_cap = min(len(b), len(e), max_overlap)
+    for size in range(overlap_cap, 15, -1):
+        if b[-size:].lower() == e[:size].lower():
+            return (b + e[size:]).strip()
+    return (b + "\n" + e).strip()
+
+
+def _clamp_outlook_confidence(value: float) -> float:
+    return max(0.0, min(1.0, float(value)))
+
+
+def _infer_outlook_and_confidence(text: str) -> tuple[str, float]:
+    lower = (text or "").lower()
+
+    bullish_hits = sum(
+        lower.count(term)
+        for term in (
+            "bullish",
+            "uptrend",
+            "trading above",
+            "positive return",
+            "strong liquidity",
+            "improving margin",
+            "momentum",
+            "rally",
+        )
+    )
+    bearish_hits = sum(
+        lower.count(term)
+        for term in (
+            "bearish",
+            "downtrend",
+            "trading below",
+            "negative return",
+            "net loss",
+            "decline",
+            "weakness",
+            "deteriorat",
+        )
+    )
+
+    if bullish_hits > bearish_hits:
+        delta = bullish_hits - bearish_hits
+        return "Bullish", _clamp_outlook_confidence(0.60 + 0.05 * min(delta, 5))
+    if bearish_hits > bullish_hits:
+        delta = bearish_hits - bullish_hits
+        return "Bearish", _clamp_outlook_confidence(0.40 - 0.05 * min(delta, 5))
+    return "Neutral", 0.50
+
+
+def _enforce_single_ticker_outlook_sections(answer: str) -> str:
+    text = (answer or "").strip()
+    if not text:
+        return (
+            "Answer: Insufficient financial data [F] is available to answer this ticker query.\n"
+            "Outlook: Neutral.\n"
+            "Outlook Confidence (0-1): 0.50"
+        )
+
+    outlook_match = re.search(
+        r"(?im)^\s*Outlook:\s*(Bullish|Bearish|Neutral)\.?\s*$",
+        text,
+    )
+    confidence_match = re.search(
+        r"(?im)^\s*Outlook Confidence \(0-1\):\s*([01](?:\.\d+)?)\s*$",
+        text,
+    )
+
+    if outlook_match:
+        outlook = outlook_match.group(1).capitalize()
+    else:
+        outlook, _ = _infer_outlook_and_confidence(text)
+
+    if confidence_match:
+        confidence = _clamp_outlook_confidence(float(confidence_match.group(1)))
+    else:
+        _, confidence = _infer_outlook_and_confidence(text)
+
+    # Keep confidence directionally consistent with outlook label.
+    if outlook == "Bullish" and confidence < 0.50:
+        confidence = 0.60
+    elif outlook == "Bearish" and confidence > 0.50:
+        confidence = 0.40
+    elif outlook == "Neutral":
+        confidence = 0.50 if abs(confidence - 0.50) <= 0.15 else confidence
+
+    outlook_line = f"Outlook: {outlook}."
+    confidence_line = f"Outlook Confidence (0-1): {confidence:.2f}"
+
+    lines = text.splitlines()
+    has_outlook = any(re.match(r"(?i)^\s*Outlook:\s*", ln) for ln in lines)
+    has_conf = any(re.match(r"(?i)^\s*Outlook Confidence \(0-1\):\s*", ln) for ln in lines)
+
+    if has_outlook or has_conf:
+        normalized: list[str] = []
+        seen_outlook = False
+        seen_conf = False
+        for ln in lines:
+            if re.match(r"(?i)^\s*Outlook:\s*", ln):
+                if not seen_outlook:
+                    normalized.append(outlook_line)
+                    seen_outlook = True
+                continue
+            if re.match(r"(?i)^\s*Outlook Confidence \(0-1\):\s*", ln):
+                if not seen_conf:
+                    normalized.append(confidence_line)
+                    seen_conf = True
+                continue
+            normalized.append(ln)
+        if not seen_outlook:
+            normalized.append(outlook_line)
+        if not seen_conf:
+            normalized.append(confidence_line)
+        return "\n".join(normalized).strip()
+
+    theory_idx = None
+    for idx, ln in enumerate(lines):
+        if re.match(r"(?i)^\s*Theory:\s*", ln):
+            theory_idx = idx
+            break
+
+    if theory_idx is None:
+        lines.extend([outlook_line, confidence_line])
+    else:
+        lines[theory_idx:theory_idx] = [outlook_line, confidence_line]
+    return "\n".join(lines).strip()
+
+
+def generate_answer(
+    query: str,
+    context: str,
+    gen_client: Any,
+    system_prompt: str,
+    *,
+    max_tokens: int | None = None,
+) -> str:
+    budget = max(128, int(max_tokens or GEN_MAX_TOKENS))
+    messages = [
+        {
+            "role": "user",
+            "content": (
+                f"Question: {query}\n\n"
+                "Use the context below to answer.\n"
+                "Prefer directly relevant evidence over tangential mentions.\n"
+                "If evidence is weak or indirect, say so clearly.\n\n"
+                f"Context:\n{context}"
+            ),
+        }
+    ]
+
     out = gen_client.messages.create(
         model=GEN_MODEL_NAME,
-        max_tokens=GEN_MAX_TOKENS,
+        max_tokens=budget,
         temperature=0,
         system=system_prompt,
-        messages=[
-            {
-                "role": "user",
-                "content": (
-                    f"Question: {query}\n\n"
-                    "Use the context below to answer.\n"
-                    "Prefer directly relevant evidence over tangential mentions.\n"
-                    "If evidence is weak or indirect, say so clearly.\n\n"
-                    f"Context:\n{context}"
-                ),
-            }
-        ],
+        messages=messages,
     )
     raw = anthropic_text(out)
-    cleaned = strip_think_tags(raw).strip()
-    return cleaned or "I could not generate a grounded answer from the retrieved context."
+    assembled = strip_think_tags(raw).strip()
+
+    continuation_rounds = max(0, GEN_CONTINUATION_MAX_ROUNDS)
+    stop_reason = str(getattr(out, "stop_reason", "") or "").lower()
+    while continuation_rounds > 0 and stop_reason in {"max_tokens", "length"}:
+        continuation_rounds -= 1
+        continuation_prompt = (
+            "Continue the previous answer from exactly where it stopped.\n"
+            "Do not repeat any text already written.\n"
+            "Return only the continuation text.\n\n"
+            f"Question: {query}\n\n"
+            f"Context:\n{context}\n\n"
+            "Answer so far:\n"
+            f"{assembled}"
+        )
+        out = gen_client.messages.create(
+            model=GEN_MODEL_NAME,
+            max_tokens=budget,
+            temperature=0,
+            system=system_prompt,
+            messages=[{"role": "user", "content": continuation_prompt}],
+        )
+        continuation = strip_think_tags(anthropic_text(out)).strip()
+        if not continuation:
+            break
+        assembled = _append_non_overlapping_text(assembled, continuation)
+        stop_reason = str(getattr(out, "stop_reason", "") or "").lower()
+
+    return assembled or "I could not generate a grounded answer from the retrieved context."
 
 
 def run_query_once(
@@ -4832,6 +5980,7 @@ def run_query_once(
             ticker=primary_target.ticker,
             date_start=primary_date_start,
             date_end=primary_date_end,
+            include_technicals=True,
         )
         finance_context_present = bool((fin_ctx or "").strip())
         retrieval_traces.append(
@@ -5203,8 +6352,10 @@ def run_query_once(
         if causal_intent and not market_data_intent and not summary_mode
         else None
     )
+    # Keep single-ticker instructions isolated from chat memory to reduce
+    # section-label drift (e.g., reverting to Answer/Evidence/Theory format).
     single_ticker_financial_system_prompt = (
-        build_system_prompt(base_single_ticker_financial_prompt, memory)
+        base_single_ticker_financial_prompt
         if final_route == "single_ticker_financial"
         else None
     )
@@ -5226,7 +6377,31 @@ def run_query_once(
             active_prompt = single_ticker_financial_system_prompt
         else:
             active_prompt = causal_system_prompt if causal_system_prompt else system_prompt
-        final = generate_answer(query, merged_context, gen_client, active_prompt)
+        gen_max_tokens = (
+            SINGLE_TICKER_GEN_MAX_TOKENS
+            if final_route == "single_ticker_financial"
+            else GEN_MAX_TOKENS
+        )
+        final = generate_answer(
+            query,
+            merged_context,
+            gen_client,
+            active_prompt,
+            max_tokens=gen_max_tokens,
+        )
+        if final_route == "single_ticker_financial":
+            enforced_final = _enforce_single_ticker_outlook_sections(final)
+            if enforced_final != final:
+                logs.append(
+                    "  [single_ticker_outlook_enforcement] "
+                    f"applied ({SINGLE_TICKER_OUTLOOK_ENFORCEMENT_VERSION})"
+                )
+            else:
+                logs.append(
+                    "  [single_ticker_outlook_enforcement] "
+                    f"already_satisfied ({SINGLE_TICKER_OUTLOOK_ENFORCEMENT_VERSION})"
+                )
+            final = enforced_final
 
     if market_data_note:
         final = f"{final}\n\nNote: {market_data_note}"
