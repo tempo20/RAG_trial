@@ -1,27 +1,4 @@
-﻿"""
-chatter.py - Hybrid QA chatbot using lean Neo4j plus SQLite evidence.
-
-Neo4j stores structured macro objects only:
-  - Period
-  - Entity
-  - MacroEvent
-  - Asset
-  - Channel
-
-SQLite remains the source of truth for:
-  - articles
-  - chunks
-  - entity_mentions
-  - macro_events and related normalized tables
-
-Retrieval strategy:
-  1. Resolve entity / asset intent from the query
-  2. Use Neo4j for structured event reasoning
-  3. Use SQLite to materialize chunk/article evidence
-  4. Fall back to SQLite chunk embedding search for broad news QA
-"""
-
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import json
 import importlib
@@ -71,12 +48,10 @@ from convo_memory import (
     MEMORY_PATH,
 )
 
-# ---------------------------------------------------------------------------
 # Config
-# ---------------------------------------------------------------------------
 
 DEBUG_SKIP_GENERATION = os.getenv("DEBUG_SKIP_GENERATION", "0").strip() in {"1", "true", "yes"}
-SINGLE_TICKER_OUTLOOK_ENFORCEMENT_VERSION = "v1"
+SINGLE_TICKER_OUTLOOK_ENFORCEMENT_VERSION = "v2"
 GEN_MODEL_NAME = os.getenv("GEN_MODEL_NAME")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
 TICKER_MAP_PATH = Path(os.getenv("TICKER_MAP_PATH", "ticker_company_map.csv"))
@@ -125,7 +100,7 @@ SUMMARY_DOMAIN_TERMS = (
 SQLITE_SEMANTIC_CANDIDATE_LIMIT = int(os.getenv("SQLITE_SEMANTIC_CANDIDATE_LIMIT", "0"))
 MACRO_EVENT_CANDIDATE_LIMIT = int(os.getenv("MACRO_EVENT_CANDIDATE_LIMIT", "600"))
 GEN_MAX_TOKENS = int(os.getenv("GEN_MAX_TOKENS", "650"))
-SINGLE_TICKER_GEN_MAX_TOKENS = int(os.getenv("SINGLE_TICKER_GEN_MAX_TOKENS", "1000"))
+SINGLE_TICKER_GEN_MAX_TOKENS = int(os.getenv("SINGLE_TICKER_GEN_MAX_TOKENS", "400"))
 GEN_CONTINUATION_MAX_ROUNDS = int(os.getenv("GEN_CONTINUATION_MAX_ROUNDS", "1"))
 RERANKER_MODEL_NAME = os.getenv("RERANKER_MODEL_NAME", "cross-encoder/ms-marco-MiniLM-L-6-v2")
 ENABLE_CROSS_ENCODER_RERANK = os.getenv("ENABLE_CROSS_ENCODER_RERANK", "1").strip().lower() in {"1", "true", "yes", "on"}
@@ -448,11 +423,13 @@ def load_prompt_templates(path: Path) -> tuple[str, str, str, str]:
             "You are a grounded single-ticker financial analyst. "
             "Use only the FINANCIAL DATA [F] block provided in the context. "
             "Do not use outside knowledge or article/news evidence. "
-            "Structure your response with these exact section headers: Answer, Evidence, Outlook, Outlook Confidence (0-1), Theory. "
-            "Every factual sentence in Answer and Evidence must include [F]. "
+            "Return a concise outlook memo, not a full financial statement walkthrough. "
+            "Structure your response with these exact section headers: Answer, Outlook, Outlook Confidence (0-1), Confidence Rationale, Key Drivers, Risks / Gaps. "
+            "Every factual sentence in Answer, Confidence Rationale, Key Drivers, and Risks / Gaps must include [F]. "
             "Outlook must be exactly one of: Bullish, Bearish, or Neutral. "
-            "Outlook Confidence (0-1) must be a single number from 0.00 to 1.00, where 0.00 is fully bearish and 1.00 is fully bullish; use 0.50 for neutral/mixed. "
-            "Theory may contain cautious inference from [F] and must not contain citations. "
+            "Outlook Confidence (0-1) must be a single number from 0.00 to 1.00, where 0.00 is fully bearish, 0.50 is neutral/mixed, and 1.00 is fully bullish. "
+            "Confidence Rationale must explain why the specific number is above, below, or near 0.50 by weighing the most important bullish evidence against the most important bearish or uncertainty evidence from [F]. "
+            "Keep the full response around 150-250 words and avoid repeating the same metric in multiple sections. "
             "If FINANCIAL DATA [F] is missing or unusable, state that there is insufficient financial data [F] to answer. "
             "Your article database covers {date_min} to {date_max}."
         )
@@ -685,9 +662,7 @@ CAUSAL_ENTITY_TICKER_MAP = {
     "treasury-safe-haven":  "TLT",
 }
 
-# ---------------------------------------------------------------------------
 # Utilities
-# ---------------------------------------------------------------------------
 
 def cosine_sim(a: np.ndarray, b: np.ndarray) -> float:
     denom = np.linalg.norm(a) * np.linalg.norm(b)
@@ -2776,6 +2751,94 @@ def _safe_metric(df, field: str):
     return None, None
 
 
+def _safe_latest_ratio_metric(df, ticker: str, *field_names: str):
+    """
+    Return (value, period_label) for the latest non-null ratio value.
+
+    FinanceToolkit ratio methods can return either ticker-indexed frames
+    (ticker x period) or metric-indexed frames (metric x period), depending on
+    method/version. This helper accepts both shapes.
+    """
+    import pandas as pd
+
+    if df is None:
+        return None, None
+    try:
+        if df.empty:
+            return None, None
+    except Exception:
+        return None, None
+
+    def _latest_from_series(series):
+        try:
+            if isinstance(series, pd.DataFrame) and hasattr(series, "squeeze"):
+                series = series.squeeze()
+            if hasattr(series, "items"):
+                for period, value in reversed(list(series.items())):
+                    try:
+                        if pd.notna(value):
+                            return float(value), str(period)[:10]
+                    except Exception:
+                        continue
+        except Exception:
+            return None, None
+        return None, None
+
+    try:
+        if isinstance(df, pd.Series):
+            return _latest_from_series(df)
+    except Exception:
+        pass
+
+    candidates = []
+
+    # FinanceToolkit often returns ratio frames indexed by ticker.
+    try:
+        if ticker in df.index:
+            candidates.append(df.loc[ticker])
+    except Exception:
+        pass
+
+    # Some collected ratio outputs are metric-indexed.
+    for field in field_names:
+        try:
+            if field in df.index:
+                candidates.append(df.loc[field])
+        except Exception:
+            pass
+
+    # Period-indexed frame with ticker as a column.
+    try:
+        if ticker in df.columns:
+            candidates.append(df[ticker])
+    except Exception:
+        pass
+
+    # MultiIndex column safety: isolate the ticker from any column level.
+    try:
+        if hasattr(df.columns, "levels"):
+            for level in range(df.columns.nlevels):
+                if ticker in set(df.columns.get_level_values(level)):
+                    candidates.append(df.xs(ticker, axis=1, level=level).squeeze())
+    except Exception:
+        pass
+
+    # Single-row ratio frames should still be usable even if the row label
+    # differs between FinanceToolkit versions.
+    try:
+        if len(df.index) == 1:
+            candidates.append(df.iloc[0])
+    except Exception:
+        pass
+
+    for candidate in candidates:
+        value, period = _latest_from_series(candidate)
+        if value is not None:
+            return value, period
+
+    return None, None
+
+
 def _fmt_val(val, *, pct: bool = False, scale: str = "auto", decimals: int = 2) -> str:
     """
     Format a numeric metric value for display in the [F] block.
@@ -2814,7 +2877,7 @@ def _fmt_val(val, *, pct: bool = False, scale: str = "auto", decimals: int = 2) 
 
 
 def _compute_derived_metrics(
-    income, balance, cashflow, profile, ticker: str
+    income, balance, cashflow, profile, ticker: str, debt_to_equity_ratio=None
 ) -> dict:
     """
     Compute all derived analytical metrics from normalized statement DataFrames.
@@ -2841,6 +2904,9 @@ def _compute_derived_metrics(
     cash,       _     = _safe_metric(balance,  "Cash and Cash Equivalents")
     tot_debt,   _     = _safe_metric(balance,  "Total Debt")
     lt_debt,    _     = _safe_metric(balance,  "Long Term Debt")
+    ratio_de, ratio_de_p = (
+        debt_to_equity_ratio if debt_to_equity_ratio is not None else (None, None)
+    )
 
     ocf,   _          = _safe_metric(cashflow, "Operating Cash Flow")
     capex, _          = _safe_metric(cashflow, "Capital Expenditure")
@@ -2948,8 +3014,10 @@ def _compute_derived_metrics(
     debt = tot_debt if tot_debt is not None else lt_debt
     if debt is not None and tot_equity and tot_equity != 0:
         m["debt_to_equity"] = (debt / tot_equity, rev_p, None)
+    elif ratio_de is not None:
+        m["debt_to_equity"] = (ratio_de, ratio_de_p, None)
     else:
-        m["debt_to_equity"] = (None, None, "missing Debt or Equity")
+        m["debt_to_equity"] = (None, None, "missing Debt or Equity and ratio unavailable")
 
     if cash is not None and debt is not None:
         m["net_cash_position"] = (cash - debt, rev_p, None)
@@ -3040,8 +3108,23 @@ def _compute_price_trend(hist_df) -> dict:
     if close.empty:
         return _unavail("all Close prices are null")
 
+    def _index_to_datetime(index) -> "pd.DatetimeIndex":
+        if isinstance(index, pd.PeriodIndex):
+            dt_index = index.to_timestamp()
+        else:
+            dt_index = pd.to_datetime(index)
+        return pd.DatetimeIndex(dt_index).tz_localize(None)
+
+    def _date_label(value) -> str:
+        if isinstance(value, pd.Period):
+            return str(value)[:10]
+        try:
+            return str(pd.to_datetime(value).date())
+        except Exception:
+            return str(value)[:10]
+
     latest_close = float(close.iloc[-1])
-    latest_date  = str(close.index[-1])[:10]
+    latest_date  = _date_label(close.index[-1])
     m: dict = {}
     m["latest_close"] = (latest_close, latest_date, None)
     m["latest_date"]  = (latest_date,  latest_date, None)
@@ -3060,8 +3143,9 @@ def _compute_price_trend(hist_df) -> dict:
 
     # YTD
     try:
-        yr = pd.to_datetime(close.index[-1]).year
-        ytd_slice = close[pd.to_datetime(close.index) >= pd.Timestamp(f"{yr}-01-01")]
+        close_dates = _index_to_datetime(close.index)
+        yr = close_dates[-1].year
+        ytd_slice = close[close_dates >= pd.Timestamp(f"{yr}-01-01")]
         if len(ytd_slice) >= 2:
             m["return_ytd"] = (
                 (float(ytd_slice.iloc[-1]) / float(ytd_slice.iloc[0]) - 1) * 100,
@@ -3387,7 +3471,8 @@ def fetch_financial_context(
     from datetime import datetime, timezone, timedelta
     now      = datetime.now(timezone.utc)
     end_dt   = date_end   or now.strftime("%Y-%m-%d")
-    start_dt = date_start or (now - timedelta(days=lookback_days)).strftime("%Y-%m-%d")
+    price_lookback_days = max(int(lookback_days or 365), 400)
+    start_dt = date_start or (now - timedelta(days=price_lookback_days)).strftime("%Y-%m-%d")
     statement_lookback_days = max(int(lookback_days or 365), 365 * 4)
     default_statement_start_dt = (now - timedelta(days=statement_lookback_days)).strftime("%Y-%m-%d")
     statement_start_dt = (
@@ -3493,6 +3578,17 @@ def fetch_financial_context(
     except Exception as e:
         fetch_status["cashflow"] = f"error: {e}"
 
+    debt_to_equity_ratio_raw = None
+    try:
+        debt_to_equity_ratio_raw = statement_toolkit.ratios.get_debt_to_equity_ratio(rounding=6)
+        fetch_status["debt_to_equity_ratio"] = (
+            "ok"
+            if debt_to_equity_ratio_raw is not None and not debt_to_equity_ratio_raw.empty
+            else "empty"
+        )
+    except Exception as e:
+        fetch_status["debt_to_equity_ratio"] = f"error: {e}"
+
     quarterly_income_raw = None
     quarterly_balance_raw = None
     quarterly_cashflow_raw = None
@@ -3555,6 +3651,14 @@ def fetch_financial_context(
     quarterly_income = _normalize_fin_df(quarterly_income_raw, ticker)
     quarterly_balance = _normalize_fin_df(quarterly_balance_raw, ticker)
     quarterly_cashflow = _normalize_fin_df(quarterly_cashflow_raw, ticker)
+    debt_to_equity_ratio = _safe_latest_ratio_metric(
+        debt_to_equity_ratio_raw,
+        ticker,
+        "Debt-to-Equity Ratio",
+        "Debt to Equity Ratio",
+        "Debt-to-Equity",
+        "Debt to Equity",
+    )
 
     # Detect period type for financial statements
     period_type = "annual"
@@ -3573,7 +3677,14 @@ def fetch_financial_context(
     # ------------------------------------------------------------------ #
     # 3. Compute analytical layers                                        #
     # ------------------------------------------------------------------ #
-    derived   = _compute_derived_metrics(income, balance, cashflow, profile, ticker)
+    derived   = _compute_derived_metrics(
+        income,
+        balance,
+        cashflow,
+        profile,
+        ticker,
+        debt_to_equity_ratio=debt_to_equity_ratio,
+    )
     quarterly_derived = _compute_derived_metrics(
         quarterly_income,
         quarterly_balance,
@@ -5767,7 +5878,10 @@ def _enforce_single_ticker_outlook_sections(answer: str) -> str:
         return (
             "Answer: Insufficient financial data [F] is available to answer this ticker query.\n"
             "Outlook: Neutral.\n"
-            "Outlook Confidence (0-1): 0.50"
+            "Outlook Confidence (0-1): 0.50\n"
+            "Confidence Rationale: The confidence is 0.50 because there is no usable FINANCIAL DATA [F] block to support a bullish or bearish tilt.\n"
+            "Key Drivers: Not assessable because the FINANCIAL DATA [F] block is missing or unusable.\n"
+            "Risks / Gaps: The FINANCIAL DATA [F] block is missing or unusable."
         )
 
     outlook_match = re.search(
@@ -5838,6 +5952,75 @@ def _enforce_single_ticker_outlook_sections(answer: str) -> str:
         lines[theory_idx:theory_idx] = [outlook_line, confidence_line]
     return "\n".join(lines).strip()
 
+def _remove_orphan_single_ticker_value_lines(text: str) -> str:
+    lines = text.splitlines()
+    cleaned: list[str] = []
+
+    previous_label: str | None = None
+
+    for raw_line in lines:
+        line = raw_line.strip()
+
+        # Drop standalone duplicate outlook values.
+        if line in {"Bullish", "Bearish", "Neutral"}:
+            if previous_label == "Outlook":
+                continue
+
+        # Drop standalone duplicate confidence values.
+        if re.fullmatch(r"[01](?:\.\d{1,2})?", line):
+            if previous_label == "Confidence":
+                continue
+
+        cleaned.append(raw_line)
+
+        if re.match(r"(?i)^\s*Outlook:\s*(Bullish|Bearish|Neutral)\.?\s*$", line):
+            previous_label = "Outlook"
+        elif re.match(r"(?i)^\s*Outlook Confidence \(0-1\):\s*[01](?:\.\d+)?\s*$", line):
+            previous_label = "Confidence"
+        elif line:
+            previous_label = None
+
+    return "\n".join(cleaned).strip()
+
+SINGLE_TICKER_REQUIRED_SECTIONS = [
+    "Answer:",
+    "Outlook:",
+    "Outlook Confidence (0-1):",
+    "Confidence Rationale:",
+    "Key Drivers:",
+    "Risks / Gaps:",
+]
+
+def _validate_single_ticker_output(text: str) -> list[str]:
+    errors: list[str] = []
+
+    for section in SINGLE_TICKER_REQUIRED_SECTIONS:
+        count = len(re.findall(rf"(?im)^\s*{re.escape(section)}", text))
+        if count != 1:
+            errors.append(f"{section} appears {count} times")
+
+    if re.search(r"(?im)^\\s*(Bullish|Bearish|Neutral)\\s*$", text):
+        errors.append("Standalone outlook value line found")
+
+    if re.search(r"(?im)^\\s*[01](?:\\.\\d{1,2})?\\s*$", text):
+        errors.append("Standalone confidence value line found")
+
+    key_drivers_match = re.search(
+        r"(?is)Key Drivers:\\s*(.*?)(?:\\n\\s*Risks / Gaps:|\\Z)",
+        text,
+    )
+    if key_drivers_match:
+        key_driver_bullets = re.findall(r"(?m)^\\s*[-•]\\s+", key_drivers_match.group(1))
+        if len(key_driver_bullets) != 3:
+            errors.append(f"Expected 3 Key Drivers bullets, got {len(key_driver_bullets)}")
+
+    risks_match = re.search(r"(?is)Risks / Gaps:\\s*(.*)\\Z", text)
+    if risks_match:
+        risk_bullets = re.findall(r"(?m)^\\s*[-•]\\s+", risks_match.group(1))
+        if len(risk_bullets) != 2:
+            errors.append(f"Expected 2 Risks / Gaps bullets, got {len(risk_bullets)}")
+
+    return errors
 
 def generate_answer(
     query: str,
@@ -6113,8 +6296,11 @@ def run_query_once(
             return _empty_result(
                 (
                     "Answer: Insufficient financial data [F] is available to answer this ticker query.\n"
-                    "Evidence: The FINANCIAL DATA [F] block is missing or unusable.\n"
-                    "Theory: None."
+                    "Outlook: Neutral.\n"
+                    "Outlook Confidence (0-1): 0.50\n"
+                    "Confidence Rationale: The confidence is 0.50 because there is no usable FINANCIAL DATA [F] block to support a bullish or bearish tilt.\n"
+                    "Key Drivers: Not assessable because the FINANCIAL DATA [F] block is missing or unusable.\n"
+                    "Risks / Gaps: The FINANCIAL DATA [F] block is missing or unusable."
                 ),
                 "single_ticker_financial",
             )
@@ -6143,8 +6329,11 @@ def run_query_once(
             return _empty_result(
                 (
                     "Answer: Insufficient financial data [F] is available to answer this ticker query.\n"
-                    "Evidence: The FINANCIAL DATA [F] block is missing or unusable.\n"
-                    "Theory: None."
+                    "Outlook: Neutral.\n"
+                    "Outlook Confidence (0-1): 0.50\n"
+                    "Confidence Rationale: The confidence is 0.50 because there is no usable FINANCIAL DATA [F] block to support a bullish or bearish tilt.\n"
+                    "Key Drivers: Not assessable because the FINANCIAL DATA [F] block is missing or unusable.\n"
+                    "Risks / Gaps: The FINANCIAL DATA [F] block is missing or unusable."
                 ),
                 "single_ticker_financial",
             )
@@ -6554,7 +6743,7 @@ def run_query_once(
             max_tokens=gen_max_tokens,
         )
         if final_route == "single_ticker_financial":
-            enforced_final = _enforce_single_ticker_outlook_sections(final)
+            enforced_final = _remove_orphan_single_ticker_value_lines(_enforce_single_ticker_outlook_sections(final))
             if enforced_final != final:
                 logs.append(
                     "  [single_ticker_outlook_enforcement] "
@@ -6565,6 +6754,15 @@ def run_query_once(
                     "  [single_ticker_outlook_enforcement] "
                     f"already_satisfied ({SINGLE_TICKER_OUTLOOK_ENFORCEMENT_VERSION})"
                 )
+            validation_errors = _validate_single_ticker_output(enforced_final)
+            if validation_errors:
+                logs.append(
+                    "  [single_ticker_validation] failed: "
+                    + "; ".join(validation_errors)
+                )
+            else:
+                logs.append("  [single_ticker_validation] passed")
+
             final = enforced_final
 
     if market_data_note:
