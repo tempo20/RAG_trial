@@ -73,6 +73,9 @@ SUMMARY_MIN_UNIQUE_SOURCES = int(os.getenv("SUMMARY_MIN_UNIQUE_SOURCES", "3"))
 SUMMARY_CANDIDATE_LIMIT = int(os.getenv("SUMMARY_CANDIDATE_LIMIT", "300"))
 SUMMARY_STREAM_BRIEF_MAX_SHARE = float(os.getenv("SUMMARY_STREAM_BRIEF_MAX_SHARE", "0.55"))
 SUMMARY_MIN_FULL_CONTEXT_CHUNKS = int(os.getenv("SUMMARY_MIN_FULL_CONTEXT_CHUNKS", "2"))
+SINGLE_TICKER_NEWS_MAX_ITEMS = int(os.getenv("SINGLE_TICKER_NEWS_MAX_ITEMS", "5"))
+SINGLE_TICKER_NEWS_TIMEOUT_SECONDS = float(os.getenv("SINGLE_TICKER_NEWS_TIMEOUT_SECONDS", "10"))
+GDELT_DOC_SEARCH_URL = "https://api.gdeltproject.org/api/v2/doc/doc"
 SUMMARY_TERMS = (
     "summary",
     "summarise",
@@ -421,11 +424,11 @@ def load_prompt_templates(path: Path) -> tuple[str, str, str, str]:
     if single_ticker_financial_raw is None:
         single_ticker_financial_prompt = (
             "You are a grounded single-ticker financial analyst. "
-            "Use only the FINANCIAL DATA [F] block provided in the context. "
-            "Do not use outside knowledge or article/news evidence. "
+            "Use only the FINANCIAL DATA [F] block and, when present, the NEWS DATA [N] block provided in the context. "
+            "Do not use outside knowledge or [Sx] citations. "
             "Return a concise outlook memo, not a full financial statement walkthrough. "
             "Structure your response with these exact section headers: Answer, Outlook, Outlook Confidence (0-1), Confidence Rationale, Key Drivers, Risks / Gaps. "
-            "Every factual sentence in Answer, Confidence Rationale, Key Drivers, and Risks / Gaps must include [F]. "
+            "Every factual sentence in Answer, Confidence Rationale, Key Drivers, and Risks / Gaps must include [F] or [N1]/[N2]/... where appropriate. "
             "Outlook must be exactly one of: Bullish, Bearish, or Neutral. "
             "Outlook Confidence (0-1) must be a single number from 0.00 to 1.00, where 0.00 is fully bearish, 0.50 is neutral/mixed, and 1.00 is fully bullish. "
             "Confidence Rationale must explain why the specific number is above, below, or near 0.50 by weighing the most important bullish evidence against the most important bearish or uncertainty evidence from [F]. "
@@ -5738,10 +5741,102 @@ def build_context(
     return "\n".join(lines)
 
 
+def _extract_company_name_from_financial_context(financial_context: str) -> str:
+    match = re.search(
+        r"(?im)^\s*Company Name:\s*(.+?)\s*$",
+        financial_context or "",
+    )
+    if not match:
+        return ""
+    return re.sub(r"\s+", " ", match.group(1).strip())
+
+
+def fetch_single_ticker_news_context(
+    company_name: str,
+    *,
+    max_items: int = SINGLE_TICKER_NEWS_MAX_ITEMS,
+    timeout_seconds: float = SINGLE_TICKER_NEWS_TIMEOUT_SECONDS,
+) -> tuple[str, str, int]:
+    query = re.sub(r"\s+", " ", (company_name or "").strip())
+    if not query:
+        return "", "", 0
+
+    try:
+        import requests
+    except Exception as exc:
+        print(f"  [news data] dependencies unavailable: {exc}")
+        return "", query, 0
+
+    limit = min(max(1, int(max_items)), 50)
+    escaped_query = query.replace('"', " ").strip()
+    gdelt_query = f"\"{escaped_query}\" sourcelang:english"
+    params = {
+        "query": gdelt_query,
+        "mode": "artlist",
+        "format": "json",
+        "sort": "datedesc",
+        "timespan": "1month",
+        "maxrecords": limit,
+    }
+    try:
+        response = requests.get(
+            GDELT_DOC_SEARCH_URL,
+            params=params,
+            timeout=max(1.0, float(timeout_seconds)),
+        )
+        response.raise_for_status()
+        payload = response.json()
+    except Exception as exc:
+        print(f"  [news data] GDELT fetch failed for '{query}': {exc}")
+        return "", query, 0
+
+    if not isinstance(payload, dict):
+        print(f"  [news data] malformed GDELT response for '{query}'")
+        return "", query, 0
+
+    articles = payload.get("articles")
+    if not isinstance(articles, list):
+        print(f"  [news data] malformed GDELT articles for '{query}'")
+        return "", query, 0
+
+    selected = [article for article in articles if isinstance(article, dict)][:limit]
+    if not selected:
+        print(f"  [news data] empty GDELT results for '{query}'")
+        return "", query, 0
+
+    request_url = str(getattr(response, "url", GDELT_DOC_SEARCH_URL) or GDELT_DOC_SEARCH_URL)
+    lines: list[str] = []
+    lines.append("NEWS DATA [N]")
+    lines.append("Cite facts from this block as [N1], [N2], etc. Do not cite as [Sx], [M], or [F].")
+    lines.append(f"Source: GDELT DOC 2.0 | Query: {query} | URL: {request_url}")
+    lines.append("")
+
+    for idx, article in enumerate(selected, start=1):
+        publisher = re.sub(r"\s+", " ", str(article.get("domain") or "").strip())
+        title = re.sub(r"\s+", " ", str(article.get("title") or "untitled").strip())
+        published = re.sub(
+            r"\s+",
+            " ",
+            str(article.get("seendate") or "unknown").strip(),
+        )
+        link = str(article.get("url") or "").strip()
+
+        lines.append(f"[N{idx}] Title: {title}")
+        if publisher:
+            lines.append(f"  Publisher: {publisher}")
+        lines.append(f"  Published: {published}")
+        if link:
+            lines.append(f"  Link: {link}")
+        lines.append("")
+
+    return "\n".join(lines).strip(), query, len(selected)
+
+
 def build_financial_only_context(
     query: str,
     target: QueryTarget,
     financial_context: str,
+    news_context: str = "",
 ) -> str:
     lines = []
     lines.append(f"QUERY: {query}")
@@ -5751,10 +5846,66 @@ def build_financial_only_context(
     lines.append(f"ENTITY TYPE   : {target.entity_type or 'unknown'}")
     lines.append(f"CONFIDENCE    : {target.confidence:.2f}")
     lines.append("")
-    lines.append("Use only the FINANCIAL DATA [F] block below.")
+    if (news_context or "").strip():
+        lines.append("Use only the FINANCIAL DATA [F] and NEWS DATA [N] blocks below.")
+    else:
+        lines.append("Use only the FINANCIAL DATA [F] block below.")
     lines.append("")
     lines.append(financial_context.strip())
+    if (news_context or "").strip():
+        lines.append("")
+        lines.append(news_context.strip())
     return "\n".join(lines)
+
+
+def _dump_query_contexts(
+    *,
+    base_dir: str,
+    query: str,
+    final_route: str,
+    timestamp: str,
+    merged_context: str,
+    financial_context: str,
+    news_context: str,
+    news_query: str,
+    news_item_count: int,
+) -> tuple[str, str, str]:
+    full_dump_path = os.path.join(base_dir, "query_context.txt")
+    fin_dump_path = os.path.join(base_dir, "query_fin_context.txt")
+    news_dump_path = os.path.join(base_dir, "query_news_context.txt")
+
+    with open(full_dump_path, "w", encoding="utf-8") as f:
+        f.write(f"QUERY      : {query}\n")
+        f.write(f"ROUTE      : {final_route}\n")
+        f.write(f"TIMESTAMP  : {timestamp}\n")
+        f.write("=" * 80 + "\n\n")
+        f.write(merged_context)
+
+    with open(fin_dump_path, "w", encoding="utf-8") as f:
+        f.write(f"QUERY      : {query}\n")
+        f.write(f"ROUTE      : {final_route}\n")
+        f.write(f"TIMESTAMP  : {timestamp}\n")
+        f.write(f"FIN_CTX    : {'present' if (financial_context or '').strip() else 'absent'}\n")
+        f.write("=" * 80 + "\n\n")
+        if (financial_context or "").strip():
+            f.write(financial_context.strip())
+        else:
+            f.write("No FINANCIAL DATA [F] block captured for this query.")
+
+    with open(news_dump_path, "w", encoding="utf-8") as f:
+        f.write(f"QUERY      : {query}\n")
+        f.write(f"ROUTE      : {final_route}\n")
+        f.write(f"TIMESTAMP  : {timestamp}\n")
+        f.write(f"NEWS_CTX   : {'present' if (news_context or '').strip() else 'absent'}\n")
+        f.write(f"NEWS_QUERY : {news_query or 'N/A'}\n")
+        f.write(f"NEWS_ITEMS : {int(news_item_count or 0)}\n")
+        f.write("=" * 80 + "\n\n")
+        if (news_context or "").strip():
+            f.write(news_context.strip())
+        else:
+            f.write("No NEWS DATA [N] block captured for this query.")
+
+    return full_dump_path, fin_dump_path, news_dump_path
 
 
 def build_signal_context(
@@ -6144,6 +6295,9 @@ def run_query_once(
     summary_used_date_ranges: list[tuple[str | None, str | None]] = []
     market_ctx = ""
     fin_ctx = ""
+    news_ctx = ""
+    news_query = ""
+    news_item_count = 0
     logs: list[str] = []
     primary_target: QueryTarget | None = None
     primary_date_start: str | None = None
@@ -6236,6 +6390,11 @@ def run_query_once(
                 "finance_context_present": any(
                     bool(trace.get("finance_context_present")) for trace in retrieval_traces
                 ),
+                "news_context_present": any(
+                    bool(trace.get("news_context_present")) for trace in retrieval_traces
+                ),
+                "news_query": news_query if route_type == "single_ticker_financial" else "",
+                "news_item_count": int(news_item_count if route_type == "single_ticker_financial" else 0),
                 "sub_trace_count": len(retrieval_traces),
                 "sub_traces": retrieval_traces,
             },
@@ -6291,6 +6450,9 @@ def run_query_once(
                     "ranked_count": 0,
                     "ranked_candidates": [],
                     "finance_context_present": False,
+                    "news_context_present": False,
+                    "news_query": "",
+                    "news_item_count": 0,
                 }
             )
             return _empty_result(
@@ -6312,19 +6474,22 @@ def run_query_once(
             include_technicals=True,
         )
         finance_context_present = bool((fin_ctx or "").strip())
-        retrieval_traces.append(
-            {
-                "sub_query": query,
-                "date_start": primary_date_start,
-                "date_end": primary_date_end,
-                "route_type": "single_ticker_financial",
-                "candidate_count": 0,
-                "ranked_count": 0,
-                "ranked_candidates": [],
-                "finance_context_present": finance_context_present,
-            }
-        )
         if not finance_context_present:
+            retrieval_traces.append(
+                {
+                    "sub_query": query,
+                    "date_start": primary_date_start,
+                    "date_end": primary_date_end,
+                    "route_type": "single_ticker_financial",
+                    "candidate_count": 0,
+                    "ranked_count": 0,
+                    "ranked_candidates": [],
+                    "finance_context_present": False,
+                    "news_context_present": False,
+                    "news_query": "",
+                    "news_item_count": 0,
+                }
+            )
             logs.append(f"  [financial data] no usable [F] block for {primary_target.ticker}")
             return _empty_result(
                 (
@@ -6337,8 +6502,44 @@ def run_query_once(
                 ),
                 "single_ticker_financial",
             )
+
+        company_name = (
+            _extract_company_name_from_financial_context(fin_ctx)
+            or (primary_target.display_name or "")
+            or (primary_target.ticker or "")
+        )
+        news_ctx, news_query, news_item_count = fetch_single_ticker_news_context(company_name)
+        news_context_present = bool((news_ctx or "").strip())
+        retrieval_traces.append(
+            {
+                "sub_query": query,
+                "date_start": primary_date_start,
+                "date_end": primary_date_end,
+                "route_type": "single_ticker_financial",
+                "candidate_count": 0,
+                "ranked_count": 0,
+                "ranked_candidates": [],
+                "finance_context_present": True,
+                "news_context_present": news_context_present,
+                "news_query": news_query,
+                "news_item_count": int(news_item_count),
+            }
+        )
         logs.append(f"  [financial data] fetched [F] block for {primary_target.ticker}")
-        all_contexts.append(build_financial_only_context(query, primary_target, fin_ctx))
+        if news_context_present:
+            logs.append(
+                f"  [news data] fetched [N] block for '{news_query}' ({news_item_count} items)"
+            )
+        else:
+            logs.append(f"  [news data] no usable [N] block for '{news_query or company_name}'")
+        all_contexts.append(
+            build_financial_only_context(
+                query,
+                primary_target,
+                fin_ctx,
+                news_context=news_ctx,
+            )
+        )
         sub_queries = []
 
     for sq in sub_queries:
@@ -6694,23 +6895,24 @@ def run_query_once(
     )
     merged_context = "\n\n---\n\n".join(all_contexts)
 
-    # Dump the full context fed to the model on every query so it can be inspected.
+    # Dump the full model context plus source-specific context files for inspection.
     try:
         import datetime as _dt
         _ts = _dt.datetime.now().strftime("%Y%m%d_%H%M%S")
-        _safe_q = re.sub(r"[^\w\s-]", "", query)[:60].strip().replace(" ", "_")
-        _dump_path = os.path.join(
-            os.path.dirname(os.path.abspath(__file__)),
-            f"query_fin_context.txt",
+        _full_dump_path, _fin_dump_path, _news_dump_path = _dump_query_contexts(
+            base_dir=os.path.dirname(os.path.abspath(__file__)),
+            query=query,
+            final_route=final_route,
+            timestamp=_ts,
+            merged_context=merged_context,
+            financial_context=fin_ctx,
+            news_context=news_ctx,
+            news_query=news_query,
+            news_item_count=news_item_count,
         )
-        with open(_dump_path, "w", encoding="utf-8") as _f:
-            _f.write(f"QUERY      : {query}\n")
-            _f.write(f"ROUTE      : {final_route}\n")
-            _f.write(f"TIMESTAMP  : {_ts}\n")
-            _f.write(f"FIN_CTX    : {'present' if (fin_ctx or '').strip() else 'absent'}\n")
-            _f.write("=" * 80 + "\n\n")
-            _f.write(merged_context)
-        print(f"  [context dump] {_dump_path}")
+        print(f"  [context dump] {_full_dump_path}")
+        print(f"  [context dump] {_fin_dump_path}")
+        print(f"  [context dump] {_news_dump_path}")
     except Exception as _dump_exc:
         print(f"  [context dump] failed: {_dump_exc}")
 
@@ -6850,6 +7052,9 @@ def run_query_once(
                 "date_end": trace.get("date_end"),
                 "signal_ids": trace.get("signal_ids"),
                 "finance_context_present": bool(trace.get("finance_context_present")),
+                "news_context_present": bool(trace.get("news_context_present")),
+                "news_query": trace.get("news_query") or "",
+                "news_item_count": int(trace.get("news_item_count") or 0),
                 "top_candidates": [_compact_candidate(candidate) for candidate in ranked_candidates[:10]],
             }
         )
@@ -6859,6 +7064,9 @@ def run_query_once(
         "scoring_weights": _resolve_scoring_weights(final_route),
         "selected_chunk_count": len(all_chunks),
         "finance_context_present": bool((fin_ctx or "").strip()) if final_route == "single_ticker_financial" else False,
+        "news_context_present": bool((news_ctx or "").strip()) if final_route == "single_ticker_financial" else False,
+        "news_query": news_query if final_route == "single_ticker_financial" else "",
+        "news_item_count": int(news_item_count if final_route == "single_ticker_financial" else 0),
         "sub_trace_count": len(sub_trace_payloads),
         "sub_traces": sub_trace_payloads,
     }
