@@ -328,6 +328,59 @@ SCHEMA_SQL = """
         FOREIGN KEY(macro_event_id) REFERENCES macro_events(macro_event_id)
     );
 
+    CREATE TABLE IF NOT EXISTS single_ticker_financial_metrics (
+        id TEXT PRIMARY KEY,
+        ticker TEXT NOT NULL,
+        as_of_date TEXT NOT NULL,
+        source_provider TEXT,
+        metrics_json TEXT NOT NULL,
+        score_json TEXT,
+        data_quality_json TEXT,
+        created_at TEXT NOT NULL,
+        UNIQUE(ticker, as_of_date, source_provider)
+    );
+
+    CREATE TABLE IF NOT EXISTS single_ticker_technical_indicators (
+        id TEXT PRIMARY KEY,
+        ticker TEXT NOT NULL,
+        as_of_date TEXT NOT NULL,
+        lookback_days INTEGER,
+        indicators_json TEXT NOT NULL,
+        score_json TEXT,
+        data_quality_json TEXT,
+        created_at TEXT NOT NULL,
+        UNIQUE(ticker, as_of_date, lookback_days)
+    );
+
+    CREATE TABLE IF NOT EXISTS strategy_backtest_runs (
+        backtest_id TEXT PRIMARY KEY,
+        strategy_name TEXT NOT NULL,
+        ticker TEXT NOT NULL,
+        start_date TEXT,
+        end_date TEXT,
+        params_json TEXT,
+        metrics_json TEXT NOT NULL,
+        trades_json TEXT,
+        data_quality_json TEXT,
+        created_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS strategy_signals (
+        signal_id TEXT PRIMARY KEY,
+        ticker TEXT NOT NULL,
+        strategy_name TEXT NOT NULL,
+        signal_date TEXT NOT NULL,
+        signal_direction TEXT NOT NULL,
+        signal_strength REAL,
+        confidence REAL,
+        horizon TEXT,
+        metrics_json TEXT,
+        rationale_json TEXT,
+        backtest_id TEXT,
+        created_at TEXT NOT NULL,
+        FOREIGN KEY(backtest_id) REFERENCES strategy_backtest_runs(backtest_id)
+    );
+
     CREATE TABLE IF NOT EXISTS source_quality (
         source_name TEXT PRIMARY KEY,
         source_provider TEXT,
@@ -466,6 +519,18 @@ INDEX_SQL = """
     CREATE INDEX IF NOT EXISTS idx_market_reactions_signal_id ON market_reactions(signal_id);
     CREATE INDEX IF NOT EXISTS idx_market_reactions_target ON market_reactions(target_type, target_id);
     CREATE INDEX IF NOT EXISTS idx_market_reactions_event_time ON market_reactions(event_time);
+
+    CREATE INDEX IF NOT EXISTS idx_single_ticker_financial_ticker_date
+    ON single_ticker_financial_metrics(ticker, as_of_date);
+
+    CREATE INDEX IF NOT EXISTS idx_single_ticker_technical_ticker_date
+    ON single_ticker_technical_indicators(ticker, as_of_date);
+
+    CREATE INDEX IF NOT EXISTS idx_strategy_backtests_ticker_strategy
+    ON strategy_backtest_runs(ticker, strategy_name);
+
+    CREATE INDEX IF NOT EXISTS idx_strategy_signals_ticker_date
+    ON strategy_signals(ticker, signal_date);
 
     CREATE INDEX IF NOT EXISTS idx_source_quality_provider ON source_quality(source_provider);
     CREATE INDEX IF NOT EXISTS idx_source_quality_score ON source_quality(quality_score DESC);

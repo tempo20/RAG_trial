@@ -75,6 +75,9 @@ SUMMARY_STREAM_BRIEF_MAX_SHARE = float(os.getenv("SUMMARY_STREAM_BRIEF_MAX_SHARE
 SUMMARY_MIN_FULL_CONTEXT_CHUNKS = int(os.getenv("SUMMARY_MIN_FULL_CONTEXT_CHUNKS", "2"))
 SINGLE_TICKER_NEWS_MAX_ITEMS = int(os.getenv("SINGLE_TICKER_NEWS_MAX_ITEMS", "5"))
 SINGLE_TICKER_NEWS_TIMEOUT_SECONDS = float(os.getenv("SINGLE_TICKER_NEWS_TIMEOUT_SECONDS", "10"))
+ENABLE_SINGLE_TICKER_ANALYSIS = os.getenv("ENABLE_SINGLE_TICKER_ANALYSIS", "0").strip().lower() in {"1", "true", "yes", "on"}
+ENABLE_SINGLE_TICKER_BACKTESTS = os.getenv("ENABLE_SINGLE_TICKER_BACKTESTS", "0").strip().lower() in {"1", "true", "yes", "on"}
+SINGLE_TICKER_LOOKBACK_DAYS = int(os.getenv("SINGLE_TICKER_LOOKBACK_DAYS", "252"))
 GDELT_DOC_SEARCH_URL = "https://api.gdeltproject.org/api/v2/doc/doc"
 SUMMARY_TERMS = (
     "summary",
@@ -5858,6 +5861,85 @@ def build_financial_only_context(
     return "\n".join(lines)
 
 
+def _build_single_ticker_analysis_context(ticker: str, query: str = "") -> str:
+    if not ENABLE_SINGLE_TICKER_ANALYSIS:
+        return ""
+
+    warnings_out: list[str] = []
+    payload: dict[str, Any] = {
+        "ticker_resolution": None,
+        "financial_metrics": None,
+        "technical_indicators": None,
+        "strategy_signals": {},
+    }
+    if ENABLE_SINGLE_TICKER_BACKTESTS:
+        payload["strategy_backtests"] = {}
+
+    try:
+        from dataclasses import asdict
+        from single_ticker_analysis import (
+            collect_financial_metrics,
+            compute_technical_indicators,
+            generate_strategy_signal,
+            resolve_single_ticker,
+            run_strategy_backtest,
+        )
+    except Exception as exc:
+        return (
+            "[SINGLE TICKER ANALYSIS]\n"
+            + json.dumps({"warnings": [f"single_ticker_analysis import failed: {exc}"]}, ensure_ascii=True, sort_keys=True)
+        )
+
+    try:
+        payload["ticker_resolution"] = asdict(resolve_single_ticker(query or ticker))
+    except Exception as exc:
+        warnings_out.append(f"ticker resolution failed: {exc}")
+
+    try:
+        payload["financial_metrics"] = collect_financial_metrics(
+            ticker,
+            db_path=SQLITE_DB,
+            persist=True,
+        )
+    except Exception as exc:
+        warnings_out.append(f"financial metrics failed: {exc}")
+
+    try:
+        payload["technical_indicators"] = compute_technical_indicators(
+            ticker,
+            lookback_days=SINGLE_TICKER_LOOKBACK_DAYS,
+            db_path=SQLITE_DB,
+            persist=True,
+        )
+    except Exception as exc:
+        warnings_out.append(f"technical indicators failed: {exc}")
+
+    for strategy_name in ("moving_average_trend", "momentum", "rsi_mean_reversion"):
+        if ENABLE_SINGLE_TICKER_BACKTESTS:
+            try:
+                payload["strategy_backtests"][strategy_name] = run_strategy_backtest(
+                    ticker,
+                    strategy_name,
+                    db_path=SQLITE_DB,
+                    persist=True,
+                )
+            except Exception as exc:
+                warnings_out.append(f"{strategy_name} backtest failed: {exc}")
+        try:
+            payload["strategy_signals"][strategy_name] = generate_strategy_signal(
+                ticker,
+                strategy_name,
+                db_path=SQLITE_DB,
+                persist=True,
+            )
+        except Exception as exc:
+            warnings_out.append(f"{strategy_name} signal failed: {exc}")
+
+    if warnings_out:
+        payload["warnings"] = warnings_out
+    return "[SINGLE TICKER ANALYSIS]\n" + json.dumps(payload, ensure_ascii=True, sort_keys=True, default=str)
+
+
 def _dump_query_contexts(
     *,
     base_dir: str,
@@ -6532,6 +6614,13 @@ def run_query_once(
             )
         else:
             logs.append(f"  [news data] no usable [N] block for '{news_query or company_name}'")
+        structured_analysis_ctx = _build_single_ticker_analysis_context(
+            primary_target.ticker,
+            query=query,
+        )
+        if structured_analysis_ctx:
+            fin_ctx = f"{fin_ctx.strip()}\n\n{structured_analysis_ctx}"
+            logs.append("  [single ticker analysis] appended structured analysis block")
         all_contexts.append(
             build_financial_only_context(
                 query,
