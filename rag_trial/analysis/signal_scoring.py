@@ -8,7 +8,8 @@ from collections import Counter, defaultdict
 from datetime import datetime, timezone
 from typing import Any
 
-from create_sql_db import connect_sqlite, create_database
+from rag_trial.db.create_sql_db import connect_sqlite, create_database
+from rag_trial.paths import SQLITE_DB_PATH
 
 
 SIGNAL_SCORE_WEIGHTS = {
@@ -508,7 +509,7 @@ def _refresh_source_quality(conn, member_lookup: dict[str, list[dict[str, Any]]]
 
 
 def run_signal_scoring(
-    db_path: str = "my_database.db",
+    db_path: str = str(SQLITE_DB_PATH),
     *,
     limit: int | None = None,
 ) -> dict[str, Any]:

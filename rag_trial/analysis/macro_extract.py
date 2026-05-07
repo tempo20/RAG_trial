@@ -7,9 +7,9 @@ into macro_events / macro_event_shock_types / macro_channels /
 asset_impacts / evidence_spans tables.
 
 Usage:
-    python macro_extract.py                    # process all unprocessed chunks
-    python macro_extract.py --limit 100        # process at most N chunks
-    python macro_extract.py --reprocess        # reprocess failed runs only
+    python -m rag_trial.analysis.macro_extract                    # process all unprocessed chunks
+    python -m rag_trial.analysis.macro_extract --limit 100        # process at most N chunks
+    python -m rag_trial.analysis.macro_extract --reprocess        # reprocess failed runs only
 """
 
 from __future__ import annotations
@@ -29,6 +29,9 @@ from pathlib import Path
 from typing import Any
 
 from dotenv import load_dotenv
+from rag_trial.paths import PROMPT_TEMPLATES_PATH as DEFAULT_PROMPT_TEMPLATES_PATH
+from rag_trial.paths import SQLITE_DB_PATH as DEFAULT_SQLITE_DB_PATH
+from rag_trial.paths import env_path, env_str_path
 
 load_dotenv()
 
@@ -36,10 +39,10 @@ load_dotenv()
 # Config
 # ---------------------------------------------------------------------------
 
-SQLITE_DB         = os.getenv("SQLITE_DB", "my_database.db")
+SQLITE_DB         = env_str_path("SQLITE_DB", DEFAULT_SQLITE_DB_PATH)
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
 GEN_MODEL_NAME    = os.getenv("GEN_MODEL_NAME", "claude-haiku-4-5-20251001")
-PROMPT_TEMPLATES_PATH = Path(os.getenv("PROMPT_TEMPLATES_PATH", "prompt_templates.json"))
+PROMPT_TEMPLATES_PATH = env_path("PROMPT_TEMPLATES_PATH", DEFAULT_PROMPT_TEMPLATES_PATH)
 
 PROMPT_VERSION              = "v2"
 SCHEMA_VERSION              = "v1"
@@ -1454,7 +1457,7 @@ def run_extraction(
     chunk_ids: list[str] | None = None,
 ) -> None:
     client = _build_client()
-    from create_sql_db import create_database, connect_sqlite
+    from rag_trial.db.create_sql_db import create_database, connect_sqlite
 
     create_database(db_path)
     conn = connect_sqlite(db_path)
@@ -1809,7 +1812,7 @@ def _queue_rows(
 
 
 def print_queue(db_path: str = SQLITE_DB, *, queue_name: str, limit: int = 20) -> None:
-    from create_sql_db import create_database, connect_sqlite
+    from rag_trial.db.create_sql_db import create_database, connect_sqlite
 
     create_database(db_path)
     conn = connect_sqlite(db_path)
@@ -1838,8 +1841,8 @@ def inspect_run(
     if not run_id and not chunk_id:
         raise ValueError("inspect_run requires run_id or chunk_id")
 
-    from create_sql_db import connect_sqlite
-    from create_sql_db import create_database
+    from rag_trial.db.create_sql_db import connect_sqlite
+    from rag_trial.db.create_sql_db import create_database
 
     create_database(db_path)
     conn = connect_sqlite(db_path)
@@ -1920,7 +1923,7 @@ def retry_queue(
     queue_name: str = RETRY_QUEUE_NAME,
     limit: int | None = None,
 ) -> None:
-    from create_sql_db import create_database, connect_sqlite
+    from rag_trial.db.create_sql_db import create_database, connect_sqlite
 
     create_database(db_path)
     conn = connect_sqlite(db_path)
@@ -1946,7 +1949,7 @@ def retry_queue(
 
 
 def report_diagnostics(db_path: str = SQLITE_DB, limit: int = 20) -> None:
-    from create_sql_db import create_database, connect_sqlite
+    from rag_trial.db.create_sql_db import create_database, connect_sqlite
 
     create_database(db_path)
     conn = connect_sqlite(db_path)

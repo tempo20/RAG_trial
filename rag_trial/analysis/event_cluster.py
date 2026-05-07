@@ -8,7 +8,8 @@ from collections import Counter
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable
 
-from create_sql_db import connect_sqlite, create_database
+from rag_trial.db.create_sql_db import connect_sqlite, create_database
+from rag_trial.paths import SQLITE_DB_PATH
 
 
 EmbeddingFn = Callable[[list[str]], list[list[float]]]
@@ -129,7 +130,7 @@ def _asset_overlap(event: dict[str, Any], cluster: dict[str, Any]) -> set[str]:
 
 
 def _default_embedding_fn(texts: list[str]) -> list[list[float]]:
-    from tgrag_setup import embed_texts
+    from rag_trial.ingestion.tgrag_setup import embed_texts
 
     return embed_texts(texts)
 
@@ -551,7 +552,7 @@ def update_cluster_metadata(
 
 
 def run_event_clustering(
-    db_path: str = "my_database.db",
+    db_path: str = str(SQLITE_DB_PATH),
     *,
     window_days: int = 7,
     similarity_threshold: float = 0.82,

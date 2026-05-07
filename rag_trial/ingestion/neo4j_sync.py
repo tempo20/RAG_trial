@@ -26,7 +26,7 @@ from typing import Iterable
 from dotenv import load_dotenv
 from neo4j import GraphDatabase
 
-from graph_schema import (
+from rag_trial.db.graph_schema import (
     NEO4J_PASSWORD,
     NEO4J_URI,
     NEO4J_USER,
@@ -49,10 +49,11 @@ from graph_schema import (
     ensure_schema,
     wipe_lean_graph,
 )
+from rag_trial.paths import SQLITE_DB_PATH, env_str_path
 
 load_dotenv()
 
-SQLITE_DB = os.getenv("SQLITE_DB", "my_database.db")
+SQLITE_DB = env_str_path("SQLITE_DB", SQLITE_DB_PATH)
 BATCH_SIZE = int(os.getenv("NEO4J_SYNC_BATCH_SIZE", "500"))
 
 

@@ -14,11 +14,11 @@ Downstream, articles connect to prices via paths like:
   (:Article)-[:HAS_CHUNK]->(:Chunk)-[:MENTIONS]->(:Entity)-[:ALIASES_TICKER]->(:Instrument)<-[:FOR_INSTRUMENT]-(:MarketBar)
 
 Usage:
-  python hist_to_db.py              # FinanceToolkit download, then Neo4j ingest (FMP_API_KEY)
-  python hist_to_db.py --no-fetch   # use existing parquet only (no API call)
-  python hist_to_db.py --parquet custom.parquet --batch-size 2000
-  python hist_to_db.py --skip-link  # only bars/instruments, no Entity links
-  python hist_to_db.py --fetch-only # only write hist_data.parquet (FMP_API_KEY)
+  python -m rag_trial.ingestion.hist_to_db              # FinanceToolkit download, then Neo4j ingest (FMP_API_KEY)
+  python -m rag_trial.ingestion.hist_to_db --no-fetch   # use existing parquet only (no API call)
+  python -m rag_trial.ingestion.hist_to_db --parquet custom.parquet --batch-size 2000
+  python -m rag_trial.ingestion.hist_to_db --skip-link  # only bars/instruments, no Entity links
+  python -m rag_trial.ingestion.hist_to_db --fetch-only # only write hist_data.parquet (FMP_API_KEY)
 """
 
 from __future__ import annotations
@@ -32,13 +32,15 @@ import pandas as pd
 from dotenv import load_dotenv
 from neo4j import GraphDatabase
 
+from rag_trial.paths import HIST_DATA_PARQUET_PATH
+
 load_dotenv()
 
 NEO4J_URI = os.getenv("NEO4J_URI", "bolt://localhost:7687")
 NEO4J_USER = os.getenv("NEO4J_USER", "neo4j")
 NEO4J_PASSWORD = os.getenv("NEO4J_PASSWORD", "password")
 
-DEFAULT_PARQUET = Path("hist_data.parquet")
+DEFAULT_PARQUET = HIST_DATA_PARQUET_PATH
 
 # Same universe as get_fin.ipynb (FinanceToolkit / FMP).
 TOP_100_TICKERS = [

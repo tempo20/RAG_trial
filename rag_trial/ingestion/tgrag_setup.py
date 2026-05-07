@@ -57,7 +57,7 @@ try:
 except ImportError: 
     fuzz = None
 
-from graph_schema import (
+from rag_trial.db.graph_schema import (
     NEO4J_URI,
     NEO4J_PASSWORD,
     NEO4J_USER,
@@ -65,14 +65,19 @@ from graph_schema import (
     knowledge_node_uid,
     period_key_for,
 )
+from rag_trial.paths import ARTICLES_JSON_PATH as DEFAULT_ARTICLES_JSON_PATH
+from rag_trial.paths import FIN_ENTITY_MAP_PATH as DEFAULT_FIN_ENTITY_MAP_PATH
+from rag_trial.paths import SQLITE_DB_PATH as DEFAULT_SQLITE_DB_PATH
+from rag_trial.paths import TICKER_MAP_PATH as DEFAULT_TICKER_MAP_PATH
+from rag_trial.paths import env_path, env_str_path
 
 load_dotenv()
 
 # Config
 
-ARTICLES_JSON = Path(os.getenv("ARTICLES_JSON", "cnbc_articles.json"))
-TICKER_MAP_PATH = Path(os.getenv("TICKER_MAP_PATH", "ticker_company_map.csv"))
-FIN_ENTITY_MAP_PATH = Path(os.getenv("FIN_ENTITY_MAP_PATH", "financial_entity_map.csv"))
+ARTICLES_JSON = env_path("ARTICLES_JSON", DEFAULT_ARTICLES_JSON_PATH)
+TICKER_MAP_PATH = env_path("TICKER_MAP_PATH", DEFAULT_TICKER_MAP_PATH)
+FIN_ENTITY_MAP_PATH = env_path("FIN_ENTITY_MAP_PATH", DEFAULT_FIN_ENTITY_MAP_PATH)
 
 # Chunking
 CHUNK_TOKEN_TARGET = int(os.getenv("CHUNK_TOKEN_TARGET", "400"))   # ~400 tokens per chunk
@@ -105,7 +110,7 @@ MINHASH_SHINGLE_SIZE = int(os.getenv("MINHASH_SHINGLE_SIZE", "5"))
 NEO4J_BATCH_SIZE = int(os.getenv("NEO4J_BATCH_SIZE", "200"))
 
 # SQLite store
-SQLITE_DB = os.getenv("SQLITE_DB", "my_database.db")
+SQLITE_DB = env_str_path("SQLITE_DB", DEFAULT_SQLITE_DB_PATH)
 
 PROCESSING_STATE_ORDER = {
     "ingested": 0,
@@ -145,7 +150,7 @@ def _advance_article_processing_state(
     if not ids:
         return 0
 
-    from create_sql_db import connect_sqlite
+    from rag_trial.db.create_sql_db import connect_sqlite
     conn = connect_sqlite(db_path)
     rank = PROCESSING_STATE_ORDER[target_state]
     rank_expr = _state_rank_sql("processing_state")
@@ -176,7 +181,7 @@ def _advance_chunk_processing_state(
     if not ids:
         return 0
 
-    from create_sql_db import connect_sqlite
+    from rag_trial.db.create_sql_db import connect_sqlite
     conn = connect_sqlite(db_path)
     rank = PROCESSING_STATE_ORDER[target_state]
     rank_expr = _state_rank_sql("processing_state")
@@ -200,7 +205,7 @@ def _advance_articles_to_embedded_when_ready(
     db_path: str = SQLITE_DB,
     article_ids: list[str] | set[str] | None = None,
 ) -> int:
-    from create_sql_db import connect_sqlite
+    from rag_trial.db.create_sql_db import connect_sqlite
     conn = connect_sqlite(db_path, fk=False)
     conn.row_factory = sqlite3.Row
     params: list[str] = []
@@ -1255,7 +1260,7 @@ def run_integrity_check(db_path: str = SQLITE_DB) -> None:
     - orphan chunks             (chunks.article_id not in articles)
     - orphan entity_mentions    (mentions referencing missing chunk or article)
     """
-    from create_sql_db import connect_sqlite
+    from rag_trial.db.create_sql_db import connect_sqlite
     conn = connect_sqlite(db_path)
     try:
         # Foreign key violations across all tables
@@ -1321,7 +1326,7 @@ def run_sqlite_pass(
     keep_per_singletons: if True, skips the PER singleton filter so all
     extracted person entities are written regardless of chunk frequency.
     """
-    from create_sql_db import create_database, ensure_migrations
+    from rag_trial.db.create_sql_db import create_database, ensure_migrations
     create_database(db_path)
     ensure_migrations(db_path)
 
@@ -1417,7 +1422,7 @@ def run_sqlite_pass(
 
 def _upsert_chunks_sqlite(chunks: list[dict], db_path: str = SQLITE_DB) -> None:
     """Write chunk dicts to SQLite chunks table. Skips already-present rows."""
-    from create_sql_db import connect_sqlite
+    from rag_trial.db.create_sql_db import connect_sqlite
     conn = connect_sqlite(db_path)
     inserted = 0
     for c in chunks:
@@ -1449,7 +1454,7 @@ def _upsert_chunks_sqlite(chunks: list[dict], db_path: str = SQLITE_DB) -> None:
 
 def _upsert_entity_mentions_sqlite(mentions: list[dict], db_path: str = SQLITE_DB) -> None:
     """Write entity mention dicts to SQLite entity_mentions table."""
-    from create_sql_db import connect_sqlite
+    from rag_trial.db.create_sql_db import connect_sqlite
     conn = connect_sqlite(db_path)
     inserted = 0
     for m in mentions:
@@ -1484,7 +1489,7 @@ def _load_unembedded_chunks_sqlite(
     limit: int | None = None,
 ) -> list[dict]:
     """Return chunks that still need embeddings."""
-    from create_sql_db import connect_sqlite
+    from rag_trial.db.create_sql_db import connect_sqlite
     conn = connect_sqlite(db_path, fk=False)
     conn.row_factory = sqlite3.Row
     sql = """
@@ -1511,7 +1516,7 @@ def _write_chunk_embeddings_sqlite(
     """Persist (embedding_json, chunk_id) rows."""
     if not rows:
         return
-    from create_sql_db import connect_sqlite
+    from rag_trial.db.create_sql_db import connect_sqlite
     conn = connect_sqlite(db_path)
     conn.executemany(
         "UPDATE chunks "

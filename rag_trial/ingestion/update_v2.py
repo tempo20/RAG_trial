@@ -16,6 +16,8 @@ from __future__ import annotations
 import argparse
 import os
 
+from rag_trial.paths import SQLITE_DB_PATH, env_str_path
+
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="SQLite pipeline orchestrator (v2)")
@@ -103,9 +105,9 @@ def main() -> None:
     args = parser.parse_args()
 
     if args.reset_db:
-        from create_sql_db import create_database
+        from rag_trial.db.create_sql_db import create_database
 
-        db_path = os.getenv("SQLITE_DB", "my_database.db")
+        db_path = env_str_path("SQLITE_DB", SQLITE_DB_PATH)
         if os.path.exists(db_path):
             os.remove(db_path)
             print(f"Removed existing database: {db_path}")
@@ -118,7 +120,7 @@ def main() -> None:
     else:
         print("Step 1: Scraping RSS feeds -> SQLite")
         print("=" * 60)
-        from simple_scraper_v2 import main as scrape
+        from rag_trial.ingestion.simple_scraper_v2 import main as scrape
 
         scrape()
 
@@ -126,7 +128,7 @@ def main() -> None:
     print("=" * 60)
     print("Step 2: SQLite pass (chunking + entity extraction)")
     print("=" * 60)
-    from tgrag_setup import run_sqlite_pass
+    from rag_trial.ingestion.tgrag_setup import run_sqlite_pass
 
     run_sqlite_pass(
         reset=args.reset,
@@ -142,7 +144,7 @@ def main() -> None:
     else:
         print("Step 3: Macro extraction -> SQLite")
         print("=" * 60)
-        from macro_extract import run_extraction
+        from rag_trial.analysis.macro_extract import run_extraction
 
         run_extraction(limit=args.macro_limit)
 
@@ -153,7 +155,7 @@ def main() -> None:
     else:
         print("Step 4: Event clustering -> SQLite")
         print("=" * 60)
-        from event_cluster import run_event_clustering
+        from rag_trial.analysis.event_cluster import run_event_clustering
 
         cluster_summary = run_event_clustering(window_days=args.cluster_window_days)
         print("[event_cluster] summary:")
@@ -167,7 +169,7 @@ def main() -> None:
     else:
         print("Step 5: Signal scoring -> SQLite")
         print("=" * 60)
-        from signal_scoring import run_signal_scoring
+        from rag_trial.analysis.signal_scoring import run_signal_scoring
 
         scoring_summary = run_signal_scoring(limit=args.signal_limit)
         print("[signal_scoring] summary:")
@@ -181,7 +183,7 @@ def main() -> None:
     else:
         print("Step 6: Market feedback -> SQLite")
         print("=" * 60)
-        from market_feedback import run_market_feedback
+        from rag_trial.analysis.market_feedback import run_market_feedback
 
         feedback_summary = run_market_feedback()
         print("[market_feedback] summary:")
@@ -195,7 +197,7 @@ def main() -> None:
     else:
         print("Step 7: Neo4j sync <- SQLite")
         print("=" * 60)
-        from neo4j_sync import sync_sqlite_to_neo4j
+        from rag_trial.ingestion.neo4j_sync import sync_sqlite_to_neo4j
 
         counts = sync_sqlite_to_neo4j(wipe=args.wipe_neo4j)
         print("[neo4j_sync] counts:")
@@ -206,7 +208,7 @@ def main() -> None:
     print("=" * 60)
     print("Pipeline complete.")
     print("  Inspect DB:  python -c \"import sqlite3; ...\"")
-    print("  Chat:        python chatter.py")
+    print("  Chat:        python -m rag_trial.chat.chatter")
     print("=" * 60)
 
 

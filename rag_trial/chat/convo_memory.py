@@ -27,12 +27,14 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
+from rag_trial.paths import CONVERSATION_MEMORY_PATH, env_path
+
 
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
 
-MEMORY_PATH = Path("conversation_memory.json")
+MEMORY_PATH = env_path("CONVERSATION_MEMORY_PATH", CONVERSATION_MEMORY_PATH)
 
 # After this many turns the oldest turns are compressed into a text summary
 # to prevent the system-prompt injection from growing unbounded.

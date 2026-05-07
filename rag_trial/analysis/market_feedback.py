@@ -6,10 +6,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from create_sql_db import connect_sqlite, create_database
+from rag_trial.db.create_sql_db import connect_sqlite, create_database
+from rag_trial.paths import HIST_DATA_PARQUET_PATH, SQLITE_DB_PATH
 
 
-DEFAULT_PARQUET = Path("hist_data.parquet")
+DEFAULT_PARQUET = HIST_DATA_PARQUET_PATH
 
 
 def _now_utc() -> str:
@@ -34,7 +35,7 @@ def _parse_dt(value: Any) -> datetime | None:
 
 def _load_long_frame(parquet_path: Path):
     try:
-        from hist_to_db import long_frame_from_parquet
+        from rag_trial.ingestion.hist_to_db import long_frame_from_parquet
     except Exception as exc:  # pragma: no cover - environment-dependent
         return None, f"market_data_loader_unavailable:{exc}"
     try:
@@ -182,7 +183,7 @@ def write_market_reaction(conn, payload: dict[str, Any]) -> None:
 
 
 def run_market_feedback(
-    db_path: str = "my_database.db",
+    db_path: str = str(SQLITE_DB_PATH),
     *,
     parquet_path: str | Path = DEFAULT_PARQUET,
     limit: int | None = None,

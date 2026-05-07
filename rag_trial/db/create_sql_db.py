@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import sqlite3
 
+from rag_trial.paths import SQLITE_DB_PATH
+
 
 SCHEMA_SQL = """
     CREATE TABLE IF NOT EXISTS articles (
@@ -546,7 +548,7 @@ REQUIRED_COLUMNS: dict[str, dict[str, str]] = {
 }
 
 
-def connect_sqlite(db_path: str = "my_database.db", *, fk: bool = True) -> sqlite3.Connection:
+def connect_sqlite(db_path: str = str(SQLITE_DB_PATH), *, fk: bool = True) -> sqlite3.Connection:
     """Open a SQLite connection with consistent settings."""
     conn = sqlite3.connect(db_path)
     if fk:
@@ -590,7 +592,7 @@ def _ensure_schema_objects(conn: sqlite3.Connection) -> None:
     conn.executescript(INDEX_SQL)
 
 
-def create_database(db_path: str = "my_database.db") -> None:
+def create_database(db_path: str = str(SQLITE_DB_PATH)) -> None:
     conn = connect_sqlite(db_path)
     _ensure_schema_objects(conn)
     conn.commit()
@@ -598,7 +600,7 @@ def create_database(db_path: str = "my_database.db") -> None:
     print(f"Database created successfully at: {db_path}")
 
 
-def ensure_migrations(db_path: str = "my_database.db") -> None:
+def ensure_migrations(db_path: str = str(SQLITE_DB_PATH)) -> None:
     """Apply schema migrations needed for existing databases."""
     conn = connect_sqlite(db_path)
     _ensure_schema_objects(conn)

@@ -4,7 +4,8 @@ import argparse
 import json
 import sqlite3
 
-from create_sql_db import connect_sqlite, create_database
+from rag_trial.db.create_sql_db import connect_sqlite, create_database
+from rag_trial.paths import SQLITE_DB_PATH
 
 
 def _connect(db_path: str) -> sqlite3.Connection:
@@ -463,7 +464,7 @@ def show_source_quality(db_path: str, limit: int) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Analyst-facing SQLite inspection tools")
-    parser.add_argument("--db", default="my_database.db", help="Path to SQLite DB")
+    parser.add_argument("--db", default=str(SQLITE_DB_PATH), help="Path to SQLite DB")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     latest_parser = subparsers.add_parser("latest-events", help="Show latest macro events by confidence")

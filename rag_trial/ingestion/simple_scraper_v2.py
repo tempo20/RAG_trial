@@ -8,8 +8,8 @@ Key features:
   4. Deduplication delegated to ingestion pipeline (single authority)
 
 Usage:
-    python simple_scraper_v2.py
-    python simple_scraper_v2.py --reset-db
+    python -m rag_trial.ingestion.simple_scraper_v2
+    python -m rag_trial.ingestion.simple_scraper_v2 --reset-db
 """
 
 from __future__ import annotations
@@ -46,6 +46,8 @@ try:
 except ImportError:  # pragma: no cover - exercised in dependency-light envs
     trafilatura = None
 from tqdm import tqdm
+
+from rag_trial.paths import ARTICLES_JSON_PATH, SQLITE_DB_PATH, env_str_path
 
 load_dotenv()
 
@@ -102,8 +104,8 @@ ALPHA_NEWS_ENDPOINT = "https://www.alphavantage.co/query"
 ALPHA_SENTIMENT_FUNCTION = "NEWS_SENTIMENT"
 ALPHA_SOURCE_FEED = "alpha://news_sentiment"
 
-OUTPUT_JSON = os.getenv("OUTPUT_JSON", "cnbc_articles.json")
-SQLITE_DB = os.getenv("SQLITE_DB", "my_database.db")
+OUTPUT_JSON = env_str_path("OUTPUT_JSON", ARTICLES_JSON_PATH)
+SQLITE_DB = env_str_path("SQLITE_DB", SQLITE_DB_PATH)
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "20"))
 CONCURRENT_REQUESTS = int(os.getenv("CONCURRENT_REQUESTS", "10"))
 
@@ -1678,7 +1680,7 @@ def _is_boilerplate_article(text: str, url: str = "") -> bool:
 
 def _save_to_sqlite(articles: list[dict], scraped_at_utc: str) -> None:
     """Persist ok articles to SQLite and keep raw rows for audit."""
-    from create_sql_db import create_database, connect_sqlite, ensure_migrations
+    from rag_trial.db.create_sql_db import create_database, connect_sqlite, ensure_migrations
     create_database(SQLITE_DB)
     ensure_migrations(SQLITE_DB)
     conn = connect_sqlite(SQLITE_DB)
@@ -1794,7 +1796,7 @@ def _save_to_sqlite(articles: list[dict], scraped_at_utc: str) -> None:
 
 def _reset_sqlite_db() -> None:
     """Delete and recreate the SQLite DB file."""
-    from create_sql_db import create_database
+    from rag_trial.db.create_sql_db import create_database
     if os.path.exists(SQLITE_DB):
         os.remove(SQLITE_DB)
         print(f"Reset SQLite database file: {SQLITE_DB}")

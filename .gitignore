@@ -1,5 +1,9 @@
 venv/
 notebooks/
+Notebooks/
+runtime/
+data/articles/
+data/market/
 .env
 .env.*
 !.env.example
@@ -13,15 +17,11 @@ __pycache__/
 *.sqlite3
 *.csv
 !requirements.txt
-!financial_entity_map.csv
 test_simple_scraper_v2.py
 test_financial_entity_linker.py
-!create_sql_db.py
 my_database.db
 my_database_snapshot.db
-!prompt_templates.json
-!gold_eval_cases.json
-!ticker_company_map.csv
 notebooks/test.py
 timesfm*
 test*.py
+# tests/test*.py

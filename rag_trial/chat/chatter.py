@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import json
 import importlib
@@ -6,6 +6,7 @@ import uuid
 import os
 import re
 import sqlite3
+import sys
 import time
 import warnings
 from collections import Counter, defaultdict
@@ -13,6 +14,11 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Any, Optional
+
+if __package__ in {None, ""}:
+    repo_root = Path(__file__).resolve().parents[2]
+    if str(repo_root) not in sys.path:
+        sys.path.insert(0, str(repo_root))
 
 from dotenv import load_dotenv
 load_dotenv()
@@ -25,7 +31,7 @@ import numpy as np
 from neo4j import GraphDatabase
 from sentence_transformers import SentenceTransformer
 
-from graph_schema import (
+from rag_trial.db.graph_schema import (
     NEO4J_URI,
     NEO4J_USER,
     NEO4J_PASSWORD,
@@ -33,19 +39,28 @@ from graph_schema import (
     asset_key,
     period_key_for,
 )
-from tgrag_setup import (
+from rag_trial.ingestion.tgrag_setup import (
     EMBED_MODEL_NAME,
     _canonicalize,
     load_financial_entity_map,
     load_ticker_company_map,
 )
-from convo_memory import (
+from rag_trial.chat.convo_memory import (
     ConversationMemory,
     resolve_coreference,
     resolve_temporal_carryover,
     save_memory,
     load_memory,
     MEMORY_PATH,
+)
+from rag_trial.paths import (
+    FIN_ENTITY_MAP_PATH as DEFAULT_FIN_ENTITY_MAP_PATH,
+    PROMPT_TEMPLATES_PATH as DEFAULT_PROMPT_TEMPLATES_PATH,
+    QUERY_CONTEXT_DIR,
+    SQLITE_DB_PATH as DEFAULT_SQLITE_DB_PATH,
+    TICKER_MAP_PATH as DEFAULT_TICKER_MAP_PATH,
+    env_path,
+    env_str_path,
 )
 
 # Config
@@ -54,10 +69,10 @@ DEBUG_SKIP_GENERATION = os.getenv("DEBUG_SKIP_GENERATION", "0").strip() in {"1",
 SINGLE_TICKER_OUTLOOK_ENFORCEMENT_VERSION = "v2"
 GEN_MODEL_NAME = os.getenv("GEN_MODEL_NAME")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
-TICKER_MAP_PATH = Path(os.getenv("TICKER_MAP_PATH", "ticker_company_map.csv"))
-FIN_ENTITY_MAP_PATH = Path(os.getenv("FIN_ENTITY_MAP_PATH", "financial_entity_map.csv"))
-SQLITE_DB = os.getenv("SQLITE_DB", "my_database.db")
-PROMPT_TEMPLATES_PATH = Path(os.getenv("PROMPT_TEMPLATES_PATH", "prompt_templates.json"))
+TICKER_MAP_PATH = env_path("TICKER_MAP_PATH", DEFAULT_TICKER_MAP_PATH)
+FIN_ENTITY_MAP_PATH = env_path("FIN_ENTITY_MAP_PATH", DEFAULT_FIN_ENTITY_MAP_PATH)
+SQLITE_DB = env_str_path("SQLITE_DB", DEFAULT_SQLITE_DB_PATH)
+PROMPT_TEMPLATES_PATH = env_path("PROMPT_TEMPLATES_PATH", DEFAULT_PROMPT_TEMPLATES_PATH)
 
 SHOW_PROVENANCE = os.getenv("SHOW_PROVENANCE", "0").strip().lower() in {"1", "true", "yes", "on"}
 TOP_K = int(os.getenv("TOP_K", "3"))
@@ -6336,6 +6351,7 @@ def _dump_query_contexts(
     news_query: str,
     news_item_count: int,
 ) -> tuple[str, str, str]:
+    os.makedirs(base_dir, exist_ok=True)
     full_dump_path = os.path.join(base_dir, "query_context.txt")
     fin_dump_path = os.path.join(base_dir, "query_fin_context.txt")
     news_dump_path = os.path.join(base_dir, "query_news_context.txt")
@@ -6382,6 +6398,7 @@ def _dump_financial_context_only(
     timestamp: str,
     financial_context: str,
 ) -> str:
+    os.makedirs(base_dir, exist_ok=True)
     fin_dump_path = os.path.join(base_dir, "query_fin_context.txt")
     with open(fin_dump_path, "w", encoding="utf-8") as f:
         f.write(f"QUERY      : {query}\n")
@@ -6988,7 +7005,7 @@ def run_query_once(
             import datetime as _dt
             _ts = _dt.datetime.now().strftime("%Y%m%d_%H%M%S")
             fin_dump_path = _dump_financial_context_only(
-                base_dir=os.path.dirname(os.path.abspath(__file__)),
+                base_dir=str(QUERY_CONTEXT_DIR),
                 query=query,
                 final_route="market_tickers_today",
                 timestamp=_ts,
@@ -7546,7 +7563,7 @@ def run_query_once(
         import datetime as _dt
         _ts = _dt.datetime.now().strftime("%Y%m%d_%H%M%S")
         _full_dump_path, _fin_dump_path, _news_dump_path = _dump_query_contexts(
-            base_dir=os.path.dirname(os.path.abspath(__file__)),
+            base_dir=str(QUERY_CONTEXT_DIR),
             query=query,
             final_route=final_route,
             timestamp=_ts,

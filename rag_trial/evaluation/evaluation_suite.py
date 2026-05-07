@@ -12,14 +12,15 @@ from typing import Any
 from neo4j import GraphDatabase
 from sentence_transformers import SentenceTransformer
 
-import chatter
-from convo_memory import ConversationMemory
-from create_sql_db import create_database
-from graph_schema import NEO4J_PASSWORD, NEO4J_URI, NEO4J_USER
-from tgrag_setup import EMBED_MODEL_NAME, load_financial_entity_map, load_ticker_company_map
+from rag_trial.chat import chatter
+from rag_trial.chat.convo_memory import ConversationMemory
+from rag_trial.db.create_sql_db import create_database
+from rag_trial.db.graph_schema import NEO4J_PASSWORD, NEO4J_URI, NEO4J_USER
+from rag_trial.ingestion.tgrag_setup import EMBED_MODEL_NAME, load_financial_entity_map, load_ticker_company_map
+from rag_trial.paths import GOLD_EVAL_CASES_PATH
 
 
-DEFAULT_GOLD_PATH = Path("gold_eval_cases.json")
+DEFAULT_GOLD_PATH = GOLD_EVAL_CASES_PATH
 DEFAULT_RELEASE_GATE_THRESHOLDS: dict[str, float] = {
     "case_pass_rate_min": 0.8,
     "target_resolution_accuracy_min": 0.8,
