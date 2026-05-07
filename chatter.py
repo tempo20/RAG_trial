@@ -8,7 +8,7 @@ import re
 import sqlite3
 import time
 import warnings
-from collections import defaultdict
+from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
@@ -76,6 +76,11 @@ SUMMARY_MIN_FULL_CONTEXT_CHUNKS = int(os.getenv("SUMMARY_MIN_FULL_CONTEXT_CHUNKS
 SINGLE_TICKER_NEWS_MAX_ITEMS = int(os.getenv("SINGLE_TICKER_NEWS_MAX_ITEMS", "5"))
 SINGLE_TICKER_NEWS_TIMEOUT_SECONDS = float(os.getenv("SINGLE_TICKER_NEWS_TIMEOUT_SECONDS", "10"))
 GDELT_DOC_SEARCH_URL = "https://api.gdeltproject.org/api/v2/doc/doc"
+FINANCIAL_TOOLKIT_RATE_LIMIT_PER_MIN = int(os.getenv("FINANCIAL_TOOLKIT_RATE_LIMIT_PER_MIN", "300"))
+FINANCIAL_TOOLKIT_ESTIMATED_CALLS_PER_TICKER = float(os.getenv("FINANCIAL_TOOLKIT_ESTIMATED_CALLS_PER_TICKER", "10"))
+FINANCIAL_TOOLKIT_RATE_LIMIT_BUFFER = float(os.getenv("FINANCIAL_TOOLKIT_RATE_LIMIT_BUFFER", "0.8"))
+FINANCIAL_TOOLKIT_BATCH_COOLDOWN_SECONDS = float(os.getenv("FINANCIAL_TOOLKIT_BATCH_COOLDOWN_SECONDS", "61"))
+FINANCIAL_TOOLKIT_MAX_BATCH_TICKERS = int(os.getenv("FINANCIAL_TOOLKIT_MAX_BATCH_TICKERS", "0"))
 SUMMARY_TERMS = (
     "summary",
     "summarise",
@@ -128,6 +133,7 @@ ROUTE_TYPES = (
     "macro_causal",
     "entity_profile",
     "single_ticker_financial",
+    "market_tickers_today",
     "live_market_data",
     "broad_exploration",
     "ambiguous",
@@ -174,6 +180,7 @@ ROUTE_WEIGHT_MULTIPLIERS: dict[str, dict[str, float]] = {
     "macro_causal": {"event_support_score": 1.35, "graph_relevance_score": 1.25},
     "entity_profile": {"target_match_score": 1.35, "recency_score": 0.85},
     "single_ticker_financial": {},
+    "market_tickers_today": {},
     "live_market_data": {"recency_score": 1.25, "target_match_score": 1.20},
     "broad_exploration": {"semantic_score": 1.10, "keyword_overlap_score": 1.10},
     "ambiguous": {"ambiguity_penalty": 1.50, "target_match_score": 0.85},
@@ -221,6 +228,14 @@ ROUTE_PROFILES: dict[str, dict[str, Any]] = {
         "allowed_content_classes": ("news_report", "analysis", "official_release", "stream_brief", "evergreen_explainer"),
     },
     "single_ticker_financial": {
+        "top_k": 0,
+        "expanded_k": 0,
+        "recency_half_life_days": max(1.0, RECENCY_HALF_LIFE_DAYS),
+        "candidate_cap": 0,
+        "answer_strictness": "very_high",
+        "allowed_content_classes": (),
+    },
+    "market_tickers_today": {
         "top_k": 0,
         "expanded_k": 0,
         "recency_half_life_days": max(1.0, RECENCY_HALF_LIFE_DAYS),
@@ -456,6 +471,22 @@ MARKET_INTENT_HINTS = (
     "low",
     "volume",
 )
+
+MARKET_TICKER_SCREEN_INTENT_HINTS = (
+    "market tickers for today",
+    "market tickers today",
+    "today's market tickers",
+    "todays market tickers",
+)
+
+SCREENERS = [
+    "most_actives",
+    "day_gainers",
+    "small_cap_gainers",
+    "aggressive_small_caps",
+    "undervalued_growth_stocks",
+    "undervalued_large_caps",
+]
 
 SINGLE_TICKER_FINANCIAL_INTENT_HINTS = (
     "performance",
@@ -799,6 +830,8 @@ def classify_query_route(
     explicit_latest_news_intent: bool = False,
 ) -> str:
     q = (query or "").strip().lower()
+    if is_market_ticker_screen_intent(query):
+        return "market_tickers_today"
     if summary_mode:
         return "daily_summary"
     if causal_intent:
@@ -2059,6 +2092,12 @@ def is_market_data_intent(query: str) -> bool:
     q = query.lower()
     return any(hint in q for hint in MARKET_INTENT_HINTS)
 
+
+def is_market_ticker_screen_intent(query: str) -> bool:
+    q = (query or "").strip().lower()
+    return any(hint in q for hint in MARKET_TICKER_SCREEN_INTENT_HINTS)
+
+
 def is_summary_query(query: str) -> bool:
     q = (query or "").strip().lower()
     has_summary = any(term in q for term in SUMMARY_TERMS)
@@ -2570,6 +2609,49 @@ def fetch_market_context(
     return "\n".join(lines)
 
 
+def fetch_yahoo_screener(scr_id: str, count: int = 100):
+    try:
+        import pandas as pd
+    except ImportError:
+        return []
+
+    try:
+        import yfinance as yf
+    except ImportError as exc:
+        print(f"  [market tickers] yfinance unavailable: {exc}")
+        return pd.DataFrame()
+
+    try:
+        data = yf.screen(scr_id, count=count)
+    except Exception as exc:
+        print(f"  [market tickers] Yahoo screener fetch failed for {scr_id}: {exc}")
+        return pd.DataFrame()
+
+    quotes = data.get("quotes", []) if isinstance(data, dict) else []
+    if not quotes:
+        return pd.DataFrame()
+
+    df = pd.DataFrame(quotes)
+    existing_cols = [c for c in ["symbol"] if c in df.columns]
+    return df[existing_cols]
+
+
+def fetch_today_market_overlap_tickers(count: int = 100) -> list[str]:
+    all_tickers_list: list[str] = []
+    for screener in SCREENERS:
+        df = fetch_yahoo_screener(screener, count=count)
+        if not hasattr(df, "empty") or df.empty or "symbol" not in df.columns:
+            continue
+        all_tickers_list.extend(
+            str(symbol).strip().upper()
+            for symbol in df["symbol"].dropna().tolist()
+            if str(symbol).strip()
+        )
+
+    ticker_counts = Counter(all_tickers_list)
+    return [ticker for ticker, n in ticker_counts.items() if n > 1]
+
+
 def _append_statement_rows(
     lines: list[str],
     df,
@@ -2693,6 +2775,7 @@ def _normalize_fin_df(df, ticker: str):
     Handles:
     - None / empty input → returns None
     - MultiIndex columns where level-0 is ticker → slice to ticker sub-frame
+    - MultiIndex rows where one level is ticker → slice to the ticker row group
     - MultiIndex rows → flatten by joining tuple levels with " | "
     """
     import pandas as pd
@@ -2713,6 +2796,18 @@ def _normalize_fin_df(df, ticker: str):
                 sub = sub[ticker]
             elif len(top) == 1:
                 sub = sub[top[0]]
+    except Exception:
+        pass
+
+    try:
+        if isinstance(sub.index, pd.MultiIndex) or hasattr(sub.index, "levels"):
+            ticker_key = str(ticker).upper()
+            for level in range(sub.index.nlevels):
+                level_values = list(sub.index.get_level_values(level).unique())
+                match = next((value for value in level_values if str(value).upper() == ticker_key), None)
+                if match is not None:
+                    sub = sub.xs(match, axis=0, level=level)
+                    break
     except Exception:
         pass
 
@@ -3436,32 +3531,135 @@ def _classify_financial_metrics(derived: dict, price: dict, technical: dict) -> 
 # ---------------------------------------------------------------------------
 
 def fetch_financial_context(
-    ticker: str,
+    ticker: str | list[str],
     date_start: str | None,
     date_end: str | None,
     lookback_days: int = 365,
     include_technicals: bool = False,
 ) -> str:
-    """
-    Fetch financial data for *ticker* via FinanceToolkit and return an
-    analysis-ready FINANCIAL DATA [F] block structured in 13 sections plus a quarterly snapshot:
+    if isinstance(ticker, list):
+        deduped_tickers: list[str] = []
+        seen: set[str] = set()
+        for raw_ticker in ticker:
+            symbol = str(raw_ticker or "").strip().upper()
+            if not symbol or symbol in seen:
+                continue
+            seen.add(symbol)
+            deduped_tickers.append(symbol)
 
-      1. DATA AVAILABILITY       8. CASH FLOW
-      2. COMPANY PROFILE         9. VALUATION
-      3. FINANCIAL SNAPSHOT     10. STOCK PRICE TREND
-      3A. QUARTERLY SNAPSHOT    11. TECHNICAL INDICATORS
-      4. GROWTH
-      5. PROFITABILITY          12. DERIVED CLASSIFICATIONS
-      6. EXPENSE STRUCTURE      13. DATA LIMITATIONS
-      7. LIQUIDITY & LEVERAGE
+        return _fetch_batch_financial_context(
+            tickers=deduped_tickers,
+            date_start=date_start,
+            date_end=date_end,
+            lookback_days=lookback_days,
+            include_technicals=include_technicals,
+        )
 
-    Every metric includes its ticker, period/date, units, and an explicit
-    "unavailable — <reason>" marker when the value cannot be computed.
-    No LLM inference is used to fill gaps.
+    return _fetch_single_financial_context(
+        ticker=ticker,
+        date_start=date_start,
+        date_end=date_end,
+        lookback_days=lookback_days,
+        include_technicals=include_technicals,
+    )
 
-    Returns empty string when FMP_API_KEY is absent, FinanceToolkit is not
-    installed, Toolkit init fails, or no usable data is returned for ticker.
-    """
+
+def _fetch_batch_financial_context(
+    tickers: list[str],
+    date_start: str | None,
+    date_end: str | None,
+    lookback_days: int = 365,
+    include_technicals: bool = False,
+) -> str:
+    if not tickers:
+        return ""
+
+    chunk_size = _resolve_financial_batch_chunk_size()
+    if len(tickers) <= chunk_size:
+        return _fetch_batch_financial_context_once(
+            tickers=tickers,
+            date_start=date_start,
+            date_end=date_end,
+            lookback_days=lookback_days,
+            include_technicals=include_technicals,
+        )
+
+    chunks = [tickers[i:i + chunk_size] for i in range(0, len(tickers), chunk_size)]
+    print(
+        "  [financial data] rate-limited batch fetch: "
+        f"{len(tickers)} tickers across {len(chunks)} chunk(s), "
+        f"chunk_size={chunk_size}, cooldown={FINANCIAL_TOOLKIT_BATCH_COOLDOWN_SECONDS:.1f}s"
+    )
+    lines = [
+        "MULTI-TICKER FINANCIAL DATA [F]",
+        "Cite facts from these FinanceToolkit blocks as [F].",
+        "Source: FinancialModelingPrep via FinanceToolkit.",
+        f"Tickers requested: {', '.join(tickers)}",
+        (
+            "Rate limit policy: "
+            f"{FINANCIAL_TOOLKIT_RATE_LIMIT_PER_MIN} calls/minute, "
+            f"estimated {FINANCIAL_TOOLKIT_ESTIMATED_CALLS_PER_TICKER:g} calls/ticker, "
+            f"chunk_size={chunk_size}, chunks={len(chunks)}."
+        ),
+    ]
+
+    any_context = False
+    for idx, chunk in enumerate(chunks, start=1):
+        if idx > 1 and FINANCIAL_TOOLKIT_BATCH_COOLDOWN_SECONDS > 0:
+            print(
+                "  [financial data] waiting "
+                f"{FINANCIAL_TOOLKIT_BATCH_COOLDOWN_SECONDS:.1f}s before batch {idx}/{len(chunks)}"
+            )
+            time.sleep(FINANCIAL_TOOLKIT_BATCH_COOLDOWN_SECONDS)
+
+        print(
+            "  [financial data] fetching batch "
+            f"{idx}/{len(chunks)} ({len(chunk)} ticker(s)): {', '.join(chunk)}"
+        )
+        block = _fetch_batch_financial_context_once(
+            tickers=chunk,
+            date_start=date_start,
+            date_end=date_end,
+            lookback_days=lookback_days,
+            include_technicals=include_technicals,
+        )
+        body = _strip_multi_ticker_context_header(block)
+        if body:
+            any_context = True
+            lines.append("")
+            lines.append(f"RATE-LIMITED BATCH {idx}/{len(chunks)} | Tickers: {', '.join(chunk)}")
+            lines.append(body)
+
+    return "\n".join(lines) if any_context else ""
+
+
+def _resolve_financial_batch_chunk_size() -> int:
+    estimated_calls = max(FINANCIAL_TOOLKIT_ESTIMATED_CALLS_PER_TICKER, 1.0)
+    usable_calls = max(int(FINANCIAL_TOOLKIT_RATE_LIMIT_PER_MIN * FINANCIAL_TOOLKIT_RATE_LIMIT_BUFFER), 1)
+    derived_size = max(int(usable_calls // estimated_calls), 1)
+    if FINANCIAL_TOOLKIT_MAX_BATCH_TICKERS > 0:
+        return max(min(derived_size, FINANCIAL_TOOLKIT_MAX_BATCH_TICKERS), 1)
+    return derived_size
+
+
+def _strip_multi_ticker_context_header(block: str) -> str:
+    lines = (block or "").splitlines()
+    for idx, line in enumerate(lines):
+        if line.startswith("[") and line.endswith("]"):
+            return "\n".join(lines[idx:]).strip()
+    return (block or "").strip()
+
+
+def _fetch_batch_financial_context_once(
+    tickers: list[str],
+    date_start: str | None,
+    date_end: str | None,
+    lookback_days: int = 365,
+    include_technicals: bool = False,
+) -> str:
+    if not tickers:
+        return ""
+
     api_key = os.getenv("FMP_API_KEY", "").strip()
     if not api_key:
         return ""
@@ -3471,9 +3669,8 @@ def fetch_financial_context(
     except ImportError:
         return ""
 
-    from datetime import datetime, timezone, timedelta
-    now      = datetime.now(timezone.utc)
-    end_dt   = date_end   or now.strftime("%Y-%m-%d")
+    now = datetime.now(timezone.utc)
+    end_dt = date_end or now.strftime("%Y-%m-%d")
     price_lookback_days = max(int(lookback_days or 365), 400)
     start_dt = date_start or (now - timedelta(days=price_lookback_days)).strftime("%Y-%m-%d")
     statement_lookback_days = max(int(lookback_days or 365), 365 * 4)
@@ -3500,25 +3697,27 @@ def fetch_financial_context(
         if quarterly is not None:
             kwargs["quarterly"] = quarterly
         try:
-            return Toolkit([ticker], **kwargs)
+            return Toolkit(tickers, **kwargs)
         except TypeError:
-            # Older FinanceToolkit versions may not expose the quarterly kwarg.
             if quarterly is None:
                 raise
             kwargs.pop("quarterly", None)
-            return Toolkit([ticker], **kwargs)
+            return Toolkit(tickers, **kwargs)
 
     try:
         toolkit = _init_toolkit(start_dt)
     except Exception as exc:
-        print(f"  [financial data] Toolkit init failed for {ticker}: {exc}")
+        print(f"  [financial data] Toolkit init failed for {len(tickers)} tickers: {exc}")
         return ""
 
     try:
         statement_toolkit = _init_toolkit(statement_start_dt, quarterly=False)
         statement_period_request = "annual (quarterly=False)"
     except Exception as exc:
-        print(f"  [financial data] annual Toolkit init failed for {ticker}: {exc}; falling back to price Toolkit")
+        print(
+            "  [financial data] annual Toolkit init failed for "
+            f"{len(tickers)} tickers: {exc}; falling back to price Toolkit"
+        )
         statement_toolkit = toolkit
         statement_period_request = "default (annual Toolkit unavailable)"
 
@@ -3526,15 +3725,14 @@ def fetch_financial_context(
         quarterly_toolkit = _init_toolkit(quarterly_start_dt, quarterly=True)
         quarterly_period_request = "quarterly (quarterly=True)"
     except Exception as exc:
-        print(f"  [financial data] quarterly Toolkit init failed for {ticker}: {exc}; quarterly statements unavailable")
+        print(
+            "  [financial data] quarterly Toolkit init failed for "
+            f"{len(tickers)} tickers: {exc}; quarterly statements unavailable"
+        )
         quarterly_toolkit = None
         quarterly_period_request = "unavailable"
 
-    # ------------------------------------------------------------------ #
-    # 1. Raw data fetches — each individually guarded                     #
-    # ------------------------------------------------------------------ #
     fetch_status: dict[str, str] = {}
-
     profile = None
     try:
         profile = toolkit.get_profile()
@@ -3543,20 +3741,9 @@ def fetch_financial_context(
         fetch_status["profile"] = f"error: {e}"
 
     hist_raw = None
-    hist_df: "object | None" = None
     try:
         hist_raw = toolkit.get_historical_data()
-        if hist_raw is not None and not hist_raw.empty:
-            if hasattr(hist_raw.columns, "levels"):
-                try:
-                    hist_df = hist_raw.xs(ticker, axis=1, level=1)
-                except KeyError:
-                    hist_df = hist_raw
-            else:
-                hist_df = hist_raw
-            fetch_status["historical"] = "ok"
-        else:
-            fetch_status["historical"] = "empty"
+        fetch_status["historical"] = "ok" if (hist_raw is not None and not hist_raw.empty) else "empty"
     except Exception as e:
         fetch_status["historical"] = f"error: {e}"
 
@@ -3635,6 +3822,285 @@ def fetch_financial_context(
             fetch_status["indicators"] = f"error: {e}"
     else:
         fetch_status["indicators"] = "skipped (include_technicals=False)"
+
+    useful = [s for s in fetch_status.values() if s == "ok"]
+    if not useful:
+        print(
+            f"  [financial data] no usable FMP data for {len(tickers)} tickers "
+            "(tickers may be unsupported or premium-gated)"
+        )
+        return ""
+
+    preloaded_data = {
+        "now": now,
+        "statement_start_dt": statement_start_dt,
+        "quarterly_start_dt": quarterly_start_dt,
+        "statement_period_request": statement_period_request,
+        "quarterly_period_request": quarterly_period_request,
+        "fetch_status": fetch_status,
+        "profile": profile,
+        "hist_raw": hist_raw,
+        "income_raw": income_raw,
+        "balance_raw": balance_raw,
+        "cashflow_raw": cashflow_raw,
+        "debt_to_equity_ratio_raw": debt_to_equity_ratio_raw,
+        "quarterly_income_raw": quarterly_income_raw,
+        "quarterly_balance_raw": quarterly_balance_raw,
+        "quarterly_cashflow_raw": quarterly_cashflow_raw,
+        "indicators_df": indicators_df,
+    }
+
+    fetched_blocks: list[tuple[str, str]] = []
+    for symbol in tickers:
+        try:
+            block = _fetch_single_financial_context(
+                ticker=symbol,
+                date_start=date_start,
+                date_end=date_end,
+                lookback_days=lookback_days,
+                include_technicals=include_technicals,
+                _preloaded_data=preloaded_data,
+            )
+        except Exception as exc:
+            print(f"  [financial data] render failed for {symbol}: {exc}")
+            continue
+        if (block or "").strip():
+            fetched_blocks.append((symbol, block.strip()))
+
+    if not fetched_blocks:
+        return ""
+
+    lines = [
+        "MULTI-TICKER FINANCIAL DATA [F]",
+        "Cite facts from these FinanceToolkit blocks as [F].",
+        "Source: FinancialModelingPrep via FinanceToolkit.",
+        f"Tickers requested: {', '.join(tickers)}",
+    ]
+    for symbol, block in fetched_blocks:
+        lines.append("")
+        lines.append(f"[{symbol}]")
+        lines.append(block)
+    return "\n".join(lines)
+
+
+def _fetch_single_financial_context(
+    ticker: str,
+    date_start: str | None,
+    date_end: str | None,
+    lookback_days: int = 365,
+    include_technicals: bool = False,
+    _preloaded_data: dict[str, Any] | None = None,
+) -> str:
+    """
+    Fetch financial data for *ticker* via FinanceToolkit and return an
+    analysis-ready FINANCIAL DATA [F] block structured in 13 sections plus a quarterly snapshot:
+
+      1. DATA AVAILABILITY       8. CASH FLOW
+      2. COMPANY PROFILE         9. VALUATION
+      3. FINANCIAL SNAPSHOT     10. STOCK PRICE TREND
+      3A. QUARTERLY SNAPSHOT    11. TECHNICAL INDICATORS
+      4. GROWTH
+      5. PROFITABILITY          12. DERIVED CLASSIFICATIONS
+      6. EXPENSE STRUCTURE      13. DATA LIMITATIONS
+      7. LIQUIDITY & LEVERAGE
+
+    Every metric includes its ticker, period/date, units, and an explicit
+    "unavailable — <reason>" marker when the value cannot be computed.
+    No LLM inference is used to fill gaps.
+
+    Returns empty string when FMP_API_KEY is absent, FinanceToolkit is not
+    installed, Toolkit init fails, or no usable data is returned for ticker.
+    """
+    from datetime import datetime, timezone, timedelta
+    now      = datetime.now(timezone.utc)
+    end_dt   = date_end   or now.strftime("%Y-%m-%d")
+    price_lookback_days = max(int(lookback_days or 365), 400)
+    start_dt = date_start or (now - timedelta(days=price_lookback_days)).strftime("%Y-%m-%d")
+    statement_lookback_days = max(int(lookback_days or 365), 365 * 4)
+    default_statement_start_dt = (now - timedelta(days=statement_lookback_days)).strftime("%Y-%m-%d")
+    statement_start_dt = (
+        date_start
+        if date_start and date_start < default_statement_start_dt
+        else default_statement_start_dt
+    )
+    quarterly_lookback_days = max(int(lookback_days or 365), 365 * 2)
+    default_quarterly_start_dt = (now - timedelta(days=quarterly_lookback_days)).strftime("%Y-%m-%d")
+    quarterly_start_dt = (
+        date_start
+        if date_start and date_start < default_quarterly_start_dt
+        else default_quarterly_start_dt
+    )
+
+    if _preloaded_data is not None:
+        now = _preloaded_data.get("now") or now
+        statement_start_dt = _preloaded_data.get("statement_start_dt") or statement_start_dt
+        quarterly_start_dt = _preloaded_data.get("quarterly_start_dt") or quarterly_start_dt
+        statement_period_request = _preloaded_data.get("statement_period_request") or "annual (quarterly=False)"
+        quarterly_period_request = _preloaded_data.get("quarterly_period_request") or "quarterly (quarterly=True)"
+        fetch_status = dict(_preloaded_data.get("fetch_status") or {})
+        profile = _preloaded_data.get("profile")
+        hist_raw = _preloaded_data.get("hist_raw")
+        income_raw = _preloaded_data.get("income_raw")
+        balance_raw = _preloaded_data.get("balance_raw")
+        cashflow_raw = _preloaded_data.get("cashflow_raw")
+        debt_to_equity_ratio_raw = _preloaded_data.get("debt_to_equity_ratio_raw")
+        quarterly_income_raw = _preloaded_data.get("quarterly_income_raw")
+        quarterly_balance_raw = _preloaded_data.get("quarterly_balance_raw")
+        quarterly_cashflow_raw = _preloaded_data.get("quarterly_cashflow_raw")
+        indicators_df = _preloaded_data.get("indicators_df")
+    else:
+        api_key = os.getenv("FMP_API_KEY", "").strip()
+        if not api_key:
+            return ""
+
+        try:
+            from financetoolkit import Toolkit
+        except ImportError:
+            return ""
+
+        def _init_toolkit(start_date: str, *, quarterly: bool | None = None):
+            kwargs = {
+                "api_key": api_key,
+                "start_date": start_date,
+                "end_date": end_dt,
+            }
+            if quarterly is not None:
+                kwargs["quarterly"] = quarterly
+            try:
+                return Toolkit([ticker], **kwargs)
+            except TypeError:
+                # Older FinanceToolkit versions may not expose the quarterly kwarg.
+                if quarterly is None:
+                    raise
+                kwargs.pop("quarterly", None)
+                return Toolkit([ticker], **kwargs)
+
+        try:
+            toolkit = _init_toolkit(start_dt)
+        except Exception as exc:
+            print(f"  [financial data] Toolkit init failed for {ticker}: {exc}")
+            return ""
+
+        try:
+            statement_toolkit = _init_toolkit(statement_start_dt, quarterly=False)
+            statement_period_request = "annual (quarterly=False)"
+        except Exception as exc:
+            print(f"  [financial data] annual Toolkit init failed for {ticker}: {exc}; falling back to price Toolkit")
+            statement_toolkit = toolkit
+            statement_period_request = "default (annual Toolkit unavailable)"
+
+        try:
+            quarterly_toolkit = _init_toolkit(quarterly_start_dt, quarterly=True)
+            quarterly_period_request = "quarterly (quarterly=True)"
+        except Exception as exc:
+            print(f"  [financial data] quarterly Toolkit init failed for {ticker}: {exc}; quarterly statements unavailable")
+            quarterly_toolkit = None
+            quarterly_period_request = "unavailable"
+
+        # ------------------------------------------------------------------ #
+        # 1. Raw data fetches — each individually guarded                     #
+        # ------------------------------------------------------------------ #
+        fetch_status: dict[str, str] = {}
+
+        profile = None
+        try:
+            profile = toolkit.get_profile()
+            fetch_status["profile"] = "ok" if (profile is not None and not profile.empty) else "empty"
+        except Exception as e:
+            fetch_status["profile"] = f"error: {e}"
+
+        hist_raw = None
+        try:
+            hist_raw = toolkit.get_historical_data()
+            fetch_status["historical"] = "ok" if (hist_raw is not None and not hist_raw.empty) else "empty"
+        except Exception as e:
+            fetch_status["historical"] = f"error: {e}"
+
+        income_raw = None
+        try:
+            income_raw = statement_toolkit.get_income_statement()
+            fetch_status["income"] = "ok" if (income_raw is not None and not income_raw.empty) else "empty"
+        except Exception as e:
+            fetch_status["income"] = f"error: {e}"
+
+        balance_raw = None
+        try:
+            balance_raw = statement_toolkit.get_balance_sheet_statement()
+            fetch_status["balance"] = "ok" if (balance_raw is not None and not balance_raw.empty) else "empty"
+        except Exception as e:
+            fetch_status["balance"] = f"error: {e}"
+
+        cashflow_raw = None
+        try:
+            cashflow_raw = statement_toolkit.get_cash_flow_statement()
+            fetch_status["cashflow"] = "ok" if (cashflow_raw is not None and not cashflow_raw.empty) else "empty"
+        except Exception as e:
+            fetch_status["cashflow"] = f"error: {e}"
+
+        debt_to_equity_ratio_raw = None
+        try:
+            debt_to_equity_ratio_raw = statement_toolkit.ratios.get_debt_to_equity_ratio(rounding=6)
+            fetch_status["debt_to_equity_ratio"] = (
+                "ok"
+                if debt_to_equity_ratio_raw is not None and not debt_to_equity_ratio_raw.empty
+                else "empty"
+            )
+        except Exception as e:
+            fetch_status["debt_to_equity_ratio"] = f"error: {e}"
+
+        quarterly_income_raw = None
+        quarterly_balance_raw = None
+        quarterly_cashflow_raw = None
+        if quarterly_toolkit is not None:
+            try:
+                quarterly_income_raw = quarterly_toolkit.get_income_statement()
+                fetch_status["income_quarterly"] = (
+                    "ok" if (quarterly_income_raw is not None and not quarterly_income_raw.empty) else "empty"
+                )
+            except Exception as e:
+                fetch_status["income_quarterly"] = f"error: {e}"
+
+            try:
+                quarterly_balance_raw = quarterly_toolkit.get_balance_sheet_statement()
+                fetch_status["balance_quarterly"] = (
+                    "ok" if (quarterly_balance_raw is not None and not quarterly_balance_raw.empty) else "empty"
+                )
+            except Exception as e:
+                fetch_status["balance_quarterly"] = f"error: {e}"
+
+            try:
+                quarterly_cashflow_raw = quarterly_toolkit.get_cash_flow_statement()
+                fetch_status["cashflow_quarterly"] = (
+                    "ok" if (quarterly_cashflow_raw is not None and not quarterly_cashflow_raw.empty) else "empty"
+                )
+            except Exception as e:
+                fetch_status["cashflow_quarterly"] = f"error: {e}"
+        else:
+            fetch_status["income_quarterly"] = "skipped (quarterly Toolkit unavailable)"
+            fetch_status["balance_quarterly"] = "skipped (quarterly Toolkit unavailable)"
+            fetch_status["cashflow_quarterly"] = "skipped (quarterly Toolkit unavailable)"
+
+        indicators_df = None
+        if include_technicals:
+            try:
+                indicators_df = toolkit.technicals.collect_all_indicators()
+                fetch_status["indicators"] = (
+                    "ok" if (indicators_df is not None and not indicators_df.empty) else "empty"
+                )
+            except Exception as e:
+                fetch_status["indicators"] = f"error: {e}"
+        else:
+            fetch_status["indicators"] = "skipped (include_technicals=False)"
+
+    hist_df: "object | None" = None
+    if hist_raw is not None and not hist_raw.empty:
+        if hasattr(hist_raw.columns, "levels"):
+            try:
+                hist_df = hist_raw.xs(ticker, axis=1, level=1)
+            except KeyError:
+                hist_df = hist_raw
+        else:
+            hist_df = hist_raw
 
     # Bail early if nothing at all came back
     useful = [s for s in fetch_status.values() if s == "ok"]
@@ -5908,6 +6374,28 @@ def _dump_query_contexts(
     return full_dump_path, fin_dump_path, news_dump_path
 
 
+def _dump_financial_context_only(
+    *,
+    base_dir: str,
+    query: str,
+    final_route: str,
+    timestamp: str,
+    financial_context: str,
+) -> str:
+    fin_dump_path = os.path.join(base_dir, "query_fin_context.txt")
+    with open(fin_dump_path, "w", encoding="utf-8") as f:
+        f.write(f"QUERY      : {query}\n")
+        f.write(f"ROUTE      : {final_route}\n")
+        f.write(f"TIMESTAMP  : {timestamp}\n")
+        f.write(f"FIN_CTX    : {'present' if (financial_context or '').strip() else 'absent'}\n")
+        f.write("=" * 80 + "\n\n")
+        if (financial_context or "").strip():
+            f.write(financial_context.strip())
+        else:
+            f.write("No FINANCIAL DATA [F] block captured for this query.")
+    return fin_dump_path
+
+
 def build_signal_context(
     query: str,
     target: QueryTarget,
@@ -6279,11 +6767,12 @@ def run_query_once(
         financial_intent=financial_intent,
         explicit_latest_news_intent=explicit_latest_news_intent,
     )
-    sub_queries = (
-        [_extract_single_time_range(query)]
-        if route_seed == "single_ticker_financial"
-        else resolve_temporal_carryover(decompose_query(query, gen_client), memory)
-    )
+    if route_seed == "single_ticker_financial":
+        sub_queries = [_extract_single_time_range(query)]
+    elif route_seed == "market_tickers_today":
+        sub_queries = []
+    else:
+        sub_queries = resolve_temporal_carryover(decompose_query(query, gen_client), memory)
 
     all_contexts: list[str] = []
     all_urls: list[str] = []
@@ -6311,6 +6800,8 @@ def run_query_once(
         logs.append(f"  [decomposed into {len(sub_queries)} sub-queries]")
     if route_seed == "single_ticker_financial":
         logs.append("  [route_type=single_ticker_financial]")
+    if route_seed == "market_tickers_today":
+        logs.append("  [route_type=market_tickers_today]")
 
     def _compact_candidate(candidate: dict[str, Any]) -> dict[str, Any]:
         return {
@@ -6418,6 +6909,161 @@ def run_query_once(
             "contradiction_signals": False,
             "date_start": primary_date_start,
             "date_end": primary_date_end,
+        }
+
+    if route_seed == "market_tickers_today":
+        primary_target = QueryTarget(
+            query_type=QUERY_TYPE_GENERAL,
+            canonical_name=None,
+            display_name="market ticker screen",
+            ticker=None,
+            entity_type=None,
+            confidence=0.0,
+            resolution_mode="market_tickers_today",
+        )
+        overlap_tickers = fetch_today_market_overlap_tickers()
+        if not overlap_tickers:
+            retrieval_traces.append(
+                {
+                    "sub_query": query,
+                    "date_start": None,
+                    "date_end": None,
+                    "route_type": "market_tickers_today",
+                    "candidate_count": 0,
+                    "ranked_count": 0,
+                    "ranked_candidates": [],
+                    "finance_context_present": False,
+                    "news_context_present": False,
+                    "ticker_count": 0,
+                    "tickers": [],
+                }
+            )
+            logs.append("  [market tickers] no overlapping Yahoo screener tickers found")
+            return _empty_result(
+                (
+                    "Answer: No overlapping market tickers were retrieved from Yahoo screeners today.\n"
+                    "Evidence: The Yahoo screener overlap list was empty or unavailable.\n"
+                    "Theory: The market-tickers route needs at least one ticker appearing in multiple configured screeners."
+                ),
+                "market_tickers_today",
+            )
+
+        fin_ctx = fetch_financial_context(
+            ticker=overlap_tickers,
+            date_start=None,
+            date_end=None,
+            include_technicals=True,
+        )
+        finance_context_present = bool((fin_ctx or "").strip())
+        retrieval_traces.append(
+            {
+                "sub_query": query,
+                "date_start": None,
+                "date_end": None,
+                "route_type": "market_tickers_today",
+                "candidate_count": len(overlap_tickers),
+                "ranked_count": 0,
+                "ranked_candidates": [],
+                "finance_context_present": finance_context_present,
+                "news_context_present": False,
+                "ticker_count": len(overlap_tickers),
+                "tickers": overlap_tickers,
+            }
+        )
+        logs.append(f"  [market tickers] overlap tickers={len(overlap_tickers)}")
+        if not finance_context_present:
+            logs.append("  [financial data] no usable [F] blocks for market ticker overlap list")
+            return _empty_result(
+                (
+                    "Answer: No usable FINANCIAL DATA [F] blocks were retrieved for today's market ticker overlap list.\n"
+                    "Evidence: FinanceToolkit returned no usable data for the overlap tickers.\n"
+                    "Theory: The tickers may be unsupported, premium-gated, or unavailable from the configured data provider."
+                ),
+                "market_tickers_today",
+            )
+
+        logs.append("  [financial data] fetched multi-ticker [F] context")
+        fin_dump_path = ""
+        try:
+            import datetime as _dt
+            _ts = _dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+            fin_dump_path = _dump_financial_context_only(
+                base_dir=os.path.dirname(os.path.abspath(__file__)),
+                query=query,
+                final_route="market_tickers_today",
+                timestamp=_ts,
+                financial_context=fin_ctx,
+            )
+            logs.append(f"  [context dump] {fin_dump_path}")
+        except Exception as _dump_exc:
+            logs.append(f"  [context dump] failed: {_dump_exc}")
+
+        final_answer = (
+            "Financial context written to query_fin_context.txt "
+            f"for {len(overlap_tickers)} overlap ticker(s)."
+        )
+        if fin_dump_path:
+            final_answer += f"\nPath: {fin_dump_path}"
+
+        resolved_target = {
+            "canonical_name": None,
+            "display_name": primary_target.display_name,
+            "ticker": None,
+            "query_type": primary_target.query_type,
+            "entity_type": None,
+            "best_candidate": None,
+            "candidates": [],
+            "ambiguity_score": 0.0,
+            "resolution_mode": primary_target.resolution_mode,
+            "needs_disambiguation": False,
+        }
+        retrieval_trace_payload = {
+            "route_type": "market_tickers_today",
+            "route_profile": _resolve_route_profile("market_tickers_today"),
+            "scoring_weights": _resolve_scoring_weights("market_tickers_today"),
+            "selected_chunk_count": 0,
+            "finance_context_present": True,
+            "news_context_present": False,
+            "news_query": "",
+            "news_item_count": 0,
+            "ticker_count": len(overlap_tickers),
+            "tickers": overlap_tickers,
+            "financial_context_path": fin_dump_path,
+            "sub_trace_count": len(retrieval_traces),
+            "sub_traces": retrieval_traces,
+        }
+        return {
+            "run_id": run_id,
+            "query": query,
+            "answer": final_answer,
+            "chunks": [],
+            "urls": [],
+            "logs": logs,
+            "citation_map": {},
+            "provenance": "Why this answer: FINANCIAL DATA [F] only.",
+            "target": primary_target,
+            "resolved_target": resolved_target,
+            "resolved_target_json": resolved_target,
+            "route_type": "market_tickers_today",
+            "retrieval_trace": retrieval_trace_payload,
+            "answer_confidence": 78.0,
+            "decision": "answer",
+            "answer_meta": {
+                "answer_confidence": 78.0,
+                "decision": "answer",
+                "route_type": "market_tickers_today",
+                "signals": {
+                    "finance_context_present": True,
+                    "ticker_count": len(overlap_tickers),
+                    "financial_context_path": fin_dump_path,
+                },
+                "contradiction_signals": False,
+            },
+            "selected_macro_events": [],
+            "selected_signals": [],
+            "contradiction_signals": False,
+            "date_start": None,
+            "date_end": None,
         }
 
     if route_seed == "single_ticker_financial":
