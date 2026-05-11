@@ -2873,18 +2873,32 @@ def _default_analyst_payload() -> list[Any]:
     return []
 
 
-def _market_ticker_analyst_estimate_window(now: datetime | None = None) -> tuple[str, str]:
-    current = (now or datetime.now()).date()
-    if current.month == 12:
-        start_year = current.year + 1
-        start_month = 1
-    else:
-        start_year = current.year
-        start_month = current.month + 1
+def _market_ticker_analyst_estimate_years(now: datetime | None = None) -> tuple[int, int]:
+    current_year = (now or datetime.now()).year
+    return current_year, current_year + 1
 
-    start_dt = datetime(start_year, start_month, 1)
-    end_dt = start_dt.replace(year=start_dt.year + 1)
-    return start_dt.strftime("%Y-%m-%d"), end_dt.strftime("%Y-%m-%d")
+
+def _market_ticker_analyst_estimate_window(now: datetime | None = None) -> tuple[str, str]:
+    current_year, next_year = _market_ticker_analyst_estimate_years(now)
+    return f"{current_year}-01-01", f"{next_year}-12-31"
+
+
+def _estimate_row_year(row: Any) -> int | None:
+    if not isinstance(row, dict):
+        return None
+    raw_date = str(row.get("date") or "").strip()
+    if len(raw_date) < 4:
+        return None
+    try:
+        return int(raw_date[:4])
+    except ValueError:
+        return None
+
+
+def _filter_analyst_estimates_to_years(payload: Any, years: set[int]) -> Any:
+    if not isinstance(payload, list):
+        return payload
+    return [row for row in payload if _estimate_row_year(row) in years]
 
 
 def _call_analyst_endpoint(
@@ -2915,6 +2929,20 @@ def _fetch_market_ticker_consensus(symbol: str) -> dict[str, Any]:
 def _build_market_ticker_analyst_payload(item: tuple[str, Any, str, str]) -> dict[str, Any]:
     symbol, consensus_payload, estimate_date_start, estimate_date_end = item
     errors: dict[str, str] = {}
+    analyst_estimates = _call_analyst_endpoint(
+        symbol=symbol,
+        key="analyst_estimates",
+        func=get_analyst_estimates,
+        errors=errors,
+        func_kwargs={
+            "date_from": estimate_date_start,
+            "date_to": estimate_date_end,
+        },
+    )
+    analyst_estimate_years = {
+        int(estimate_date_start[:4]),
+        int(estimate_date_end[:4]),
+    }
     return {
         "symbol": symbol,
         "grades_consensus": consensus_payload,
@@ -2936,15 +2964,9 @@ def _build_market_ticker_analyst_payload(item: tuple[str, Any, str, str]) -> dic
             func=get_ratings_snapshot,
             errors=errors,
         ),
-        "analyst_estimates": _call_analyst_endpoint(
-            symbol=symbol,
-            key="analyst_estimates",
-            func=get_analyst_estimates,
-            errors=errors,
-            func_kwargs={
-                "date_from": estimate_date_start,
-                "date_to": estimate_date_end,
-            },
+        "analyst_estimates": _filter_analyst_estimates_to_years(
+            analyst_estimates,
+            analyst_estimate_years,
         ),
         "errors": errors,
     }
@@ -2968,6 +2990,7 @@ def build_market_ticker_analyst_context(
             "date_start": estimate_date_start,
             "date_end": estimate_date_end,
             "period": "annual",
+            "years": [int(estimate_date_start[:4]), int(estimate_date_end[:4])],
         },
         "ticker_counts": {
             "screened": len(tickers),
