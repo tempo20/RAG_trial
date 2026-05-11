@@ -464,7 +464,6 @@ def load_prompt_templates(path: Path) -> tuple[str, str, str, str]:
             "Confidence Rationale must explain why the specific number is above, below, or near 0.50 by weighing the most important bullish evidence against the most important bearish or uncertainty evidence from [F]. "
             "Keep the full response around 150-250 words and avoid repeating the same metric in multiple sections. "
             "If FINANCIAL DATA [F] is missing or unusable, state that there is insufficient financial data [F] to answer. "
-            "Your article database covers {date_min} to {date_max}."
         )
     else:
         single_ticker_financial_prompt = _coerce_prompt_template(
