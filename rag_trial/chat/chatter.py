@@ -66,7 +66,6 @@ from rag_trial.paths import (
     env_str_path,
 )
 from rag_trial.chat.fmp_functions import (
-    get_analyst_estimates,
     get_grades_consensus,
     get_price_target_consensus,
     get_price_target_summary,
@@ -2873,34 +2872,6 @@ def _default_analyst_payload() -> list[Any]:
     return []
 
 
-def _market_ticker_analyst_estimate_years(now: datetime | None = None) -> tuple[int, int]:
-    current_year = (now or datetime.now()).year
-    return current_year, current_year + 1
-
-
-def _market_ticker_analyst_estimate_window(now: datetime | None = None) -> tuple[str, str]:
-    current_year, next_year = _market_ticker_analyst_estimate_years(now)
-    return f"{current_year}-01-01", f"{next_year}-12-31"
-
-
-def _estimate_row_year(row: Any) -> int | None:
-    if not isinstance(row, dict):
-        return None
-    raw_date = str(row.get("date") or "").strip()
-    if len(raw_date) < 4:
-        return None
-    try:
-        return int(raw_date[:4])
-    except ValueError:
-        return None
-
-
-def _filter_analyst_estimates_to_years(payload: Any, years: set[int]) -> Any:
-    if not isinstance(payload, list):
-        return payload
-    return [row for row in payload if _estimate_row_year(row) in years]
-
-
 def _call_analyst_endpoint(
     *,
     symbol: str,
@@ -2926,23 +2897,9 @@ def _fetch_market_ticker_consensus(symbol: str) -> dict[str, Any]:
         return {"symbol": symbol, "payload": _default_analyst_payload(), "error": str(exc)}
 
 
-def _build_market_ticker_analyst_payload(item: tuple[str, Any, str, str]) -> dict[str, Any]:
-    symbol, consensus_payload, estimate_date_start, estimate_date_end = item
+def _build_market_ticker_analyst_payload(item: tuple[str, Any]) -> dict[str, Any]:
+    symbol, consensus_payload = item
     errors: dict[str, str] = {}
-    analyst_estimates = _call_analyst_endpoint(
-        symbol=symbol,
-        key="analyst_estimates",
-        func=get_analyst_estimates,
-        errors=errors,
-        func_kwargs={
-            "date_from": estimate_date_start,
-            "date_to": estimate_date_end,
-        },
-    )
-    analyst_estimate_years = {
-        int(estimate_date_start[:4]),
-        int(estimate_date_end[:4]),
-    }
     return {
         "symbol": symbol,
         "grades_consensus": consensus_payload,
@@ -2964,10 +2921,6 @@ def _build_market_ticker_analyst_payload(item: tuple[str, Any, str, str]) -> dic
             func=get_ratings_snapshot,
             errors=errors,
         ),
-        "analyst_estimates": _filter_analyst_estimates_to_years(
-            analyst_estimates,
-            analyst_estimate_years,
-        ),
         "errors": errors,
     }
 
@@ -2978,7 +2931,6 @@ def build_market_ticker_analyst_context(
     tickers: list[str],
     timestamp: str,
 ) -> dict[str, Any]:
-    estimate_date_start, estimate_date_end = _market_ticker_analyst_estimate_window()
     context: dict[str, Any] = {
         "query": query,
         "route": "market_tickers_today",
@@ -2986,12 +2938,6 @@ def build_market_ticker_analyst_context(
         "source": "FinancialModelingPrep stable endpoints via rag_trial.chat.fmp_functions",
         "screeners": list(SCREENERS),
         "accepted_consensus": sorted(ACCEPTED_ANALYST_CONSENSUS),
-        "analyst_estimates_window": {
-            "date_start": estimate_date_start,
-            "date_end": estimate_date_end,
-            "period": "annual",
-            "years": [int(estimate_date_start[:4]), int(estimate_date_end[:4])],
-        },
         "ticker_counts": {
             "screened": len(tickers),
             "passed_consensus_filter": 0,
@@ -3008,7 +2954,7 @@ def build_market_ticker_analyst_context(
         progress_label="analyst consensus",
         progress_unit="ticker",
     )
-    passed_symbols: list[tuple[str, Any, str, str]] = []
+    passed_symbols: list[tuple[str, Any]] = []
     for result in consensus_results:
         symbol = str(result.get("symbol") or "").strip().upper()
         consensus_payload = result.get("payload", _default_analyst_payload())
@@ -3044,7 +2990,7 @@ def build_market_ticker_analyst_context(
             )
             continue
 
-        passed_symbols.append((symbol, consensus_payload, estimate_date_start, estimate_date_end))
+        passed_symbols.append((symbol, consensus_payload))
 
     context["tickers"].extend(
         _parallel_map_ordered(
