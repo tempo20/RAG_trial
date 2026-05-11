@@ -28,6 +28,10 @@ def get_grades(symbol: str, *, timeout: int = 30) -> Any:
     return _fmp_get("grades", {"symbol": symbol}, timeout=timeout)
 
 
+def get_grades_consensus(symbol: str, *, timeout: int = 30) -> Any:
+    return _fmp_get("grades-consensus", {"symbol": symbol}, timeout=timeout)
+
+
 def get_price_target_consensus(symbol: str, *, timeout: int = 30) -> Any:
     return _fmp_get("price-target-consensus", {"symbol": symbol}, timeout=timeout)
 
@@ -50,11 +54,18 @@ def get_analyst_estimates(
     period: str = "annual",
     page: int = 0,
     limit: int = 10,
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
     timeout: int = 30,
 ) -> Any:
+    params: Dict[str, Any] = {"symbol": symbol, "period": period, "page": page, "limit": limit}
+    if date_from:
+        params["from"] = date_from
+    if date_to:
+        params["to"] = date_to
     return _fmp_get(
         "analyst-estimates",
-        {"symbol": symbol, "period": period, "page": page, "limit": limit},
+        params,
         timeout=timeout,
     )
 

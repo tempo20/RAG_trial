@@ -7,11 +7,14 @@ import os
 import re
 import sqlite3
 import sys
+import threading
 import time
 import warnings
-from collections import Counter, defaultdict
+from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import datetime, timezone, timedelta
+from math import ceil
 from pathlib import Path
 from typing import Any, Optional
 
@@ -62,6 +65,13 @@ from rag_trial.paths import (
     env_path,
     env_str_path,
 )
+from rag_trial.chat.fmp_functions import (
+    get_analyst_estimates,
+    get_grades_consensus,
+    get_price_target_consensus,
+    get_price_target_summary,
+    get_ratings_snapshot,
+)
 
 # Config
 
@@ -91,9 +101,25 @@ SUMMARY_MIN_FULL_CONTEXT_CHUNKS = int(os.getenv("SUMMARY_MIN_FULL_CONTEXT_CHUNKS
 SINGLE_TICKER_NEWS_MAX_ITEMS = int(os.getenv("SINGLE_TICKER_NEWS_MAX_ITEMS", "5"))
 SINGLE_TICKER_NEWS_TIMEOUT_SECONDS = float(os.getenv("SINGLE_TICKER_NEWS_TIMEOUT_SECONDS", "10"))
 GDELT_DOC_SEARCH_URL = "https://api.gdeltproject.org/api/v2/doc/doc"
-FINANCIAL_TOOLKIT_RATE_LIMIT_PER_MIN = int(os.getenv("FINANCIAL_TOOLKIT_RATE_LIMIT_PER_MIN", "300"))
+FINANCIAL_DATA_RATE_LIMIT_PER_MIN = int(
+    os.getenv(
+        "FINANCIAL_DATA_RATE_LIMIT_PER_MIN",
+        os.getenv("FINANCIAL_TOOLKIT_RATE_LIMIT_PER_MIN", "300"),
+    )
+)
+FINANCIAL_DATA_RATE_LIMIT_BUFFER = float(
+    os.getenv(
+        "FINANCIAL_DATA_RATE_LIMIT_BUFFER",
+        os.getenv("FINANCIAL_TOOLKIT_RATE_LIMIT_BUFFER", "0.8"),
+    )
+)
+FINANCIAL_TOOLKIT_RATE_LIMIT_PER_MIN = int(
+    os.getenv("FINANCIAL_TOOLKIT_RATE_LIMIT_PER_MIN", str(FINANCIAL_DATA_RATE_LIMIT_PER_MIN))
+)
 FINANCIAL_TOOLKIT_ESTIMATED_CALLS_PER_TICKER = float(os.getenv("FINANCIAL_TOOLKIT_ESTIMATED_CALLS_PER_TICKER", "10"))
-FINANCIAL_TOOLKIT_RATE_LIMIT_BUFFER = float(os.getenv("FINANCIAL_TOOLKIT_RATE_LIMIT_BUFFER", "0.8"))
+FINANCIAL_TOOLKIT_RATE_LIMIT_BUFFER = float(
+    os.getenv("FINANCIAL_TOOLKIT_RATE_LIMIT_BUFFER", str(FINANCIAL_DATA_RATE_LIMIT_BUFFER))
+)
 FINANCIAL_TOOLKIT_BATCH_COOLDOWN_SECONDS = float(os.getenv("FINANCIAL_TOOLKIT_BATCH_COOLDOWN_SECONDS", "61"))
 FINANCIAL_TOOLKIT_MAX_BATCH_TICKERS = int(os.getenv("FINANCIAL_TOOLKIT_MAX_BATCH_TICKERS", "0"))
 SUMMARY_TERMS = (
@@ -501,6 +527,10 @@ SCREENERS = [
     "undervalued_growth_stocks",
     "undervalued_large_caps",
 ]
+ACCEPTED_ANALYST_CONSENSUS = {"buy", "strongbuy"}
+MARKET_TICKERS_SCREENER_WORKERS = int(os.getenv("MARKET_TICKERS_SCREENER_WORKERS", str(len(SCREENERS))))
+MARKET_TICKERS_ANALYST_WORKERS = int(os.getenv("MARKET_TICKERS_ANALYST_WORKERS", "8"))
+MARKET_TICKERS_MAX_SCREENED = int(os.getenv("MARKET_TICKERS_MAX_SCREENED", "0"))
 
 SINGLE_TICKER_FINANCIAL_INTENT_HINTS = (
     "performance",
@@ -2623,6 +2653,146 @@ def fetch_market_context(
     return "\n".join(lines)
 
 
+_FINANCIAL_DATA_RATE_LOCK = threading.Lock()
+_FINANCIAL_DATA_NEXT_REQUEST_AT = 0.0
+
+
+def _effective_financial_data_rate_per_minute() -> int:
+    return max(int(FINANCIAL_DATA_RATE_LIMIT_PER_MIN * FINANCIAL_DATA_RATE_LIMIT_BUFFER), 1)
+
+
+def _acquire_financial_data_requests(request_count: float = 1) -> None:
+    global _FINANCIAL_DATA_NEXT_REQUEST_AT
+
+    permits = max(int(ceil(float(request_count or 0))), 0)
+    if permits <= 0:
+        return
+
+    interval_seconds = 60.0 / _effective_financial_data_rate_per_minute()
+    for _ in range(permits):
+        with _FINANCIAL_DATA_RATE_LOCK:
+            now = time.monotonic()
+            wait_seconds = max(_FINANCIAL_DATA_NEXT_REQUEST_AT - now, 0.0)
+            _FINANCIAL_DATA_NEXT_REQUEST_AT = max(now, _FINANCIAL_DATA_NEXT_REQUEST_AT) + interval_seconds
+        if wait_seconds > 0:
+            time.sleep(wait_seconds)
+
+
+def _reserve_financial_data_requests(request_count: float = 1) -> None:
+    global _FINANCIAL_DATA_NEXT_REQUEST_AT
+
+    permits = max(int(ceil(float(request_count or 0))), 0)
+    if permits <= 0:
+        return
+
+    interval_seconds = 60.0 / _effective_financial_data_rate_per_minute()
+    with _FINANCIAL_DATA_RATE_LOCK:
+        now = time.monotonic()
+        _FINANCIAL_DATA_NEXT_REQUEST_AT = max(now, _FINANCIAL_DATA_NEXT_REQUEST_AT) + (permits * interval_seconds)
+
+
+def _reserve_financial_toolkit_budget(ticker_count: int) -> None:
+    _reserve_financial_data_requests(max(ticker_count, 1) * FINANCIAL_TOOLKIT_ESTIMATED_CALLS_PER_TICKER)
+
+
+def _resolve_worker_count(configured_workers: int, item_count: int) -> int:
+    if item_count <= 0:
+        return 0
+    return max(min(int(configured_workers or 1), item_count), 1)
+
+
+def _progress_interval(total: int) -> int:
+    return max(1, min(25, total // 10 or 1))
+
+
+def _start_progress(
+    *,
+    progress_label: str | None,
+    progress_unit: str,
+    total: int,
+    worker_count: int,
+) -> tuple[Any, dict[str, Any] | None]:
+    if not progress_label or total <= 0:
+        return None, None
+
+    try:
+        from tqdm import tqdm
+    except ImportError:
+        print(
+            f"  [{progress_label}] starting {total} {progress_unit}(s) "
+            f"with {worker_count} worker(s)"
+        )
+        return None, {
+            "label": progress_label,
+            "unit": progress_unit,
+            "total": total,
+            "interval": _progress_interval(total),
+        }
+
+    return tqdm(total=total, desc=progress_label, unit=progress_unit), None
+
+
+def _advance_progress(progress_bar: Any, fallback: dict[str, Any] | None, completed: int) -> None:
+    if progress_bar is not None:
+        progress_bar.update(1)
+        return
+    if not fallback:
+        return
+
+    total = int(fallback["total"])
+    interval = int(fallback["interval"])
+    if completed == total or completed % interval == 0:
+        print(
+            f"  [{fallback['label']}] completed {completed}/{total} "
+            f"{fallback['unit']}(s)"
+        )
+
+
+def _close_progress(progress_bar: Any) -> None:
+    if progress_bar is not None:
+        progress_bar.close()
+
+
+def _parallel_map_ordered(
+    items: list[Any],
+    configured_workers: int,
+    func,
+    *,
+    progress_label: str | None = None,
+    progress_unit: str = "item",
+) -> list[Any]:
+    worker_count = _resolve_worker_count(configured_workers, len(items))
+    progress_bar, fallback = _start_progress(
+        progress_label=progress_label,
+        progress_unit=progress_unit,
+        total=len(items),
+        worker_count=worker_count,
+    )
+    completed = 0
+    try:
+        if worker_count <= 1:
+            results = []
+            for item in items:
+                results.append(func(item))
+                completed += 1
+                _advance_progress(progress_bar, fallback, completed)
+            return results
+
+        results: list[Any] = [None] * len(items)
+        with ThreadPoolExecutor(max_workers=worker_count) as executor:
+            future_to_index = {
+                executor.submit(func, item): index
+                for index, item in enumerate(items)
+            }
+            for future in as_completed(future_to_index):
+                results[future_to_index[future]] = future.result()
+                completed += 1
+                _advance_progress(progress_bar, fallback, completed)
+        return results
+    finally:
+        _close_progress(progress_bar)
+
+
 def fetch_yahoo_screener(scr_id: str, count: int = 100):
     try:
         import pandas as pd
@@ -2650,20 +2820,223 @@ def fetch_yahoo_screener(scr_id: str, count: int = 100):
     return df[existing_cols]
 
 
-def fetch_today_market_overlap_tickers(count: int = 100) -> list[str]:
-    all_tickers_list: list[str] = []
-    for screener in SCREENERS:
+def fetch_today_market_screen_tickers(count: int = 100) -> list[str]:
+    def _fetch_screener_symbols(screener: str) -> list[str]:
         df = fetch_yahoo_screener(screener, count=count)
         if not hasattr(df, "empty") or df.empty or "symbol" not in df.columns:
-            continue
-        all_tickers_list.extend(
-            str(symbol).strip().upper()
-            for symbol in df["symbol"].dropna().tolist()
-            if str(symbol).strip()
-        )
+            return []
+        return [
+            str(raw_symbol).strip().upper()
+            for raw_symbol in df["symbol"].dropna().tolist()
+            if str(raw_symbol).strip()
+        ]
 
-    ticker_counts = Counter(all_tickers_list)
-    return [ticker for ticker, n in ticker_counts.items() if n > 1]
+    tickers: list[str] = []
+    seen: set[str] = set()
+    screener_symbols = _parallel_map_ordered(
+        list(SCREENERS),
+        MARKET_TICKERS_SCREENER_WORKERS,
+        _fetch_screener_symbols,
+        progress_label="market screeners",
+        progress_unit="screener",
+    )
+    for symbols in screener_symbols:
+        for symbol in symbols:
+            if not symbol or symbol in seen:
+                continue
+            seen.add(symbol)
+            tickers.append(symbol)
+            if MARKET_TICKERS_MAX_SCREENED > 0 and len(tickers) >= MARKET_TICKERS_MAX_SCREENED:
+                return tickers
+
+    return tickers
+
+
+def _normalize_analyst_consensus(value: Any) -> str:
+    return re.sub(r"\s+", "", str(value or "").strip().lower())
+
+
+def _extract_consensus_values(payload: Any) -> list[str]:
+    values: list[str] = []
+    if isinstance(payload, dict):
+        if "consensus" in payload:
+            values.append(str(payload.get("consensus") or ""))
+        for value in payload.values():
+            values.extend(_extract_consensus_values(value))
+    elif isinstance(payload, list):
+        for item in payload:
+            values.extend(_extract_consensus_values(item))
+    return values
+
+
+def _default_analyst_payload() -> list[Any]:
+    return []
+
+
+def _market_ticker_analyst_estimate_window(now: datetime | None = None) -> tuple[str, str]:
+    current = (now or datetime.now()).date()
+    if current.month == 12:
+        start_year = current.year + 1
+        start_month = 1
+    else:
+        start_year = current.year
+        start_month = current.month + 1
+
+    start_dt = datetime(start_year, start_month, 1)
+    end_dt = start_dt.replace(year=start_dt.year + 1)
+    return start_dt.strftime("%Y-%m-%d"), end_dt.strftime("%Y-%m-%d")
+
+
+def _call_analyst_endpoint(
+    *,
+    symbol: str,
+    key: str,
+    func,
+    errors: dict[str, str],
+    func_kwargs: dict[str, Any] | None = None,
+) -> Any:
+    try:
+        _acquire_financial_data_requests()
+        payload = func(symbol, **dict(func_kwargs or {}))
+    except Exception as exc:
+        errors[key] = str(exc)
+        return _default_analyst_payload()
+    return payload
+
+
+def _fetch_market_ticker_consensus(symbol: str) -> dict[str, Any]:
+    try:
+        _acquire_financial_data_requests()
+        return {"symbol": symbol, "payload": get_grades_consensus(symbol), "error": ""}
+    except Exception as exc:
+        return {"symbol": symbol, "payload": _default_analyst_payload(), "error": str(exc)}
+
+
+def _build_market_ticker_analyst_payload(item: tuple[str, Any, str, str]) -> dict[str, Any]:
+    symbol, consensus_payload, estimate_date_start, estimate_date_end = item
+    errors: dict[str, str] = {}
+    return {
+        "symbol": symbol,
+        "grades_consensus": consensus_payload,
+        "price_target_consensus": _call_analyst_endpoint(
+            symbol=symbol,
+            key="price_target_consensus",
+            func=get_price_target_consensus,
+            errors=errors,
+        ),
+        "price_target_summary": _call_analyst_endpoint(
+            symbol=symbol,
+            key="price_target_summary",
+            func=get_price_target_summary,
+            errors=errors,
+        ),
+        "ratings_snapshot": _call_analyst_endpoint(
+            symbol=symbol,
+            key="ratings_snapshot",
+            func=get_ratings_snapshot,
+            errors=errors,
+        ),
+        "analyst_estimates": _call_analyst_endpoint(
+            symbol=symbol,
+            key="analyst_estimates",
+            func=get_analyst_estimates,
+            errors=errors,
+            func_kwargs={
+                "date_from": estimate_date_start,
+                "date_to": estimate_date_end,
+            },
+        ),
+        "errors": errors,
+    }
+
+
+def build_market_ticker_analyst_context(
+    *,
+    query: str,
+    tickers: list[str],
+    timestamp: str,
+) -> dict[str, Any]:
+    estimate_date_start, estimate_date_end = _market_ticker_analyst_estimate_window()
+    context: dict[str, Any] = {
+        "query": query,
+        "route": "market_tickers_today",
+        "timestamp": timestamp,
+        "source": "FinancialModelingPrep stable endpoints via rag_trial.chat.fmp_functions",
+        "screeners": list(SCREENERS),
+        "accepted_consensus": sorted(ACCEPTED_ANALYST_CONSENSUS),
+        "analyst_estimates_window": {
+            "date_start": estimate_date_start,
+            "date_end": estimate_date_end,
+            "period": "annual",
+        },
+        "ticker_counts": {
+            "screened": len(tickers),
+            "passed_consensus_filter": 0,
+            "failed_or_filtered": 0,
+        },
+        "filtered_out": [],
+        "tickers": [],
+    }
+
+    consensus_results = _parallel_map_ordered(
+        tickers,
+        MARKET_TICKERS_ANALYST_WORKERS,
+        _fetch_market_ticker_consensus,
+        progress_label="analyst consensus",
+        progress_unit="ticker",
+    )
+    passed_symbols: list[tuple[str, Any, str, str]] = []
+    for result in consensus_results:
+        symbol = str(result.get("symbol") or "").strip().upper()
+        consensus_payload = result.get("payload", _default_analyst_payload())
+        consensus_error = str(result.get("error") or "")
+        if consensus_error:
+            context["filtered_out"].append(
+                {
+                    "symbol": symbol,
+                    "consensus": None,
+                    "reason": "consensus_fetch_error",
+                    "error": consensus_error,
+                }
+            )
+            continue
+
+        consensus_values = _extract_consensus_values(consensus_payload)
+        normalized_values = [
+            _normalize_analyst_consensus(value)
+            for value in consensus_values
+            if _normalize_analyst_consensus(value)
+        ]
+        matched_consensus = next(
+            (value for value in normalized_values if value in ACCEPTED_ANALYST_CONSENSUS),
+            "",
+        )
+        if not matched_consensus:
+            context["filtered_out"].append(
+                {
+                    "symbol": symbol,
+                    "consensus": normalized_values[0] if normalized_values else None,
+                    "reason": "missing_consensus" if not normalized_values else "consensus_not_buy",
+                }
+            )
+            continue
+
+        passed_symbols.append((symbol, consensus_payload, estimate_date_start, estimate_date_end))
+
+    context["tickers"].extend(
+        _parallel_map_ordered(
+            passed_symbols,
+            MARKET_TICKERS_ANALYST_WORKERS,
+            _build_market_ticker_analyst_payload,
+            progress_label="analyst payloads",
+            progress_unit="ticker",
+        )
+    )
+
+    passed_count = len(context["tickers"])
+    context["ticker_counts"]["passed_consensus_filter"] = passed_count
+    context["ticker_counts"]["failed_or_filtered"] = len(tickers) - passed_count
+    return context
 
 
 def _append_statement_rows(
@@ -3611,7 +3984,8 @@ def _fetch_batch_financial_context(
         f"Tickers requested: {', '.join(tickers)}",
         (
             "Rate limit policy: "
-            f"{FINANCIAL_TOOLKIT_RATE_LIMIT_PER_MIN} calls/minute, "
+            f"{FINANCIAL_DATA_RATE_LIMIT_PER_MIN} shared calls/minute, "
+            f"buffer={FINANCIAL_DATA_RATE_LIMIT_BUFFER:g}, "
             f"estimated {FINANCIAL_TOOLKIT_ESTIMATED_CALLS_PER_TICKER:g} calls/ticker, "
             f"chunk_size={chunk_size}, chunks={len(chunks)}."
         ),
@@ -3649,7 +4023,7 @@ def _fetch_batch_financial_context(
 
 def _resolve_financial_batch_chunk_size() -> int:
     estimated_calls = max(FINANCIAL_TOOLKIT_ESTIMATED_CALLS_PER_TICKER, 1.0)
-    usable_calls = max(int(FINANCIAL_TOOLKIT_RATE_LIMIT_PER_MIN * FINANCIAL_TOOLKIT_RATE_LIMIT_BUFFER), 1)
+    usable_calls = _effective_financial_data_rate_per_minute()
     derived_size = max(int(usable_calls // estimated_calls), 1)
     if FINANCIAL_TOOLKIT_MAX_BATCH_TICKERS > 0:
         return max(min(derived_size, FINANCIAL_TOOLKIT_MAX_BATCH_TICKERS), 1)
@@ -3682,6 +4056,8 @@ def _fetch_batch_financial_context_once(
         from financetoolkit import Toolkit
     except ImportError:
         return ""
+
+    _reserve_financial_toolkit_budget(len(tickers))
 
     now = datetime.now(timezone.utc)
     end_dt = date_end or now.strftime("%Y-%m-%d")
@@ -3971,6 +4347,8 @@ def _fetch_single_financial_context(
             from financetoolkit import Toolkit
         except ImportError:
             return ""
+
+        _reserve_financial_toolkit_budget(1)
 
         def _init_toolkit(start_date: str, *, quarterly: bool | None = None):
             kwargs = {
@@ -6412,6 +6790,51 @@ def _dump_financial_context_only(
     return fin_dump_path
 
 
+def _dump_analyst_context_only(
+    *,
+    base_dir: str,
+    analyst_context: dict[str, Any],
+) -> str:
+    os.makedirs(base_dir, exist_ok=True)
+    analyst_dump_path = os.path.join(base_dir, "query_analyst_context.json")
+    dump_context = {
+        key: value
+        for key, value in analyst_context.items()
+        if key not in {"filtered_out", "tickers"}
+    }
+    excluded_ticker_keys = {"grades", "grades_historical", "ratings_historical"}
+    ticker_items = analyst_context.get("tickers", [])
+    ticker_sections: dict[str, Any] = {}
+    ticker_order: list[str] = []
+    if isinstance(ticker_items, dict):
+        iterable = ticker_items.items()
+    else:
+        iterable = (
+            (str(item.get("symbol") or "").strip().upper(), item)
+            for item in ticker_items
+            if isinstance(item, dict)
+        )
+    for symbol, payload in iterable:
+        normalized_symbol = str(symbol or "").strip().upper()
+        if not normalized_symbol or normalized_symbol in ticker_sections:
+            continue
+        if isinstance(payload, dict):
+            ticker_sections[normalized_symbol] = {
+                key: value
+                for key, value in payload.items()
+                if key not in excluded_ticker_keys
+            }
+        else:
+            ticker_sections[normalized_symbol] = payload
+        ticker_order.append(normalized_symbol)
+    dump_context["ticker_order"] = ticker_order
+    dump_context["tickers"] = ticker_sections
+    with open(analyst_dump_path, "w", encoding="utf-8") as f:
+        json.dump(dump_context, f, indent=2, sort_keys=True, default=str)
+        f.write("\n")
+    return analyst_dump_path
+
+
 def build_signal_context(
     query: str,
     target: QueryTarget,
@@ -6876,6 +7299,35 @@ def run_query_once(
             "resolution_mode": primary_target.resolution_mode if primary_target else "unresolved",
             "needs_disambiguation": primary_target.needs_disambiguation if primary_target else False,
         }
+        retrieval_trace_payload = {
+            "route_type": route_type,
+            "route_profile": _resolve_route_profile(route_type),
+            "scoring_weights": _resolve_scoring_weights(route_type),
+            "selected_chunk_count": 0,
+            "finance_context_present": any(
+                bool(trace.get("finance_context_present")) for trace in retrieval_traces
+            ),
+            "news_context_present": any(
+                bool(trace.get("news_context_present")) for trace in retrieval_traces
+            ),
+            "news_query": news_query if route_type == "single_ticker_financial" else "",
+            "news_item_count": int(news_item_count if route_type == "single_ticker_financial" else 0),
+            "sub_trace_count": len(retrieval_traces),
+            "sub_traces": retrieval_traces,
+        }
+        if route_type == "market_tickers_today":
+            latest_trace = retrieval_traces[-1] if retrieval_traces else {}
+            retrieval_trace_payload.update(
+                {
+                    "analyst_context_present": bool(latest_trace.get("analyst_context_present")),
+                    "analyst_context_path": latest_trace.get("analyst_context_path", ""),
+                    "screened_ticker_count": int(latest_trace.get("screened_ticker_count") or 0),
+                    "filtered_ticker_count": int(latest_trace.get("filtered_ticker_count") or 0),
+                    "filtered_out_count": int(latest_trace.get("filtered_out_count") or 0),
+                    "ticker_count": int(latest_trace.get("ticker_count") or 0),
+                    "tickers": latest_trace.get("tickers", []),
+                }
+            )
         return {
             "run_id": run_id,
             "query": query,
@@ -6889,22 +7341,7 @@ def run_query_once(
             "resolved_target": resolved_target,
             "resolved_target_json": resolved_target,
             "route_type": route_type,
-            "retrieval_trace": {
-                "route_type": route_type,
-                "route_profile": _resolve_route_profile(route_type),
-                "scoring_weights": _resolve_scoring_weights(route_type),
-                "selected_chunk_count": 0,
-                "finance_context_present": any(
-                    bool(trace.get("finance_context_present")) for trace in retrieval_traces
-                ),
-                "news_context_present": any(
-                    bool(trace.get("news_context_present")) for trace in retrieval_traces
-                ),
-                "news_query": news_query if route_type == "single_ticker_financial" else "",
-                "news_item_count": int(news_item_count if route_type == "single_ticker_financial" else 0),
-                "sub_trace_count": len(retrieval_traces),
-                "sub_traces": retrieval_traces,
-            },
+            "retrieval_trace": retrieval_trace_payload,
             "answer_confidence": 0.0,
             "decision": "abstain",
             "answer_meta": {
@@ -6937,8 +7374,8 @@ def run_query_once(
             confidence=0.0,
             resolution_mode="market_tickers_today",
         )
-        overlap_tickers = fetch_today_market_overlap_tickers()
-        if not overlap_tickers:
+        screened_tickers = fetch_today_market_screen_tickers()
+        if not screened_tickers:
             retrieval_traces.append(
                 {
                     "sub_query": query,
@@ -6950,76 +7387,98 @@ def run_query_once(
                     "ranked_candidates": [],
                     "finance_context_present": False,
                     "news_context_present": False,
+                    "analyst_context_present": False,
+                    "analyst_context_path": "",
+                    "screened_ticker_count": 0,
+                    "filtered_ticker_count": 0,
+                    "filtered_out_count": 0,
                     "ticker_count": 0,
                     "tickers": [],
                 }
             )
-            logs.append("  [market tickers] no overlapping Yahoo screener tickers found")
+            logs.append("  [market tickers] no Yahoo screener tickers found")
             return _empty_result(
                 (
-                    "Answer: No overlapping market tickers were retrieved from Yahoo screeners today.\n"
-                    "Evidence: The Yahoo screener overlap list was empty or unavailable.\n"
-                    "Theory: The market-tickers route needs at least one ticker appearing in multiple configured screeners."
+                    "Answer: No market tickers were retrieved from Yahoo screeners today.\n"
+                    "Evidence: The configured Yahoo screeners returned no usable ticker symbols.\n"
+                    "Theory: The market-tickers route needs at least one screener ticker before analyst filtering can run."
                 ),
                 "market_tickers_today",
             )
 
-        fin_ctx = fetch_financial_context(
-            ticker=overlap_tickers,
-            date_start=None,
-            date_end=None,
-            include_technicals=True,
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        analyst_context = build_market_ticker_analyst_context(
+            query=query,
+            tickers=screened_tickers,
+            timestamp=timestamp,
         )
-        finance_context_present = bool((fin_ctx or "").strip())
+        filtered_tickers = [
+            str(item.get("symbol") or "").strip().upper()
+            for item in analyst_context.get("tickers", [])
+            if str(item.get("symbol") or "").strip()
+        ]
+        filtered_out_count = len(analyst_context.get("filtered_out", []))
         retrieval_traces.append(
             {
                 "sub_query": query,
                 "date_start": None,
                 "date_end": None,
                 "route_type": "market_tickers_today",
-                "candidate_count": len(overlap_tickers),
+                "candidate_count": len(screened_tickers),
                 "ranked_count": 0,
                 "ranked_candidates": [],
-                "finance_context_present": finance_context_present,
+                "finance_context_present": False,
                 "news_context_present": False,
-                "ticker_count": len(overlap_tickers),
-                "tickers": overlap_tickers,
+                "analyst_context_present": False,
+                "analyst_context_path": "",
+                "screened_ticker_count": len(screened_tickers),
+                "filtered_ticker_count": len(filtered_tickers),
+                "filtered_out_count": filtered_out_count,
+                "ticker_count": len(filtered_tickers),
+                "tickers": filtered_tickers,
             }
         )
-        logs.append(f"  [market tickers] overlap tickers={len(overlap_tickers)}")
-        if not finance_context_present:
-            logs.append("  [financial data] no usable [F] blocks for market ticker overlap list")
+        logs.append(
+            "  [market tickers] "
+            f"screened={len(screened_tickers)}, analyst_consensus_pass={len(filtered_tickers)}"
+        )
+        if not filtered_tickers:
+            logs.append("  [analyst data] no tickers passed Buy/Strong Buy consensus filter")
             return _empty_result(
                 (
-                    "Answer: No usable FINANCIAL DATA [F] blocks were retrieved for today's market ticker overlap list.\n"
-                    "Evidence: FinanceToolkit returned no usable data for the overlap tickers.\n"
-                    "Theory: The tickers may be unsupported, premium-gated, or unavailable from the configured data provider."
+                    "Answer: No market tickers passed the analyst consensus filter today.\n"
+                    "Evidence: FMP grades consensus did not return Buy or Strong Buy for any screened ticker.\n"
+                    "Theory: The market-tickers route only keeps tickers with normalized consensus of buy or strongbuy."
                 ),
                 "market_tickers_today",
             )
 
-        logs.append("  [financial data] fetched multi-ticker [F] context")
-        fin_dump_path = ""
+        analyst_dump_path = ""
         try:
-            import datetime as _dt
-            _ts = _dt.datetime.now().strftime("%Y%m%d_%H%M%S")
-            fin_dump_path = _dump_financial_context_only(
+            analyst_dump_path = _dump_analyst_context_only(
                 base_dir=str(QUERY_CONTEXT_DIR),
-                query=query,
-                final_route="market_tickers_today",
-                timestamp=_ts,
-                financial_context=fin_ctx,
+                analyst_context=analyst_context,
             )
-            logs.append(f"  [context dump] {fin_dump_path}")
+            retrieval_traces[-1]["analyst_context_present"] = True
+            retrieval_traces[-1]["analyst_context_path"] = analyst_dump_path
+            logs.append(f"  [context dump] {analyst_dump_path}")
         except Exception as _dump_exc:
             logs.append(f"  [context dump] failed: {_dump_exc}")
+            return _empty_result(
+                (
+                    "Answer: Analyst context could not be written to query_analyst_context.json.\n"
+                    f"Evidence: Context dump failed with error: {_dump_exc}\n"
+                    "Theory: The market-tickers route requires a successful JSON artifact write before returning an answer."
+                ),
+                "market_tickers_today",
+            )
 
         final_answer = (
-            "Financial context written to query_fin_context.txt "
-            f"for {len(overlap_tickers)} overlap ticker(s)."
+            "Analyst context written to query_analyst_context.json "
+            f"for {len(filtered_tickers)} ticker(s)."
         )
-        if fin_dump_path:
-            final_answer += f"\nPath: {fin_dump_path}"
+        if analyst_dump_path:
+            final_answer += f"\nPath: {analyst_dump_path}"
 
         resolved_target = {
             "canonical_name": None,
@@ -7038,13 +7497,17 @@ def run_query_once(
             "route_profile": _resolve_route_profile("market_tickers_today"),
             "scoring_weights": _resolve_scoring_weights("market_tickers_today"),
             "selected_chunk_count": 0,
-            "finance_context_present": True,
+            "finance_context_present": False,
             "news_context_present": False,
+            "analyst_context_present": bool(analyst_dump_path),
+            "analyst_context_path": analyst_dump_path,
             "news_query": "",
             "news_item_count": 0,
-            "ticker_count": len(overlap_tickers),
-            "tickers": overlap_tickers,
-            "financial_context_path": fin_dump_path,
+            "screened_ticker_count": len(screened_tickers),
+            "filtered_ticker_count": len(filtered_tickers),
+            "filtered_out_count": filtered_out_count,
+            "ticker_count": len(filtered_tickers),
+            "tickers": filtered_tickers,
             "sub_trace_count": len(retrieval_traces),
             "sub_traces": retrieval_traces,
         }
@@ -7056,7 +7519,7 @@ def run_query_once(
             "urls": [],
             "logs": logs,
             "citation_map": {},
-            "provenance": "Why this answer: FINANCIAL DATA [F] only.",
+            "provenance": "Why this answer: ANALYST DATA only.",
             "target": primary_target,
             "resolved_target": resolved_target,
             "resolved_target_json": resolved_target,
@@ -7069,9 +7532,12 @@ def run_query_once(
                 "decision": "answer",
                 "route_type": "market_tickers_today",
                 "signals": {
-                    "finance_context_present": True,
-                    "ticker_count": len(overlap_tickers),
-                    "financial_context_path": fin_dump_path,
+                    "finance_context_present": False,
+                    "analyst_context_present": bool(analyst_dump_path),
+                    "ticker_count": len(filtered_tickers),
+                    "screened_ticker_count": len(screened_tickers),
+                    "filtered_ticker_count": len(filtered_tickers),
+                    "analyst_context_path": analyst_dump_path,
                 },
                 "contradiction_signals": False,
             },

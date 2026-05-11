@@ -24,4 +24,5 @@ my_database_snapshot.db
 notebooks/test.py
 timesfm*
 test*.py
+parallel_progress_suite.py
 # tests/test*.py
