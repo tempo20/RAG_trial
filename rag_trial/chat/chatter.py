@@ -75,7 +75,7 @@ from rag_trial.chat.fmp_functions import (
 # Config
 
 DEBUG_SKIP_GENERATION = os.getenv("DEBUG_SKIP_GENERATION", "0").strip() in {"1", "true", "yes"}
-SINGLE_TICKER_OUTLOOK_ENFORCEMENT_VERSION = "v2"
+SINGLE_TICKER_FUNDAMENTAL_ENFORCEMENT_VERSION = "v4"
 GEN_MODEL_NAME = os.getenv("GEN_MODEL_NAME")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
 TICKER_MAP_PATH = env_path("TICKER_MAP_PATH", DEFAULT_TICKER_MAP_PATH)
@@ -481,12 +481,13 @@ def load_prompt_templates(path: Path) -> tuple[str, str, str, str]:
             "You are a grounded single-ticker financial analyst. "
             "Use only the FINANCIAL DATA [F] block and, when present, the NEWS DATA [N] block provided in the context. "
             "Do not use outside knowledge or [Sx] citations. "
-            "Return a concise outlook memo, not a full financial statement walkthrough. "
-            "Structure your response with these exact section headers: Answer, Outlook, Outlook Confidence (0-1), Confidence Rationale, Key Drivers, Risks / Gaps. "
-            "Every factual sentence in Answer, Confidence Rationale, Key Drivers, and Risks / Gaps must include [F] or [N1]/[N2]/... where appropriate. "
-            "Outlook must be exactly one of: Bullish, Bearish, or Neutral. "
-            "Outlook Confidence (0-1) must be a single number from 0.00 to 1.00, where 0.00 is fully bearish, 0.50 is neutral/mixed, and 1.00 is fully bullish. "
-            "Confidence Rationale must explain why the specific number is above, below, or near 0.50 by weighing the most important bullish evidence against the most important bearish or uncertainty evidence from [F]. "
+            "Return a concise fundamental-analysis memo, not an outlook memo. "
+            "Structure your response with these exact section headers: Answer, Fundamental Assessment, Fundamental Score (0-10), Score Rationale, Key Fundamental Drivers, Risks / Gaps. "
+            "Every factual sentence in Answer, Score Rationale, Key Fundamental Drivers, and Risks / Gaps must include [F] or [N1]/[N2]/... where appropriate. "
+            "Fundamental Assessment must be exactly one of: Sound, Mixed, or Unsound. "
+            "Fundamental Score (0-10) must be a single whole number from 0 to 10, where 10 means very sound fundamentals, 5 means mixed or uncertain fundamentals, and 0 means fundamentally unsound. "
+            "Score Rationale must explain why the specific number is above, below, or near 5 using fundamental evidence from [F]. "
+            "Price trend, technical indicators, and news are secondary caveats only and must not drive Fundamental Score (0-10). "
             "Keep the full response around 150-250 words and avoid repeating the same metric in multiple sections. "
             "If FINANCIAL DATA [F] is missing or unusable, state that there is insufficient financial data [F] to answer. "
         )
@@ -6876,128 +6877,190 @@ def _append_non_overlapping_text(base: str, extra: str, max_overlap: int = 240) 
     return (b + "\n" + e).strip()
 
 
-def _clamp_outlook_confidence(value: float) -> float:
-    return max(0.0, min(1.0, float(value)))
+def _clamp_fundamental_score(value: float) -> float:
+    return float(max(0, min(10, int(round(float(value))))))
 
 
-def _infer_outlook_and_confidence(text: str) -> tuple[str, float]:
+def _parse_fundamental_score_value(value: str) -> float:
+    raw = float(value)
+    if 0.0 <= raw <= 1.0 and "." in value:
+        raw *= 10.0
+    return _clamp_fundamental_score(raw)
+
+
+def _assessment_for_fundamental_score(score: float) -> str:
+    if score >= 8:
+        return "Sound"
+    if score <= 4:
+        return "Unsound"
+    return "Mixed"
+
+
+def _score_for_fundamental_assessment(assessment: str) -> float:
+    normalized = (assessment or "").strip().capitalize()
+    if normalized == "Sound":
+        return 8.0
+    if normalized == "Unsound":
+        return 4.0
+    return 5.0
+
+
+def _single_ticker_fundamental_fail_closed_answer() -> str:
+    return (
+        "Answer: Insufficient financial data [F] is available to answer this ticker query.\n"
+        "Fundamental Assessment: Mixed\n"
+        "Fundamental Score (0-10): 5\n"
+        "Score Rationale: The score is 5 because there is no usable FINANCIAL DATA [F] block to support a sound or unsound fundamental assessment.\n"
+        "Key Fundamental Drivers:\n"
+        "- Not assessable because the FINANCIAL DATA [F] block is missing or unusable.\n"
+        "- Revenue, growth, profitability, and cash-flow metrics cannot be evaluated without usable FINANCIAL DATA [F].\n"
+        "- Liquidity, leverage, and valuation metrics cannot be evaluated without usable FINANCIAL DATA [F].\n"
+        "Risks / Gaps:\n"
+        "- The FINANCIAL DATA [F] block is missing or unusable.\n"
+        "- No score above or below mixed can be supported without usable FINANCIAL DATA [F]."
+    )
+
+
+def _infer_fundamental_assessment_and_score(text: str) -> tuple[str, float]:
     lower = (text or "").lower()
 
-    bullish_hits = sum(
+    sound_hits = sum(
         lower.count(term)
         for term in (
-            "bullish",
-            "uptrend",
-            "trading above",
-            "positive return",
+            "profitable",
+            "positive free cash flow",
+            "fcf positive",
+            "positive operating cash flow",
             "strong liquidity",
-            "improving margin",
-            "momentum",
-            "rally",
+            "adequate liquidity",
+            "low leverage",
+            "moderate leverage",
+            "revenue growth",
+            "positive revenue growth",
+            "gross margin",
+            "operating margin",
+            "net margin",
+            "moderate valuation",
         )
     )
-    bearish_hits = sum(
+    unsound_hits = sum(
         lower.count(term)
         for term in (
-            "bearish",
-            "downtrend",
-            "trading below",
-            "negative return",
+            "unprofitable",
             "net loss",
+            "negative free cash flow",
+            "ocf negative",
+            "cash consuming",
+            "tight liquidity",
+            "high leverage",
+            "elevated leverage",
+            "revenue decline",
             "decline",
             "weakness",
             "deteriorat",
+            "unavailable",
+            "missing",
         )
     )
 
-    if bullish_hits > bearish_hits:
-        delta = bullish_hits - bearish_hits
-        return "Bullish", _clamp_outlook_confidence(0.60 + 0.05 * min(delta, 5))
-    if bearish_hits > bullish_hits:
-        delta = bearish_hits - bullish_hits
-        return "Bearish", _clamp_outlook_confidence(0.40 - 0.05 * min(delta, 5))
-    return "Neutral", 0.50
+    if sound_hits > unsound_hits:
+        delta = sound_hits - unsound_hits
+        score = _clamp_fundamental_score(5 + min(delta, 5))
+        return _assessment_for_fundamental_score(score), score
+    if unsound_hits > sound_hits:
+        delta = unsound_hits - sound_hits
+        score = _clamp_fundamental_score(5 - min(delta, 5))
+        return _assessment_for_fundamental_score(score), score
+    return "Mixed", 5.0
 
 
-def _enforce_single_ticker_outlook_sections(answer: str) -> str:
+def _enforce_single_ticker_fundamental_sections(answer: str) -> str:
     text = (answer or "").strip()
     if not text:
-        return (
-            "Answer: Insufficient financial data [F] is available to answer this ticker query.\n"
-            "Outlook: Neutral.\n"
-            "Outlook Confidence (0-1): 0.50\n"
-            "Confidence Rationale: The confidence is 0.50 because there is no usable FINANCIAL DATA [F] block to support a bullish or bearish tilt.\n"
-            "Key Drivers: Not assessable because the FINANCIAL DATA [F] block is missing or unusable.\n"
-            "Risks / Gaps: The FINANCIAL DATA [F] block is missing or unusable."
-        )
+        return _single_ticker_fundamental_fail_closed_answer()
 
-    outlook_match = re.search(
-        r"(?im)^\s*Outlook:\s*(Bullish|Bearish|Neutral)\.?\s*$",
+    assessment_match = re.search(
+        r"(?im)^\s*Fundamental Assessment:\s*(Sound|Mixed|Unsound)\.?\s*$",
         text,
     )
-    confidence_match = re.search(
-        r"(?im)^\s*Outlook Confidence \(0-1\):\s*([01](?:\.\d+)?)\s*$",
+    score_match = re.search(
+        r"(?im)^\s*Fundamental Score \(0-(?:1|10)\):\s*([+-]?(?:\d+(?:\.\d+)?|\.\d+))\s*$",
+        text,
+    )
+    legacy_confidence_match = re.search(
+        r"(?im)^\s*Outlook Confidence \(0-1\):\s*([+-]?(?:\d+(?:\.\d+)?|\.\d+))\s*$",
         text,
     )
 
-    if outlook_match:
-        outlook = outlook_match.group(1).capitalize()
+    if score_match:
+        score = _parse_fundamental_score_value(score_match.group(1))
+        assessment = _assessment_for_fundamental_score(score)
+    elif legacy_confidence_match:
+        score = _parse_fundamental_score_value(legacy_confidence_match.group(1))
+        assessment = _assessment_for_fundamental_score(score)
+    elif assessment_match:
+        assessment = assessment_match.group(1).capitalize()
+        score = _score_for_fundamental_assessment(assessment)
     else:
-        outlook, _ = _infer_outlook_and_confidence(text)
+        assessment, score = _infer_fundamental_assessment_and_score(text)
 
-    if confidence_match:
-        confidence = _clamp_outlook_confidence(float(confidence_match.group(1)))
-    else:
-        _, confidence = _infer_outlook_and_confidence(text)
+    assessment_line = f"Fundamental Assessment: {assessment}"
+    score_line = f"Fundamental Score (0-10): {score:.0f}"
 
-    # Keep confidence directionally consistent with outlook label.
-    if outlook == "Bullish" and confidence < 0.50:
-        confidence = 0.60
-    elif outlook == "Bearish" and confidence > 0.50:
-        confidence = 0.40
-    elif outlook == "Neutral":
-        confidence = 0.50 if abs(confidence - 0.50) <= 0.15 else confidence
-
-    outlook_line = f"Outlook: {outlook}."
-    confidence_line = f"Outlook Confidence (0-1): {confidence:.2f}"
+    legacy_outlook_re = re.compile(r"(?i)^\s*Outlook:\s*")
+    legacy_conf_re = re.compile(r"(?i)^\s*Outlook Confidence \(0-1\):\s*")
+    assessment_re = re.compile(r"(?i)^\s*Fundamental Assessment:\s*")
+    score_re = re.compile(r"(?i)^\s*Fundamental Score \(0-(?:1|10)\):\s*")
 
     lines = text.splitlines()
-    has_outlook = any(re.match(r"(?i)^\s*Outlook:\s*", ln) for ln in lines)
-    has_conf = any(re.match(r"(?i)^\s*Outlook Confidence \(0-1\):\s*", ln) for ln in lines)
+    has_assessment = any(assessment_re.match(ln) for ln in lines)
+    has_score = any(score_re.match(ln) for ln in lines)
+    has_legacy = any(legacy_outlook_re.match(ln) or legacy_conf_re.match(ln) for ln in lines)
 
-    if has_outlook or has_conf:
+    if has_assessment or has_score or has_legacy:
         normalized: list[str] = []
-        seen_outlook = False
-        seen_conf = False
+        seen_assessment = False
+        seen_score = False
         for ln in lines:
-            if re.match(r"(?i)^\s*Outlook:\s*", ln):
-                if not seen_outlook:
-                    normalized.append(outlook_line)
-                    seen_outlook = True
+            if legacy_outlook_re.match(ln):
+                if not seen_assessment:
+                    normalized.append(assessment_line)
+                    seen_assessment = True
                 continue
-            if re.match(r"(?i)^\s*Outlook Confidence \(0-1\):\s*", ln):
-                if not seen_conf:
-                    normalized.append(confidence_line)
-                    seen_conf = True
+            if legacy_conf_re.match(ln):
+                if not seen_score:
+                    normalized.append(score_line)
+                    seen_score = True
+                continue
+            if assessment_re.match(ln):
+                if not seen_assessment:
+                    normalized.append(assessment_line)
+                    seen_assessment = True
+                continue
+            if score_re.match(ln):
+                if not seen_score:
+                    normalized.append(score_line)
+                    seen_score = True
                 continue
             normalized.append(ln)
-        if not seen_outlook:
-            normalized.append(outlook_line)
-        if not seen_conf:
-            normalized.append(confidence_line)
+        if not seen_assessment:
+            normalized.append(assessment_line)
+        if not seen_score:
+            normalized.append(score_line)
         return "\n".join(normalized).strip()
 
-    theory_idx = None
+    insert_idx = None
     for idx, ln in enumerate(lines):
-        if re.match(r"(?i)^\s*Theory:\s*", ln):
-            theory_idx = idx
+        if re.match(r"(?i)^\s*(Score Rationale|Key Fundamental Drivers|Risks / Gaps|Evidence|Theory):\s*", ln):
+            insert_idx = idx
             break
 
-    if theory_idx is None:
-        lines.extend([outlook_line, confidence_line])
+    if insert_idx is None:
+        lines.extend([assessment_line, score_line])
     else:
-        lines[theory_idx:theory_idx] = [outlook_line, confidence_line]
+        lines[insert_idx:insert_idx] = [assessment_line, score_line]
     return "\n".join(lines).strip()
+
 
 def _remove_orphan_single_ticker_value_lines(text: str) -> str:
     lines = text.splitlines()
@@ -7008,22 +7071,20 @@ def _remove_orphan_single_ticker_value_lines(text: str) -> str:
     for raw_line in lines:
         line = raw_line.strip()
 
-        # Drop standalone duplicate outlook values.
-        if line in {"Bullish", "Bearish", "Neutral"}:
-            if previous_label == "Outlook":
+        if line in {"Sound", "Mixed", "Unsound"}:
+            if previous_label == "Fundamental Assessment":
                 continue
 
-        # Drop standalone duplicate confidence values.
-        if re.fullmatch(r"[01](?:\.\d{1,2})?", line):
-            if previous_label == "Confidence":
+        if re.fullmatch(r"(?:10|[0-9])(?:\.\d{1,2})?", line):
+            if previous_label == "Fundamental Score":
                 continue
 
         cleaned.append(raw_line)
 
-        if re.match(r"(?i)^\s*Outlook:\s*(Bullish|Bearish|Neutral)\.?\s*$", line):
-            previous_label = "Outlook"
-        elif re.match(r"(?i)^\s*Outlook Confidence \(0-1\):\s*[01](?:\.\d+)?\s*$", line):
-            previous_label = "Confidence"
+        if re.match(r"(?i)^\s*Fundamental Assessment:\s*(Sound|Mixed|Unsound)\.?\s*$", line):
+            previous_label = "Fundamental Assessment"
+        elif re.match(r"(?i)^\s*Fundamental Score \(0-10\):\s*(?:10|[0-9])\s*$", line):
+            previous_label = "Fundamental Score"
         elif line:
             previous_label = None
 
@@ -7031,10 +7092,10 @@ def _remove_orphan_single_ticker_value_lines(text: str) -> str:
 
 SINGLE_TICKER_REQUIRED_SECTIONS = [
     "Answer:",
-    "Outlook:",
-    "Outlook Confidence (0-1):",
-    "Confidence Rationale:",
-    "Key Drivers:",
+    "Fundamental Assessment:",
+    "Fundamental Score (0-10):",
+    "Score Rationale:",
+    "Key Fundamental Drivers:",
     "Risks / Gaps:",
 ]
 
@@ -7046,24 +7107,43 @@ def _validate_single_ticker_output(text: str) -> list[str]:
         if count != 1:
             errors.append(f"{section} appears {count} times")
 
-    if re.search(r"(?im)^\\s*(Bullish|Bearish|Neutral)\\s*$", text):
-        errors.append("Standalone outlook value line found")
+    if re.search(r"(?im)^\s*(Sound|Mixed|Unsound)\s*$", text):
+        errors.append("Standalone fundamental assessment value line found")
 
-    if re.search(r"(?im)^\\s*[01](?:\\.\\d{1,2})?\\s*$", text):
-        errors.append("Standalone confidence value line found")
+    if re.search(r"(?im)^\s*(?:10|[0-9])\s*$", text):
+        errors.append("Standalone fundamental score value line found")
+
+    score_match = re.search(
+        r"(?im)^\s*Fundamental Score \(0-10\):\s*(10|[0-9])\s*$",
+        text,
+    )
+    assessment_match = re.search(
+        r"(?im)^\s*Fundamental Assessment:\s*(Sound|Mixed|Unsound)\s*$",
+        text,
+    )
+    if not score_match:
+        errors.append("Fundamental Score (0-10) must be a whole number from 0 to 10")
+    if score_match and assessment_match:
+        score = float(score_match.group(1))
+        expected = _assessment_for_fundamental_score(score)
+        observed = assessment_match.group(1).capitalize()
+        if observed != expected:
+            errors.append(
+                f"Fundamental Assessment {observed} is inconsistent with score {score:.0f}; expected {expected}"
+            )
 
     key_drivers_match = re.search(
-        r"(?is)Key Drivers:\\s*(.*?)(?:\\n\\s*Risks / Gaps:|\\Z)",
+        r"(?is)Key Fundamental Drivers:\s*(.*?)(?:\n\s*Risks / Gaps:|\Z)",
         text,
     )
     if key_drivers_match:
-        key_driver_bullets = re.findall(r"(?m)^\\s*[-•]\\s+", key_drivers_match.group(1))
+        key_driver_bullets = re.findall(r"(?m)^\s*[-]\s+", key_drivers_match.group(1))
         if len(key_driver_bullets) != 3:
-            errors.append(f"Expected 3 Key Drivers bullets, got {len(key_driver_bullets)}")
+            errors.append(f"Expected 3 Key Fundamental Drivers bullets, got {len(key_driver_bullets)}")
 
-    risks_match = re.search(r"(?is)Risks / Gaps:\\s*(.*)\\Z", text)
+    risks_match = re.search(r"(?is)Risks / Gaps:\s*(.*)\Z", text)
     if risks_match:
-        risk_bullets = re.findall(r"(?m)^\\s*[-•]\\s+", risks_match.group(1))
+        risk_bullets = re.findall(r"(?m)^\s*[-]\s+", risks_match.group(1))
         if len(risk_bullets) != 2:
             errors.append(f"Expected 2 Risks / Gaps bullets, got {len(risk_bullets)}")
 
@@ -7553,14 +7633,7 @@ def run_query_once(
                 }
             )
             return _empty_result(
-                (
-                    "Answer: Insufficient financial data [F] is available to answer this ticker query.\n"
-                    "Outlook: Neutral.\n"
-                    "Outlook Confidence (0-1): 0.50\n"
-                    "Confidence Rationale: The confidence is 0.50 because there is no usable FINANCIAL DATA [F] block to support a bullish or bearish tilt.\n"
-                    "Key Drivers: Not assessable because the FINANCIAL DATA [F] block is missing or unusable.\n"
-                    "Risks / Gaps: The FINANCIAL DATA [F] block is missing or unusable."
-                ),
+                _single_ticker_fundamental_fail_closed_answer(),
                 "single_ticker_financial",
             )
 
@@ -7589,14 +7662,7 @@ def run_query_once(
             )
             logs.append(f"  [financial data] no usable [F] block for {primary_target.ticker}")
             return _empty_result(
-                (
-                    "Answer: Insufficient financial data [F] is available to answer this ticker query.\n"
-                    "Outlook: Neutral.\n"
-                    "Outlook Confidence (0-1): 0.50\n"
-                    "Confidence Rationale: The confidence is 0.50 because there is no usable FINANCIAL DATA [F] block to support a bullish or bearish tilt.\n"
-                    "Key Drivers: Not assessable because the FINANCIAL DATA [F] block is missing or unusable.\n"
-                    "Risks / Gaps: The FINANCIAL DATA [F] block is missing or unusable."
-                ),
+                _single_ticker_fundamental_fail_closed_answer(),
                 "single_ticker_financial",
             )
 
@@ -8042,16 +8108,16 @@ def run_query_once(
             max_tokens=gen_max_tokens,
         )
         if final_route == "single_ticker_financial":
-            enforced_final = _remove_orphan_single_ticker_value_lines(_enforce_single_ticker_outlook_sections(final))
+            enforced_final = _remove_orphan_single_ticker_value_lines(_enforce_single_ticker_fundamental_sections(final))
             if enforced_final != final:
                 logs.append(
-                    "  [single_ticker_outlook_enforcement] "
-                    f"applied ({SINGLE_TICKER_OUTLOOK_ENFORCEMENT_VERSION})"
+                    "  [single_ticker_fundamental_enforcement] "
+                    f"applied ({SINGLE_TICKER_FUNDAMENTAL_ENFORCEMENT_VERSION})"
                 )
             else:
                 logs.append(
-                    "  [single_ticker_outlook_enforcement] "
-                    f"already_satisfied ({SINGLE_TICKER_OUTLOOK_ENFORCEMENT_VERSION})"
+                    "  [single_ticker_fundamental_enforcement] "
+                    f"already_satisfied ({SINGLE_TICKER_FUNDAMENTAL_ENFORCEMENT_VERSION})"
                 )
             validation_errors = _validate_single_ticker_output(enforced_final)
             if validation_errors:
