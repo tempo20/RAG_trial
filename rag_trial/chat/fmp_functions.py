@@ -1,5 +1,6 @@
 import os
-from datetime import date, datetime, time, timedelta
+import time as _time
+from datetime import date, datetime, time, timedelta, timezone
 from typing import Any, Dict, List, Optional
 from zoneinfo import ZoneInfo
 
@@ -11,6 +12,16 @@ BASE_URL = "https://financialmodelingprep.com/stable"
 _US_EASTERN = ZoneInfo("America/New_York")
 _REGULAR_OPEN = time(9, 30)
 _REGULAR_CLOSE = time(16, 0)
+BLOCKED_STOCK_NEWS_PUBLISHERS = {
+    "marijuanastocks",
+    "mcap mediawire",
+    "thenewswire",
+    "newsfile corp",
+    "invezz",
+    "finbold",
+    "247 wallst",
+    "24/7 wall street",
+}
 
 
 def _previous_weekday(before: date) -> date:
@@ -61,6 +72,33 @@ def _parse_fmp_chart_datetime(s: str) -> Optional[datetime]:
         return datetime.fromisoformat(s.replace("Z", "+00:00"))
     except ValueError:
         return None
+
+
+def _parse_fmp_news_datetime(value: Any) -> Optional[datetime]:
+    if not value:
+        return None
+    try:
+        dt = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+
+
+def _normalize_news_publisher(value: Any) -> str:
+    return str(value or "").strip().lower()
+
+
+def _stock_news_publisher(article: Dict[str, Any]) -> str:
+    return _normalize_news_publisher(
+        article.get("publisher")
+        or article.get("site")
+        or article.get("source")
+    )
+
+
+def _is_blocked_stock_news_publisher(article: Dict[str, Any]) -> bool:
+    publisher = _stock_news_publisher(article)
+    return publisher in BLOCKED_STOCK_NEWS_PUBLISHERS
 
 
 def _filter_intraday_by_et_window(data: Any, start_et: datetime, end_et: datetime) -> Any:
@@ -193,6 +231,61 @@ def get_news_general_latest(*, page: int = 0, limit: int = 20, timeout: int = 30
 
 def get_news_stock_latest(*, page: int = 0, limit: int = 20, timeout: int = 30) -> Any:
     return _fmp_get("news/stock-latest", {"page": page, "limit": limit}, timeout=timeout)
+
+
+def get_stock_news_last_days(
+    *,
+    days: int = 7,
+    limit: int = 250,
+    sleep_s: float = 0.25,
+    max_pages: int = 100,
+    timeout: int = 30,
+) -> List[Dict[str, Any]]:
+    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+    articles: List[Dict[str, Any]] = []
+    seen = set()
+
+    for page in range(max_pages):
+        batch = get_news_stock_latest(page=page, limit=limit, timeout=timeout)
+        if not batch:
+            break
+
+        oldest_in_batch: Optional[datetime] = None
+
+        for article in batch:
+            if not isinstance(article, dict):
+                continue
+
+            if _is_blocked_stock_news_publisher(article):
+                continue
+
+            published = _parse_fmp_news_datetime(
+                article.get("publishedDate")
+                or article.get("date")
+                or article.get("publishedAt")
+            )
+
+            if published:
+                oldest_in_batch = published if oldest_in_batch is None else min(oldest_in_batch, published)
+
+            if published and published < cutoff:
+                continue
+
+            key = article.get("url") or (article.get("title"), article.get("publishedDate"))
+            if key in seen:
+                continue
+
+            seen.add(key)
+            articles.append(article)
+
+        print(f"page={page}, batch={len(batch)}, kept={len(articles)}")
+
+        if oldest_in_batch and oldest_in_batch < cutoff:
+            break
+
+        _time.sleep(sleep_s)
+
+    return articles
 
 
 def get_news_forex_latest(*, page: int = 0, limit: int = 20, timeout: int = 30) -> Any:
