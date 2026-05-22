@@ -9,6 +9,8 @@ sentence-transformers>=2.2.0
 # Data + date parsing
 pandas>=2.0.0
 dateparser>=1.2.0
+plotly
+streamlit
 
 # Scraping / HTTP (aiohttp is required for async paths in simple_scraper*.py)
 aiohttp>=3.9.0
