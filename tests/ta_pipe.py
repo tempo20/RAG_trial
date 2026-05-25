@@ -4,7 +4,7 @@ Stock Screening & Signal Pipeline
 Stages:
   1. collect_candidates  — news momentum + Yahoo screener overlap
   2. compute_signals     — SMA/VWMA crossover logic, no plotting
-  3. rank_candidates     — filter to buy signals, sort by recency + strength
+  3. rank_candidates     — rank strongest pre-golden-cross setups
   4. plot_top            — render charts only for the top N tickers
 
 Usage:
@@ -49,6 +49,7 @@ from rag_trial.chat.fmp_functions import (
     _is_blocked_stock_news_publisher,
     _parse_fmp_news_datetime,
 )
+from rag_trial.db import ta_cache
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -156,16 +157,65 @@ class CheapMarketSignal:
 # Stage 1 — Candidate collection
 # ─────────────────────────────────────────────────────────────────────────────
 
-def collect_news_tickers(cfg: PipelineConfig) -> NewsTickerScores:
-    """
-    Return separate news recency scores and raw mention counts.
-    Delegates fetching and publisher filtering to fmp_functions so there
-    is a single source of truth for both the API call and blocked publishers.
-    If recency_decay is enabled, articles are weighted by 1 / days_old.
-    """
-    cutoff = datetime.now(timezone.utc) - timedelta(days=cfg.news_days)
+def _cache_enabled() -> bool:
+    return ta_cache.cache_enabled()
+
+
+def _score_news_articles(
+    articles: list[dict],
+    cfg: PipelineConfig,
+    *,
+    cutoff: datetime,
+    now: datetime,
+) -> NewsTickerScores:
     recency_scores: Counter = Counter()
     mention_counts: Counter = Counter()
+    seen: set = set()
+
+    for article in articles:
+        if not isinstance(article, dict):
+            continue
+
+        published = _parse_fmp_news_datetime(
+            article.get("publishedDate")
+            or article.get("date")
+            or article.get("publishedAt")
+        )
+        if published and published < cutoff:
+            continue
+
+        ticker = str(article.get("symbol") or "").strip().upper()
+        if not ticker:
+            continue
+
+        key = article.get("article_id") or article.get("url") or (
+            article.get("title"),
+            article.get("publishedDate"),
+        )
+        key = (key, ticker)
+        if key in seen:
+            continue
+        seen.add(key)
+
+        if cfg.news_recency_decay and published:
+            age_days = max((now - published).total_seconds() / 86400, 0.01)
+            weight = 1.0 / age_days
+        else:
+            weight = 1.0
+
+        recency_scores[ticker] += weight
+        mention_counts[ticker] += 1
+
+    return NewsTickerScores(recency_scores=recency_scores, mention_counts=mention_counts)
+
+
+def _fetch_news_articles_online(
+    cfg: PipelineConfig,
+    *,
+    cutoff: datetime,
+    stop_at_or_before: datetime | None = None,
+) -> list[dict]:
+    articles: list[dict] = []
     seen: set = set()
 
     for page in range(cfg.news_max_pages):
@@ -211,30 +261,78 @@ def collect_news_tickers(cfg: PipelineConfig) -> NewsTickerScores:
                 continue
             seen.add(key)
 
-            ticker = article.get("symbol")
-            if not ticker:
+            if not article.get("symbol"):
                 continue
 
-            if cfg.news_recency_decay and published:
-                age_days = max(
-                    (datetime.now(timezone.utc) - published).total_seconds() / 86400,
-                    0.01,
-                )
-                weight = 1.0 / age_days
-            else:
-                weight = 1.0
+            articles.append(article)
 
-            recency_scores[ticker] += weight
-            mention_counts[ticker] += 1
-
-        log.info("News page=%d  batch=%d  unique tickers=%d", page, len(batch), len(recency_scores))
+        log.info("News page=%d  batch=%d  kept_articles=%d", page, len(batch), len(articles))
 
         if oldest_in_batch and oldest_in_batch < cutoff:
+            break
+        if stop_at_or_before and oldest_in_batch and oldest_in_batch <= stop_at_or_before:
             break
 
         time.sleep(cfg.news_sleep_s)
 
-    return NewsTickerScores(recency_scores=recency_scores, mention_counts=mention_counts)
+    return articles
+
+
+def collect_news_tickers(cfg: PipelineConfig) -> NewsTickerScores:
+    """
+    Return separate news recency scores and raw mention counts.
+    Delegates fetching and publisher filtering to fmp_functions so there
+    is a single source of truth for both the API call and blocked publishers.
+    If recency_decay is enabled, articles are weighted by 1 / days_old.
+    """
+    now = datetime.now(timezone.utc)
+    cutoff = now - timedelta(days=cfg.news_days)
+    cutoff_date = cutoff.date().isoformat()
+
+    fetched_articles: list[dict] = []
+
+    if _cache_enabled():
+        try:
+            latest_cached = _parse_fmp_news_datetime(ta_cache.latest_article_published_at())
+            if latest_cached:
+                log.info("Refreshing FMP news cache after latest cached publish time %s", latest_cached)
+            fetched_articles = _fetch_news_articles_online(
+                cfg,
+                cutoff=cutoff,
+                stop_at_or_before=latest_cached,
+            )
+            if fetched_articles:
+                ta_cache.upsert_articles(fetched_articles)
+            cached_articles = ta_cache.load_articles_since(cutoff_date)
+            if cached_articles:
+                log.info("News cache loaded: %d cached article-symbol rows", len(cached_articles))
+                return _score_news_articles(
+                    cached_articles,
+                    cfg,
+                    cutoff=cutoff,
+                    now=now,
+                )
+        except Exception as exc:
+            log.warning("TA news cache refresh failed; falling back to FMP-only news: %s", exc)
+
+    if not fetched_articles:
+        fetched_articles = _fetch_news_articles_online(cfg, cutoff=cutoff)
+
+    if _cache_enabled() and fetched_articles:
+        try:
+            ta_cache.upsert_articles(fetched_articles)
+            cached_articles = ta_cache.load_articles_since(cutoff_date)
+            if cached_articles:
+                return _score_news_articles(
+                    cached_articles,
+                    cfg,
+                    cutoff=cutoff,
+                    now=now,
+                )
+        except Exception as exc:
+            log.warning("TA news cache write failed; using fetched news only: %s", exc)
+
+    return _score_news_articles(fetched_articles, cfg, cutoff=cutoff, now=now)
 
 
 def collect_screener_tickers(cfg: PipelineConfig) -> ScreenerTickerScores:
@@ -447,16 +545,181 @@ def _rank_by_candidate_score(
     return ranked, scored
 
 
-def _download_history_batch(tickers: list[str], cfg: PipelineConfig) -> pd.DataFrame:
-    return yf.download(
-        tickers=tickers,
-        period=cfg.cheap_history_period,
-        interval="1d",
-        group_by="ticker",
-        auto_adjust=False,
-        progress=False,
-        threads=True,
+def _history_start_for_period(period: str, end_day: date) -> str:
+    value = str(period or "").strip().lower()
+    if value.endswith("y") and value[:-1].isdigit():
+        return (pd.Timestamp(end_day) - pd.DateOffset(years=int(value[:-1]))).date().isoformat()
+    if value.endswith("mo") and value[:-2].isdigit():
+        return (pd.Timestamp(end_day) - pd.DateOffset(months=int(value[:-2]))).date().isoformat()
+    if value.endswith("wk") and value[:-2].isdigit():
+        return (pd.Timestamp(end_day) - pd.DateOffset(weeks=int(value[:-2]))).date().isoformat()
+    if value.endswith("d") and value[:-1].isdigit():
+        return (pd.Timestamp(end_day) - pd.DateOffset(days=int(value[:-1]))).date().isoformat()
+    return (pd.Timestamp(end_day) - pd.DateOffset(years=1)).date().isoformat()
+
+
+def _bars_rows_to_frame(rows: list[dict]) -> pd.DataFrame:
+    if not rows:
+        return pd.DataFrame()
+
+    df = pd.DataFrame(rows)
+    rename = {
+        "open": "Open",
+        "high": "High",
+        "low": "Low",
+        "close": "Close",
+        "adj_close": "Adj Close",
+        "volume": "Volume",
+    }
+    df = df.rename(columns=rename)
+    df.index = pd.to_datetime(df["bar_date"])
+    columns = [col for col in ["Open", "High", "Low", "Close", "Adj Close", "Volume"] if col in df.columns]
+    return df[columns].sort_index().dropna(how="all")
+
+
+def _history_frame_is_fresh(hist: pd.DataFrame | None, start_date: str, end_date: str) -> bool:
+    if hist is None or hist.empty:
+        return False
+    index = pd.to_datetime(hist.index)
+    first = index.min().date()
+    latest = index.max().date()
+    start = pd.Timestamp(start_date).date()
+    end = pd.Timestamp(end_date).date()
+    return first <= (start + timedelta(days=7)) and latest >= (end - timedelta(days=3))
+
+
+def _cached_history_frame(
+    ticker: str,
+    *,
+    start_date: str,
+    end_date: str,
+    provider: str,
+) -> pd.DataFrame | None:
+    if not _cache_enabled():
+        return None
+
+    rows = ta_cache.load_daily_bars(
+        ticker,
+        start_date,
+        end_date,
+        provider=provider,
     )
+    hist = _bars_rows_to_frame(rows)
+    if _history_frame_is_fresh(hist, start_date, end_date):
+        return hist
+    return None
+
+
+def _to_float_or_none(value) -> float | None:
+    if value is None or pd.isna(value):
+        return None
+    return float(value)
+
+
+def _history_frame_to_bar_rows(
+    ticker: str,
+    hist: pd.DataFrame | None,
+) -> list[dict]:
+    if hist is None or hist.empty:
+        return []
+
+    rows: list[dict] = []
+    for index, row in hist.iterrows():
+        timestamp = index.to_timestamp() if hasattr(index, "to_timestamp") else pd.Timestamp(index)
+        bar_date = timestamp.date().isoformat()
+        rows.append({
+            "ticker": ticker,
+            "bar_date": bar_date,
+            "open": _to_float_or_none(row.get("Open")),
+            "high": _to_float_or_none(row.get("High")),
+            "low": _to_float_or_none(row.get("Low")),
+            "close": _to_float_or_none(row.get("Close")),
+            "adj_close": _to_float_or_none(row.get("Adj Close")),
+            "volume": _to_float_or_none(row.get("Volume")),
+        })
+    return rows
+
+
+def _upsert_history_frame(
+    ticker: str,
+    hist: pd.DataFrame | None,
+    *,
+    provider: str,
+) -> None:
+    if not _cache_enabled():
+        return
+    rows = _history_frame_to_bar_rows(ticker, hist)
+    if rows:
+        ta_cache.upsert_daily_bars(rows, provider=provider)
+
+
+def _combine_ticker_history(frames: dict[str, pd.DataFrame]) -> pd.DataFrame:
+    clean = {ticker: frame for ticker, frame in frames.items() if frame is not None and not frame.empty}
+    if not clean:
+        return pd.DataFrame()
+    return pd.concat(clean, axis=1)
+
+
+def _download_history_batch(tickers: list[str], cfg: PipelineConfig) -> pd.DataFrame:
+    end_date = date.today().isoformat()
+    start_date = _history_start_for_period(cfg.cheap_history_period, date.today())
+
+    if not _cache_enabled():
+        return yf.download(
+            tickers=tickers,
+            period=cfg.cheap_history_period,
+            interval="1d",
+            group_by="ticker",
+            auto_adjust=False,
+            progress=False,
+            threads=True,
+        )
+
+    cached_frames: dict[str, pd.DataFrame] = {}
+    missing: list[str] = []
+    for ticker in tickers:
+        try:
+            cached = _cached_history_frame(
+                ticker,
+                start_date=start_date,
+                end_date=end_date,
+                provider="yahoo",
+            )
+        except Exception as exc:
+            log.warning("TA history cache read failed for %s: %s", ticker, exc)
+            cached = None
+        if cached is None:
+            missing.append(ticker)
+        else:
+            cached_frames[ticker] = cached
+
+    if missing:
+        downloaded = yf.download(
+            tickers=missing,
+            period=cfg.cheap_history_period,
+            interval="1d",
+            group_by="ticker",
+            auto_adjust=False,
+            progress=False,
+            threads=True,
+        )
+        for ticker in missing:
+            hist = _history_for_ticker(downloaded, ticker)
+            if hist is not None and not hist.empty:
+                try:
+                    _upsert_history_frame(ticker, hist, provider="yahoo")
+                    cached = _cached_history_frame(
+                        ticker,
+                        start_date=start_date,
+                        end_date=end_date,
+                        provider="yahoo",
+                    )
+                    cached_frames[ticker] = cached if cached is not None else hist
+                except Exception as exc:
+                    log.warning("TA history cache write failed for %s: %s", ticker, exc)
+                    cached_frames[ticker] = hist
+
+    return _combine_ticker_history(cached_frames)
 
 
 def _history_for_ticker(downloaded: pd.DataFrame, ticker: str) -> pd.DataFrame | None:
@@ -629,7 +892,215 @@ class SignalResult:
     strong_bullish_confirmation: pd.Series | None = None
     regular_bearish_trend: pd.Series | None = None
     strong_bearish_confirmation: pd.Series | None = None
+    pre_golden_score: float | None = None
+    pre_golden_reasons: list[str] = field(default_factory=list)
+    days_to_cross_estimate: float | None = None
+    macd: pd.Series | None = None
+    macd_signal: pd.Series | None = None
+    macd_hist: pd.Series | None = None
+    rsi: pd.Series | None = None
     error: str | None = None
+
+
+def _latest_valid_value(series: pd.Series | None) -> float | None:
+    if series is None:
+        return None
+    valid = series.replace([np.inf, -np.inf], np.nan).dropna()
+    if valid.empty:
+        return None
+    return float(valid.iloc[-1])
+
+
+def _series_value(series: pd.Series | None, offset: int = 0) -> float | None:
+    if series is None or len(series) <= offset:
+        return None
+    value = series.iloc[-1 - offset]
+    if pd.isna(value) or not np.isfinite(value):
+        return None
+    return float(value)
+
+
+def _value_days_ago(series: pd.Series | None, days: int) -> float | None:
+    return _series_value(series, days)
+
+
+def compute_pre_golden_metrics(
+    close: pd.Series,
+    volume: pd.Series,
+    sma_50: pd.Series,
+    sma_200: pd.Series,
+    vwma_50: pd.Series,
+) -> tuple[float, list[str], float | None, pd.Series, pd.Series, pd.Series, pd.Series]:
+    """Score pre-golden-cross setups while SMA50 remains below SMA200."""
+    spread = ((sma_50 - sma_200) / sma_200).replace([np.inf, -np.inf], np.nan)
+    spread_slope_5d = spread.diff(5)
+    spread_slope_10d = spread.diff(10)
+    spread_accel = spread_slope_5d.diff(5)
+    sma50_slope_10d = sma_50.pct_change(10).replace([np.inf, -np.inf], np.nan)
+    sma200_slope_20d = sma_200.pct_change(20).replace([np.inf, -np.inf], np.nan)
+
+    ema_12 = close.ewm(span=12, adjust=False).mean()
+    ema_26 = close.ewm(span=26, adjust=False).mean()
+    macd = ema_12 - ema_26
+    macd_signal = macd.ewm(span=9, adjust=False).mean()
+    macd_hist = macd - macd_signal
+
+    delta = close.diff()
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+    avg_gain = gain.rolling(14).mean()
+    avg_loss = loss.rolling(14).mean()
+    rs = avg_gain / avg_loss.replace(0, np.nan)
+    rsi = 100 - (100 / (1 + rs))
+    rsi = rsi.where(avg_loss != 0, 100)
+
+    volume_5d = volume.rolling(5).mean()
+    volume_20d = volume.rolling(20).mean()
+    relative_volume = (volume_5d / volume_20d.replace(0, np.nan)).replace(
+        [np.inf, -np.inf],
+        np.nan,
+    )
+
+    latest_spread = _series_value(spread)
+    latest_spread_slope_5d = _series_value(spread_slope_5d)
+    if latest_spread is None or latest_spread_slope_5d is None:
+        return 0.0, [], None, macd, macd_signal, macd_hist, rsi
+
+    if latest_spread >= 0:
+        return 0.0, ["already crossed"], None, macd, macd_signal, macd_hist, rsi
+
+    score = 0.0
+    reasons: list[str] = []
+
+    latest_spread_slope_10d = _series_value(spread_slope_10d)
+    latest_spread_accel = _series_value(spread_accel)
+    latest_sma50_slope_10d = _series_value(sma50_slope_10d)
+    latest_sma200_slope_20d = _series_value(sma200_slope_20d)
+    latest_close = _series_value(close)
+    latest_sma_50 = _series_value(sma_50)
+    latest_sma_200 = _series_value(sma_200)
+    latest_vwma_50 = _series_value(vwma_50)
+    latest_macd = _series_value(macd)
+    latest_macd_signal = _series_value(macd_signal)
+    latest_macd_hist = _series_value(macd_hist)
+    macd_hist_3d_ago = _value_days_ago(macd_hist, 3)
+    latest_rsi = _series_value(rsi)
+    rsi_5d_ago = _value_days_ago(rsi, 5)
+    latest_relative_volume = _series_value(relative_volume)
+
+    if -0.01 <= latest_spread < 0:
+        score += 3.0
+        reasons.append("SMA50 is within 1% below SMA200")
+    elif -0.02 <= latest_spread < -0.01:
+        score += 2.0
+        reasons.append("SMA50 is within 2% below SMA200")
+    elif -0.04 <= latest_spread < -0.02:
+        score += 1.0
+        reasons.append("SMA50 is within 4% below SMA200")
+
+    if latest_spread_slope_5d > 0:
+        score += 2.0
+        reasons.append("SMA spread is closing over 5 days")
+    if latest_spread_slope_10d is not None and latest_spread_slope_10d > 0:
+        score += 1.0
+        reasons.append("SMA spread is closing over 10 days")
+    if latest_spread_accel is not None and latest_spread_accel > 0:
+        score += 1.0
+        reasons.append("spread compression is accelerating")
+    if latest_sma50_slope_10d is not None and latest_sma50_slope_10d > 0:
+        score += 2.0
+        reasons.append("SMA50 slope is positive")
+    if latest_sma200_slope_20d is not None and latest_sma200_slope_20d < -0.03:
+        score -= 1.5
+        reasons.append("penalty: SMA200 falling sharply")
+    if latest_close is not None and latest_sma_50 is not None and latest_close > latest_sma_50:
+        score += 1.5
+        reasons.append("price is above SMA50")
+    if latest_close is not None and latest_sma_200 is not None and latest_close > latest_sma_200:
+        score += 2.0
+        reasons.append("price has reclaimed SMA200 before the cross")
+    if latest_vwma_50 is not None and latest_sma_50 is not None and latest_vwma_50 > latest_sma_50:
+        score += 1.0
+        reasons.append("VWMA50 is above SMA50")
+    if (
+        latest_macd_hist is not None
+        and macd_hist_3d_ago is not None
+        and latest_macd_hist > macd_hist_3d_ago
+    ):
+        score += 1.5
+        reasons.append("MACD histogram is rising")
+    if (
+        latest_macd is not None
+        and latest_macd_signal is not None
+        and latest_macd > latest_macd_signal
+    ):
+        score += 1.0
+        reasons.append("MACD is above signal line")
+    if (
+        latest_rsi is not None
+        and rsi_5d_ago is not None
+        and 45 <= latest_rsi <= 70
+        and latest_rsi > rsi_5d_ago
+    ):
+        score += 1.0
+        reasons.append("RSI is recovering without being overbought")
+    if latest_relative_volume is not None and latest_relative_volume > 1.1:
+        score += 1.0
+        reasons.append("recent volume is above average")
+
+    daily_spread_velocity = latest_spread_slope_5d / 5
+    if daily_spread_velocity > 0:
+        days_to_cross = abs(latest_spread / daily_spread_velocity)
+    else:
+        days_to_cross = None
+
+    return score, reasons, days_to_cross, macd, macd_signal, macd_hist, rsi
+
+
+def _ensure_datetime_index(series: pd.Series) -> pd.Series:
+    if hasattr(series.index, "to_timestamp"):
+        series.index = series.index.to_timestamp()
+    else:
+        series.index = pd.to_datetime(series.index)
+    return series
+
+
+def _load_or_fetch_signal_history(
+    ticker: str,
+    cfg: PipelineConfig,
+    *,
+    end_date: str,
+) -> pd.DataFrame | None:
+    provider = "financetoolkit"
+    if _cache_enabled():
+        try:
+            cached = _cached_history_frame(
+                ticker,
+                start_date=cfg.start_date,
+                end_date=end_date,
+                provider=provider,
+            )
+            if cached is not None:
+                log.info("Signal history cache hit: %s", ticker)
+                return cached
+        except Exception as exc:
+            log.warning("TA signal history cache read failed for %s: %s", ticker, exc)
+
+    api_key = os.getenv("FMP_API_KEY")
+    tk = Toolkit(
+        tickers=[ticker],
+        api_key=api_key,
+        start_date=cfg.start_date,
+        end_date=end_date,
+    )
+    hist_raw = tk.get_historical_data()
+    hist = _history_for_ticker(hist_raw, ticker)
+    if hist is not None and not hist.empty and _cache_enabled():
+        try:
+            _upsert_history_frame(ticker, hist, provider=provider)
+        except Exception as exc:
+            log.warning("TA signal history cache write failed for %s: %s", ticker, exc)
+    return hist
 
 
 def compute_signals(ticker: str, cfg: PipelineConfig) -> SignalResult:
@@ -645,22 +1116,17 @@ def compute_signals(ticker: str, cfg: PipelineConfig) -> SignalResult:
     )
 
     try:
-        api_key = os.getenv("FMP_API_KEY")
         end_date = date.today().isoformat()
+        hist = _load_or_fetch_signal_history(ticker, cfg, end_date=end_date)
+        if hist is None or hist.empty:
+            empty.error = "no price data"
+            return empty
 
-        tk = Toolkit(
-            tickers=[ticker],
-            api_key=api_key,
-            start_date=cfg.start_date,
-            end_date=end_date,
-        )
-        hist = tk.get_historical_data()
+        close = pd.to_numeric(hist["Close"], errors="coerce").sort_index()
+        volume = pd.to_numeric(hist["Volume"], errors="coerce").sort_index()
 
-        close = pd.to_numeric(hist["Close"][ticker], errors="coerce").sort_index()
-        volume = pd.to_numeric(hist["Volume"][ticker], errors="coerce").sort_index()
-
-        close.index = close.index.to_timestamp()
-        volume.index = volume.index.to_timestamp()
+        close = _ensure_datetime_index(close)
+        volume = _ensure_datetime_index(volume)
 
         if close.dropna().empty:
             empty.error = "no price data"
@@ -675,6 +1141,22 @@ def compute_signals(ticker: str, cfg: PipelineConfig) -> SignalResult:
 
         spread = (sma_50 - sma_200) / sma_200
         prev_spread = spread.shift(1)
+
+        (
+            pre_golden_score,
+            pre_golden_reasons,
+            days_to_cross_estimate,
+            macd,
+            macd_signal,
+            macd_hist,
+            rsi,
+        ) = compute_pre_golden_metrics(
+            close=close,
+            volume=volume,
+            sma_50=sma_50,
+            sma_200=sma_200,
+            vwma_50=vwma_50,
+        )
 
         regular_bullish_trend = (close > sma_200) & (sma_50 > sma_200)
         strong_bullish_confirmation = (close > sma_200) & (sma_50 > sma_200) & (vwma_50 > sma_50)
@@ -763,6 +1245,13 @@ def compute_signals(ticker: str, cfg: PipelineConfig) -> SignalResult:
             strong_bullish_confirmation=strong_bullish_confirmation,
             regular_bearish_trend=regular_bearish_trend,
             strong_bearish_confirmation=strong_bearish_confirmation,
+            pre_golden_score=pre_golden_score,
+            pre_golden_reasons=pre_golden_reasons,
+            days_to_cross_estimate=days_to_cross_estimate,
+            macd=macd,
+            macd_signal=macd_signal,
+            macd_hist=macd_hist,
+            rsi=rsi,
         )
 
     except Exception as exc:
@@ -772,36 +1261,45 @@ def compute_signals(ticker: str, cfg: PipelineConfig) -> SignalResult:
 
 def rank_candidates(
     results: list[SignalResult],
-    require_bullish: bool = True,
+    require_bullish: bool = False,
 ) -> list[SignalResult]:
     """
-    Filter to tickers with a recent confirmed golden cross and rank by:
-      1. Recency of latest signal (most recent first)
-      2. Spread at signal date (larger spread = stronger breakout)
+    Rank tickers by pre-golden-cross setup strength.
+
+    require_bullish is retained for backward compatibility with older callers.
     """
-    log.info("── Stage 3: ranking candidates ──────────────────────────────")
+    log.info("── Stage 3: ranking pre-golden-cross candidates ─────────────")
+
+    def latest_spread_for(r: SignalResult) -> float | None:
+        return _latest_valid_value(r.spread)
 
     filtered = [
         r for r in results
         if not r.error
-        and r.latest_signal is not None
-        and (not require_bullish or r.latest_signal == "green")
+        and r.pre_golden_score is not None
+        and r.pre_golden_score > 0
+        and latest_spread_for(r) is not None
+        and latest_spread_for(r) < 0
     ]
 
     def sort_key(r: SignalResult):
-        recency = r.latest_signal_date or datetime.min.replace(tzinfo=timezone.utc)
-        # Spread magnitude at the latest signal date as secondary sort
-        spread_strength = 0.0
-        if r.spread is not None and r.latest_signal_date is not None:
-            try:
-                idx = r.spread.index.get_loc(r.latest_signal_date)
-                spread_strength = abs(r.spread.iloc[idx])
-            except Exception:
-                pass
-        return (recency, spread_strength)
+        latest_spread = abs(latest_spread_for(r) or 9999)
+        days_to_cross = (
+            r.days_to_cross_estimate
+            if r.days_to_cross_estimate is not None
+            else 9999
+        )
+        return (
+            r.pre_golden_score,
+            -latest_spread,
+            -days_to_cross,
+        )
 
     ranked = sorted(filtered, key=sort_key, reverse=True)
-    log.info("%d tickers with active buy signal, returning top candidates", len(ranked))
+    log.info(
+        "%d tickers with pre-golden-cross setups, returning top candidates",
+        len(ranked),
+    )
     return ranked
 
 
@@ -912,22 +1410,25 @@ def plot_signal_result(
     plt.close(fig)
 
 def print_summary(ranked: list[SignalResult], cfg: PipelineConfig) -> pd.DataFrame:
-    """Print and return a DataFrame summarising the top candidates."""
+    """Print and return a DataFrame summarising the top pre-cross candidates."""
     rows = []
     for r in ranked[: cfg.top_n]:
-        last_fwd = r.forward_returns[-1] if r.forward_returns else None
+        latest_spread = _latest_valid_value(r.spread)
         rows.append({
             "ticker":            r.ticker,
+            "pre_golden_score":  round(r.pre_golden_score, 2) if r.pre_golden_score is not None else None,
+            "spread_%":          round(latest_spread * 100, 2) if latest_spread is not None else None,
+            "est_days_to_cross": round(r.days_to_cross_estimate, 1) if r.days_to_cross_estimate is not None else None,
             "latest_signal":     r.latest_signal,
             "signal_date":       r.latest_signal_date.date() if r.latest_signal_date else None,
-            f"fwd_{cfg.forward_days}d_%": f"{last_fwd * 100:+.1f}" if last_fwd is not None else "pend.",
             "total_crosses":     len(r.cross_dates),
             "golden_crosses":    r.cross_colors.count("green"),
             "death_crosses":     r.cross_colors.count("red"),
+            "reasons":           " | ".join(r.pre_golden_reasons[:4]),
         })
 
     df = pd.DataFrame(rows)
-    print("\n── Top candidates ───────────────────────────────────────────")
+    print("\n── Top pre-golden-cross candidates ──────────────────────────")
     print(df.to_string(index=False))
     print()
     return df
@@ -945,7 +1446,7 @@ def run_pipeline(cfg: PipelineConfig | None = None) -> list[SignalResult]:
     Returns
     -------
     list[SignalResult]
-        Ranked list of tickers with active buy signals.
+        Ranked list of tickers with pre-golden-cross setups.
     """
     if cfg is None:
         cfg = PipelineConfig()
@@ -968,10 +1469,10 @@ def run_pipeline(cfg: PipelineConfig | None = None) -> list[SignalResult]:
         time.sleep(cfg.signal_sleep_s)
 
 
-    ranked = rank_candidates(results, require_bullish=True)
+    ranked = rank_candidates(results, require_bullish=False)
 
     if not ranked:
-        log.info("No tickers with active buy signals found.")
+        log.info("No tickers with pre-golden-cross setups found.")
         return []
 
     print_summary(ranked, cfg)
