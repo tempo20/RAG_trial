@@ -25,19 +25,31 @@ def _format_signal_date(value) -> object:
     return value
 
 
+def _latest_valid_value(series: pd.Series | None) -> float | None:
+    if series is None:
+        return None
+    valid = series.replace([float("inf"), -float("inf")], pd.NA).dropna()
+    if valid.empty:
+        return None
+    return float(valid.iloc[-1])
+
+
 def result_summary_df(results: list[SignalResult], top_n: int) -> pd.DataFrame:
     rows = []
     for rank, r in enumerate(results[:top_n], start=1):
-        last_fwd = r.forward_returns[-1] if r.forward_returns else None
+        latest_spread = _latest_valid_value(r.spread)
         rows.append({
             "rank": rank,
             "ticker": r.ticker,
+            "pre_golden_score": round(r.pre_golden_score, 2) if r.pre_golden_score is not None else None,
+            "spread_%": round(latest_spread * 100, 2) if latest_spread is not None else None,
+            "est_days_to_cross": round(r.days_to_cross_estimate, 1) if r.days_to_cross_estimate is not None else None,
             "latest_signal": r.latest_signal,
             "signal_date": _format_signal_date(r.latest_signal_date),
-            "forward_return": f"{last_fwd * 100:+.1f}" if last_fwd is not None else "pend.",
             "total_crosses": len(r.cross_dates),
             "golden_crosses": r.cross_colors.count("green"),
             "death_crosses": r.cross_colors.count("red"),
+            "reasons": " | ".join(r.pre_golden_reasons[:4]),
         })
     return pd.DataFrame(rows)
 
@@ -69,11 +81,12 @@ def _add_series_trace(
 
 def make_signal_chart(r: SignalResult, cfg: PipelineConfig) -> go.Figure:
     fig = make_subplots(
-        rows=2,
+        rows=4,
         cols=1,
         shared_xaxes=True,
-        vertical_spacing=0.06,
-        row_heights=[0.72, 0.28],
+        vertical_spacing=0.04,
+        row_heights=[0.50, 0.18, 0.17, 0.15],
+        subplot_titles=("Price", "SMA spread %", "MACD", "RSI"),
     )
 
     _add_series_trace(fig, r.close, name="Close", row=1, col=1, color="#4da3ff")
@@ -168,9 +181,34 @@ def make_signal_chart(r: SignalResult, cfg: PipelineConfig) -> go.Figure:
     fig.add_hline(y=cfg.min_spread * 100, line_dash="dot", row=2, col=1)
     fig.add_hline(y=-cfg.min_spread * 100, line_dash="dot", row=2, col=1)
 
+    if r.macd_hist is not None and not r.macd_hist.empty:
+        hist = r.macd_hist.dropna()
+        if not hist.empty:
+            fig.add_trace(
+                go.Bar(
+                    x=hist.index,
+                    y=hist,
+                    name="MACD hist",
+                    marker_color=[
+                        "#22c55e" if value >= 0 else "#ef4444"
+                        for value in hist
+                    ],
+                    opacity=0.55,
+                ),
+                row=3,
+                col=1,
+            )
+    _add_series_trace(fig, r.macd, name="MACD", row=3, col=1, color="#60a5fa")
+    _add_series_trace(fig, r.macd_signal, name="Signal", row=3, col=1, color="#f97316")
+    fig.add_hline(y=0, line_dash="dash", row=3, col=1)
+
+    _add_series_trace(fig, r.rsi, name="RSI", row=4, col=1, color="#a78bfa")
+    fig.add_hline(y=45, line_dash="dot", row=4, col=1)
+    fig.add_hline(y=70, line_dash="dot", row=4, col=1)
+
     fig.update_layout(
-        title=f"{r.ticker} Technical Signal",
-        height=820,
+        title=f"{r.ticker} Pre-Golden-Cross Technical Setup",
+        height=980,
         hovermode="x unified",
         template="plotly_dark",
         legend={"orientation": "h", "yanchor": "bottom", "y": 1.02, "xanchor": "left", "x": 0},
@@ -178,7 +216,9 @@ def make_signal_chart(r: SignalResult, cfg: PipelineConfig) -> go.Figure:
     )
     fig.update_yaxes(title_text="Price", row=1, col=1)
     fig.update_yaxes(title_text="Spread %", row=2, col=1)
-    fig.update_xaxes(title_text="Date", row=2, col=1)
+    fig.update_yaxes(title_text="MACD", row=3, col=1)
+    fig.update_yaxes(title_text="RSI", row=4, col=1)
+    fig.update_xaxes(title_text="Date", row=4, col=1)
     return fig
 
 
@@ -197,7 +237,7 @@ def load_results() -> tuple[list[SignalResult], PipelineConfig]:
 
 
 def main() -> None:
-    st.title("Technical Analysis Candidate Dashboard")
+    st.title("Pre-Golden-Cross Candidate Dashboard")
 
     if st.button("Refresh pipeline"):
         st.cache_data.clear()
@@ -209,7 +249,7 @@ def main() -> None:
         st.stop()
 
     summary = result_summary_df(ranked, cfg.top_n)
-    st.subheader("Top candidates")
+    st.subheader("Top pre-golden-cross candidates")
     st.dataframe(summary, use_container_width=True, hide_index=True)
 
     selected_ticker = st.sidebar.radio(
@@ -218,8 +258,25 @@ def main() -> None:
         index=0,
     )
     selected_result = next(r for r in ranked if r.ticker == selected_ticker)
+    latest_spread = _latest_valid_value(selected_result.spread)
 
     st.sidebar.subheader(selected_result.ticker)
+    st.sidebar.metric(
+        "Pre-golden score",
+        f"{selected_result.pre_golden_score:.2f}"
+        if selected_result.pre_golden_score is not None
+        else "None",
+    )
+    st.sidebar.metric(
+        "Latest spread %",
+        f"{latest_spread * 100:.2f}" if latest_spread is not None else "None",
+    )
+    st.sidebar.metric(
+        "Estimated days to cross",
+        f"{selected_result.days_to_cross_estimate:.1f}"
+        if selected_result.days_to_cross_estimate is not None
+        else "None",
+    )
     st.sidebar.metric("Latest signal", selected_result.latest_signal or "None")
     st.sidebar.metric("Signal date", str(_format_signal_date(selected_result.latest_signal_date)))
     st.sidebar.metric("Total crosses", len(selected_result.cross_dates))
