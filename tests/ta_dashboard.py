@@ -61,26 +61,6 @@ st.markdown(
         padding: 0;
     }
 
-    .st-key-refresh_pipeline_fixed {
-        position: fixed;
-        right: 1rem;
-        bottom: 1rem;
-        z-index: 1001;
-        background: var(--background-color);
-        padding: 0.4rem;
-        border: 1px solid var(--border-color);
-        border-radius: 0.5rem;
-        box-shadow: 0 8px 18px rgba(0, 0, 0, 0.18);
-    }
-
-    .st-key-refresh_pipeline_fixed [data-testid="stButton"] button {
-        background: var(--secondary-background-color) !important;
-        border: 1px solid var(--border-color) !important;
-        color: var(--text-color) !important;
-        font-weight: 700;
-        min-height: 2.5rem;
-    }
-
     @media (max-width: 900px) {
         .st-key-candidate_table_sticky {
             left: 0;
@@ -354,11 +334,6 @@ def main() -> None:
     if "selected_candidate_index" not in st.session_state:
         st.session_state.selected_candidate_index = 0
 
-    with st.container(key="refresh_pipeline_fixed"):
-        if st.button("Refresh pipeline", use_container_width=True):
-            load_results.clear()
-            st.session_state.selected_candidate_index = 0
-
     ranked, cfg = load_results()
 
     if not ranked:
@@ -425,6 +400,12 @@ def main() -> None:
         use_container_width=True,
         hide_index=True,
     )
+
+    _, refresh_col = st.columns([0.82, 0.18])
+    if refresh_col.button("Refresh pipeline", use_container_width=True):
+        load_results.clear()
+        st.session_state.selected_candidate_index = 0
+        st.rerun()
 
 
 if __name__ == "__main__":
