@@ -19,6 +19,7 @@ PROMPT_TEMPLATES_PATH = CONFIG_DIR / "prompt_templates.json"
 GOLD_EVAL_CASES_PATH = PROJECT_ROOT / "tests" / "fixtures" / "gold_eval_cases.json"
 
 SQLITE_DB_PATH = RUNTIME_DIR / "db" / "my_database.db"
+TA_SQLITE_CACHE_DB_PATH = RUNTIME_DIR / "db" / "ta_cache.db"
 CONVERSATION_MEMORY_PATH = RUNTIME_DIR / "memory" / "conversation_memory.json"
 QUERY_CONTEXT_DIR = RUNTIME_DIR / "query_context"
 
