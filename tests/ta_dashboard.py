@@ -14,6 +14,83 @@ from ta_pipe import PipelineConfig, run_pipeline, SignalResult
 st.set_page_config(
     page_title="TA Candidate Dashboard",
     layout="wide",
+    initial_sidebar_state="collapsed",
+)
+
+st.markdown(
+    """
+    <style>
+    [data-testid="stSidebar"], [data-testid="collapsedControl"] {
+        display: none;
+    }
+
+    .st-key-candidate_table_sticky {
+        position: fixed;
+        top: 3.25rem;
+        left: 0;
+        right: 0;
+        width: auto;
+        max-width: none;
+        z-index: 1000;
+        background: var(--background-color);
+        padding: 0.6rem 0 0.6rem;
+        border-bottom: 1px solid var(--border-color);
+        box-shadow: 0 8px 18px rgba(0, 0, 0, 0.18);
+    }
+
+    .st-key-candidate_table_sticky [data-testid="stHorizontalBlock"],
+    .st-key-candidate_table_sticky [data-testid="column"],
+    .st-key-candidate_table_sticky .stMarkdown {
+        background: var(--background-color);
+        color: var(--text-color);
+        margin-bottom: 0;
+    }
+
+    .st-key-candidate_table_sticky .stMarkdown p,
+    .st-key-candidate_table_sticky .stMarkdown strong {
+        color: var(--text-color);
+    }
+
+    .st-key-candidate_table_sticky [data-testid="stButton"] button {
+        background: var(--secondary-background-color) !important;
+        border: 2px solid var(--border-color) !important;
+        color: var(--text-color) !important;
+        font-size: 1.35rem;
+        font-weight: 700;
+        min-height: 2.75rem;
+        padding: 0;
+    }
+
+    .st-key-refresh_pipeline_fixed {
+        position: fixed;
+        right: 1rem;
+        bottom: 1rem;
+        z-index: 1001;
+        background: var(--background-color);
+        padding: 0.4rem;
+        border: 1px solid var(--border-color);
+        border-radius: 0.5rem;
+        box-shadow: 0 8px 18px rgba(0, 0, 0, 0.18);
+    }
+
+    .st-key-refresh_pipeline_fixed [data-testid="stButton"] button {
+        background: var(--secondary-background-color) !important;
+        border: 1px solid var(--border-color) !important;
+        color: var(--text-color) !important;
+        font-weight: 700;
+        min-height: 2.5rem;
+    }
+
+    @media (max-width: 900px) {
+        .st-key-candidate_table_sticky {
+            left: 0;
+            right: 0;
+            width: auto;
+        }
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
 )
 
 
@@ -49,9 +126,44 @@ def result_summary_df(results: list[SignalResult], top_n: int) -> pd.DataFrame:
             "total_crosses": len(r.cross_dates),
             "golden_crosses": r.cross_colors.count("green"),
             "death_crosses": r.cross_colors.count("red"),
-            "reasons": " | ".join(r.pre_golden_reasons[:4]),
         })
     return pd.DataFrame(rows)
+
+
+def selected_result_details_df(r: SignalResult) -> pd.DataFrame:
+    latest_spread = _latest_valid_value(r.spread)
+    values = [
+        ("Ticker", r.ticker),
+        (
+            "Pre-golden score",
+            f"{r.pre_golden_score:.2f}" if r.pre_golden_score is not None else "None",
+        ),
+        (
+            "Latest spread %",
+            f"{latest_spread * 100:.2f}" if latest_spread is not None else "None",
+        ),
+        (
+            "Estimated days to cross",
+            f"{r.days_to_cross_estimate:.1f}"
+            if r.days_to_cross_estimate is not None
+            else "None",
+        ),
+        ("Latest signal", r.latest_signal or "None"),
+        ("Signal date", str(_format_signal_date(r.latest_signal_date))),
+        ("Total crosses", len(r.cross_dates)),
+        ("Golden crosses", r.cross_colors.count("green")),
+        ("Death crosses", r.cross_colors.count("red")),
+    ]
+    return pd.DataFrame(values, columns=["metric", "value"])
+
+
+def selected_result_reasons_df(r: SignalResult) -> pd.DataFrame:
+    if not r.pre_golden_reasons:
+        return pd.DataFrame([{"reason": "None"}])
+    return pd.DataFrame(
+        {"reason": reason}
+        for reason in r.pre_golden_reasons
+    )
 
 
 def _add_series_trace(
@@ -105,7 +217,7 @@ def make_signal_chart(r: SignalResult, cfg: PipelineConfig) -> go.Figure:
         name=f"SMA {cfg.long_sma_period}",
         row=1,
         col=1,
-        color="#f8fafc",
+        color="#facc15",
     )
     _add_series_trace(
         fig,
@@ -207,7 +319,7 @@ def make_signal_chart(r: SignalResult, cfg: PipelineConfig) -> go.Figure:
     fig.add_hline(y=70, line_dash="dot", row=4, col=1)
 
     fig.update_layout(
-        title=f"{r.ticker} Pre-Golden-Cross Technical Setup",
+        title=r.ticker,
         height=980,
         hovermode="x unified",
         template="plotly_dark",
@@ -237,10 +349,15 @@ def load_results() -> tuple[list[SignalResult], PipelineConfig]:
 
 
 def main() -> None:
-    st.title("Pre-Golden-Cross Candidate Dashboard")
+    if "candidate_table_expanded" not in st.session_state:
+        st.session_state.candidate_table_expanded = True
+    if "selected_candidate_index" not in st.session_state:
+        st.session_state.selected_candidate_index = 0
 
-    if st.button("Refresh pipeline"):
-        st.cache_data.clear()
+    with st.container(key="refresh_pipeline_fixed"):
+        if st.button("Refresh pipeline", use_container_width=True):
+            load_results.clear()
+            st.session_state.selected_candidate_index = 0
 
     ranked, cfg = load_results()
 
@@ -249,42 +366,65 @@ def main() -> None:
         st.stop()
 
     summary = result_summary_df(ranked, cfg.top_n)
-    st.subheader("Top pre-golden-cross candidates")
-    st.dataframe(summary, use_container_width=True, hide_index=True)
+    with st.container(key="candidate_table_sticky"):
+        toggle_label = "▲" if st.session_state.candidate_table_expanded else "▼"
+        toggle_col, title_col = st.columns(
+            [0.06, 0.94],
+            vertical_alignment="center",
+        )
+        if toggle_col.button(
+            toggle_label,
+            key="toggle_candidate_table",
+            use_container_width=True,
+            help=(
+                "Collapse candidate table"
+                if st.session_state.candidate_table_expanded
+                else "Expand candidate table"
+            ),
+        ):
+            st.session_state.candidate_table_expanded = not st.session_state.candidate_table_expanded
+            st.rerun()
+        title_col.markdown("**Top pre-golden-cross candidates**")
 
-    selected_ticker = st.sidebar.radio(
-        "Candidates",
-        summary["ticker"].tolist(),
-        index=0,
+        if st.session_state.candidate_table_expanded:
+            table_state = st.dataframe(
+                summary,
+                use_container_width=True,
+                hide_index=True,
+                on_select="rerun",
+                selection_mode="single-row",
+                height=280,
+            )
+            selected_rows = table_state.selection.rows
+            if selected_rows and selected_rows[0] < len(summary):
+                st.session_state.selected_candidate_index = selected_rows[0]
+
+    spacer_height = 410 if st.session_state.candidate_table_expanded else 140
+    st.markdown(
+        f'<div style="height: {spacer_height}px;"></div>',
+        unsafe_allow_html=True,
     )
+    selected_index = st.session_state.selected_candidate_index
+    if selected_index >= len(summary):
+        selected_index = 0
+        st.session_state.selected_candidate_index = selected_index
+    selected_ticker = summary.iloc[selected_index]["ticker"]
     selected_result = next(r for r in ranked if r.ticker == selected_ticker)
-    latest_spread = _latest_valid_value(selected_result.spread)
-
-    st.sidebar.subheader(selected_result.ticker)
-    st.sidebar.metric(
-        "Pre-golden score",
-        f"{selected_result.pre_golden_score:.2f}"
-        if selected_result.pre_golden_score is not None
-        else "None",
-    )
-    st.sidebar.metric(
-        "Latest spread %",
-        f"{latest_spread * 100:.2f}" if latest_spread is not None else "None",
-    )
-    st.sidebar.metric(
-        "Estimated days to cross",
-        f"{selected_result.days_to_cross_estimate:.1f}"
-        if selected_result.days_to_cross_estimate is not None
-        else "None",
-    )
-    st.sidebar.metric("Latest signal", selected_result.latest_signal or "None")
-    st.sidebar.metric("Signal date", str(_format_signal_date(selected_result.latest_signal_date)))
-    st.sidebar.metric("Total crosses", len(selected_result.cross_dates))
-    st.sidebar.metric("Golden crosses", selected_result.cross_colors.count("green"))
-    st.sidebar.metric("Death crosses", selected_result.cross_colors.count("red"))
 
     fig = make_signal_chart(selected_result, cfg)
     st.plotly_chart(fig, use_container_width=True)
+
+    st.subheader(f"{selected_result.ticker} details")
+    st.dataframe(
+        selected_result_details_df(selected_result),
+        use_container_width=True,
+        hide_index=True,
+    )
+    st.dataframe(
+        selected_result_reasons_df(selected_result),
+        use_container_width=True,
+        hide_index=True,
+    )
 
 
 if __name__ == "__main__":

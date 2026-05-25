@@ -1328,7 +1328,7 @@ def plot_signal_result(
     # Price lines
     sns.lineplot(x=r.close.index, y=r.close, ax=ax, color="steelblue", linewidth=1.2, label="Close")
     sns.lineplot(x=r.sma_50.index, y=r.sma_50, ax=ax, color="orange", linewidth=1.5, linestyle="--", label=f"SMA({cfg.short_sma_period})")
-    sns.lineplot(x=r.sma_200.index, y=r.sma_200, ax=ax, color="white", linewidth=1.8, label=f"SMA({cfg.long_sma_period})")
+    sns.lineplot(x=r.sma_200.index, y=r.sma_200, ax=ax, color="#facc15", linewidth=1.8, label=f"SMA({cfg.long_sma_period})")
     sns.lineplot(x=r.vwma_50.index, y=r.vwma_50, ax=ax, color="crimson", linewidth=1.5, linestyle="-.", label=f"VWMA({cfg.vwma_period})")
 
     # Regime shading
