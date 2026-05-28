@@ -125,6 +125,28 @@ class PipelineConfig:
     show_plots_at_end: bool = True
     save_plots: bool = False
     plot_dir: str = "plots"
+    impulse_donchian_short: int = 20
+    impulse_donchian_long: int = 55
+    impulse_return_z_window: int = 20
+    impulse_return_z_threshold: float = 2.0
+    impulse_atr_period: int = 14
+    impulse_atr_move_threshold: float = 1.5
+    impulse_relative_volume_short: int = 5
+    impulse_relative_volume_long: int = 20
+    impulse_relative_volume_threshold: float = 1.5
+    impulse_ema_fast: int = 8
+    impulse_ema_mid: int = 21
+    impulse_ema_slow: int = 50
+    impulse_min_score: float = 7.0
+    transition_min_score: float = 5.0
+    relative_strength_benchmarks: list[str] = field(
+        default_factory=lambda: ["QQQ", "SOXX", "SMH"]
+    )
+    relative_strength_window: int = 20
+    bullish_impulse_weight: float = 0.35
+    pre_golden_weight: float = 0.25
+    relative_strength_weight: float = 0.15
+    liquidity_volume_weight: float = 0.10
 
 
 @dataclass
@@ -899,6 +921,22 @@ class SignalResult:
     macd_signal: pd.Series | None = None
     macd_hist: pd.Series | None = None
     rsi: pd.Series | None = None
+    bullish_impulse_score: float | None = None
+    bullish_impulse_reasons: list[str] = field(default_factory=list)
+    relative_strength_score: float | None = None
+    relative_strength_reasons: list[str] = field(default_factory=list)
+    liquidity_volume_score: float | None = None
+    final_bullish_score: float | None = None
+    regime_label: str | None = None
+    donchian_20_high: pd.Series | None = None
+    donchian_55_high: pd.Series | None = None
+    ret_z_20: pd.Series | None = None
+    atr_14: pd.Series | None = None
+    atr_move: pd.Series | None = None
+    relative_volume: pd.Series | None = None
+    ema_8: pd.Series | None = None
+    ema_21: pd.Series | None = None
+    ema_50: pd.Series | None = None
     error: str | None = None
 
 
@@ -1057,6 +1095,292 @@ def compute_pre_golden_metrics(
     return score, reasons, days_to_cross, macd, macd_signal, macd_hist, rsi
 
 
+def compute_bullish_impulse_metrics(
+    close: pd.Series,
+    high: pd.Series,
+    low: pd.Series,
+    volume: pd.Series,
+    sma_50: pd.Series,
+    sma_200: pd.Series,
+    macd_hist: pd.Series,
+    rsi: pd.Series,
+    cfg: PipelineConfig,
+) -> tuple[
+    float,
+    list[str],
+    float,
+    pd.Series,
+    pd.Series,
+    pd.Series,
+    pd.Series,
+    pd.Series,
+    pd.Series,
+    pd.Series,
+    pd.Series,
+    pd.Series,
+]:
+    """Score fast bullish breakouts without using future bars."""
+    close = pd.to_numeric(close, errors="coerce").sort_index()
+    high = pd.to_numeric(high, errors="coerce").reindex(close.index)
+    low = pd.to_numeric(low, errors="coerce").reindex(close.index)
+    volume = pd.to_numeric(volume, errors="coerce").reindex(close.index)
+
+    donchian_short_high = close.shift(1).rolling(cfg.impulse_donchian_short).max()
+    donchian_long_high = close.shift(1).rolling(cfg.impulse_donchian_long).max()
+
+    ret_1d = close.pct_change()
+    ret_mean = ret_1d.rolling(cfg.impulse_return_z_window).mean()
+    ret_std = ret_1d.rolling(cfg.impulse_return_z_window).std()
+    ret_z = ((ret_1d - ret_mean) / ret_std.replace(0, np.nan)).replace(
+        [np.inf, -np.inf],
+        np.nan,
+    )
+
+    prev_close = close.shift(1)
+    true_range = pd.concat(
+        [
+            high - low,
+            (high - prev_close).abs(),
+            (low - prev_close).abs(),
+        ],
+        axis=1,
+    ).max(axis=1, skipna=True)
+    atr = true_range.rolling(cfg.impulse_atr_period).mean()
+    atr_move = ((close - prev_close) / atr.replace(0, np.nan)).replace(
+        [np.inf, -np.inf],
+        np.nan,
+    )
+
+    volume_short = volume.rolling(cfg.impulse_relative_volume_short).mean()
+    volume_long = volume.rolling(cfg.impulse_relative_volume_long).mean()
+    relative_volume = (volume_short / volume_long.replace(0, np.nan)).replace(
+        [np.inf, -np.inf],
+        np.nan,
+    )
+
+    ema_fast = close.ewm(span=cfg.impulse_ema_fast, adjust=False).mean()
+    ema_mid = close.ewm(span=cfg.impulse_ema_mid, adjust=False).mean()
+    ema_slow = close.ewm(span=cfg.impulse_ema_slow, adjust=False).mean()
+    ema_mid_slope_5d = ema_mid.pct_change(5).replace([np.inf, -np.inf], np.nan)
+
+    latest_close = _series_value(close)
+    latest_short_high = _series_value(donchian_short_high)
+    latest_long_high = _series_value(donchian_long_high)
+    latest_ret_z = _series_value(ret_z)
+    latest_atr_move = _series_value(atr_move)
+    latest_relative_volume = _series_value(relative_volume)
+    latest_ema_fast = _series_value(ema_fast)
+    latest_ema_mid = _series_value(ema_mid)
+    latest_ema_slow = _series_value(ema_slow)
+    latest_ema_mid_slope_5d = _series_value(ema_mid_slope_5d)
+    latest_sma_50 = _series_value(sma_50)
+    latest_sma_200 = _series_value(sma_200)
+    latest_macd_hist = _series_value(macd_hist)
+    macd_hist_3d_ago = _value_days_ago(macd_hist, 3)
+    latest_rsi = _series_value(rsi)
+
+    score = 0.0
+    reasons: list[str] = []
+
+    if latest_close is not None and latest_short_high is not None and latest_close > latest_short_high:
+        score += 2.0
+        reasons.append(f"broke above {cfg.impulse_donchian_short}-day high")
+    if latest_close is not None and latest_long_high is not None and latest_close > latest_long_high:
+        score += 2.0
+        reasons.append(f"broke above {cfg.impulse_donchian_long}-day high")
+    if latest_ret_z is not None and latest_ret_z >= cfg.impulse_return_z_threshold:
+        score += 2.0
+        reasons.append("return z-score above threshold")
+    if latest_atr_move is not None and latest_atr_move >= cfg.impulse_atr_move_threshold:
+        score += 2.0
+        reasons.append("ATR-adjusted price impulse")
+    if (
+        latest_relative_volume is not None
+        and latest_relative_volume >= cfg.impulse_relative_volume_threshold
+    ):
+        score += 1.5
+        reasons.append("relative volume expansion")
+    if (
+        latest_ema_fast is not None
+        and latest_ema_mid is not None
+        and latest_ema_fast > latest_ema_mid
+    ):
+        score += 1.5
+        reasons.append(f"EMA{cfg.impulse_ema_fast} above EMA{cfg.impulse_ema_mid}")
+    if latest_close is not None and latest_ema_mid is not None and latest_close > latest_ema_mid:
+        score += 1.0
+        reasons.append(f"price above EMA{cfg.impulse_ema_mid}")
+    if latest_ema_mid_slope_5d is not None and latest_ema_mid_slope_5d > 0:
+        score += 1.0
+        reasons.append(f"EMA{cfg.impulse_ema_mid} rising")
+    if (
+        latest_ema_mid is not None
+        and latest_ema_slow is not None
+        and latest_ema_mid > latest_ema_slow
+    ):
+        score += 1.0
+        reasons.append(f"EMA{cfg.impulse_ema_mid} above EMA{cfg.impulse_ema_slow}")
+    if latest_close is not None and latest_sma_200 is not None and latest_close > latest_sma_200:
+        score += 2.0
+        reasons.append("price reclaimed SMA200")
+    if latest_close is not None and latest_sma_50 is not None and latest_close > latest_sma_50:
+        score += 1.0
+        reasons.append("price above SMA50")
+    if (
+        latest_macd_hist is not None
+        and macd_hist_3d_ago is not None
+        and latest_macd_hist > macd_hist_3d_ago
+    ):
+        score += 1.0
+        reasons.append("MACD histogram rising")
+    if latest_rsi is not None and 50 <= latest_rsi <= 75:
+        score += 1.0
+        reasons.append("RSI in bullish range")
+
+    liquidity_volume_score = 0.0
+    if latest_relative_volume is not None:
+        scaled_volume = latest_relative_volume / cfg.impulse_relative_volume_threshold
+        liquidity_volume_score = max(0.0, min(10.0, scaled_volume * 5.0))
+
+    return (
+        score,
+        reasons,
+        liquidity_volume_score,
+        donchian_short_high,
+        donchian_long_high,
+        ret_z,
+        atr,
+        atr_move,
+        relative_volume,
+        ema_fast,
+        ema_mid,
+        ema_slow,
+    )
+
+
+def _normalize_datetime_index(series: pd.Series) -> pd.Series:
+    normalized = series.copy()
+    normalized.index = pd.to_datetime(normalized.index)
+    if getattr(normalized.index, "tz", None) is not None:
+        normalized.index = normalized.index.tz_localize(None)
+    return normalized.sort_index()
+
+
+def compute_relative_strength_score(
+    ticker: str,
+    close: pd.Series,
+    cfg: PipelineConfig,
+) -> tuple[float, list[str]]:
+    """Compare latest ticker relative strength against configured benchmarks."""
+    close = _normalize_datetime_index(pd.to_numeric(close, errors="coerce").dropna())
+    if close.empty or not cfg.relative_strength_benchmarks:
+        return 0.0, ["relative strength unavailable"]
+
+    start = close.index.min().date().isoformat()
+    end = (close.index.max().date() + timedelta(days=1)).isoformat()
+    scores: list[float] = []
+    reasons: list[str] = []
+
+    for benchmark in cfg.relative_strength_benchmarks:
+        try:
+            downloaded = yf.download(
+                benchmark,
+                start=start,
+                end=end,
+                interval="1d",
+                auto_adjust=False,
+                progress=False,
+                threads=False,
+            )
+            bench_hist = _history_for_ticker(downloaded, benchmark)
+            if bench_hist is None or bench_hist.empty:
+                continue
+            price_col = "Adj Close" if "Adj Close" in bench_hist.columns else "Close"
+            if price_col not in bench_hist.columns:
+                continue
+            bench_close = _normalize_datetime_index(
+                pd.to_numeric(bench_hist[price_col], errors="coerce").dropna()
+            )
+            aligned_benchmark = bench_close.reindex(close.index).ffill()
+            aligned = pd.DataFrame(
+                {"ticker": close, "benchmark": aligned_benchmark}
+            ).dropna()
+            if len(aligned) <= cfg.relative_strength_window:
+                continue
+            rs = (aligned["ticker"] / aligned["benchmark"].replace(0, np.nan)).replace(
+                [np.inf, -np.inf],
+                np.nan,
+            )
+            rs_sma = rs.rolling(cfg.relative_strength_window).mean()
+            latest_rs = _series_value(rs)
+            latest_rs_sma = _series_value(rs_sma)
+            rs_change = _series_value(rs.pct_change(cfg.relative_strength_window))
+            if latest_rs is None or latest_rs_sma is None:
+                continue
+
+            benchmark_score = 0.0
+            if latest_rs > latest_rs_sma:
+                benchmark_score += 1.0
+                reasons.append(f"RS above {benchmark} average")
+            if rs_change is not None and rs_change > 0:
+                benchmark_score += 1.0
+                reasons.append(f"{cfg.relative_strength_window}d RS rising vs {benchmark}")
+            scores.append(benchmark_score)
+        except Exception as exc:
+            log.debug("Relative strength failed for %s vs %s: %s", ticker, benchmark, exc)
+
+    if not scores:
+        return 0.0, ["relative strength unavailable"]
+
+    return float(sum(scores) / len(scores)), reasons or ["relative strength neutral"]
+
+
+def classify_regime(
+    *,
+    latest_close: float | None,
+    latest_sma_50: float | None,
+    latest_sma_200: float | None,
+    latest_spread: float | None,
+    bullish_impulse_score: float | None,
+    pre_golden_score: float | None,
+    cfg: PipelineConfig,
+) -> str:
+    if (
+        latest_sma_50 is not None
+        and latest_sma_200 is not None
+        and latest_close is not None
+        and latest_sma_50 > latest_sma_200
+        and latest_close > latest_sma_200
+    ):
+        return "confirmed_bullish"
+    if bullish_impulse_score is not None and bullish_impulse_score >= cfg.impulse_min_score:
+        return "bullish_impulse"
+    if (
+        latest_close is not None
+        and latest_sma_50 is not None
+        and latest_sma_200 is not None
+        and latest_close > latest_sma_200
+        and latest_sma_50 < latest_sma_200
+    ):
+        return "bullish_transition"
+    if (
+        pre_golden_score is not None
+        and latest_spread is not None
+        and pre_golden_score >= cfg.transition_min_score
+        and latest_spread < 0
+    ):
+        return "pre_golden_setup"
+    if (
+        latest_sma_50 is not None
+        and latest_sma_200 is not None
+        and latest_close is not None
+        and latest_sma_50 < latest_sma_200
+        and latest_close < latest_sma_200
+    ):
+        return "bearish_or_weak"
+    return "neutral"
+
+
 def _ensure_datetime_index(series: pd.Series) -> pd.Series:
     if hasattr(series.index, "to_timestamp"):
         series.index = series.index.to_timestamp()
@@ -1123,10 +1447,17 @@ def compute_signals(ticker: str, cfg: PipelineConfig) -> SignalResult:
             return empty
 
         close = pd.to_numeric(hist["Close"], errors="coerce").sort_index()
-        volume = pd.to_numeric(hist["Volume"], errors="coerce").sort_index()
+        volume_source = hist["Volume"] if "Volume" in hist.columns else pd.Series(np.nan, index=hist.index)
+        high_source = hist["High"] if "High" in hist.columns else pd.Series(np.nan, index=hist.index)
+        low_source = hist["Low"] if "Low" in hist.columns else pd.Series(np.nan, index=hist.index)
+        volume = pd.to_numeric(volume_source, errors="coerce").sort_index()
+        high = pd.to_numeric(high_source, errors="coerce").sort_index()
+        low = pd.to_numeric(low_source, errors="coerce").sort_index()
 
         close = _ensure_datetime_index(close)
-        volume = _ensure_datetime_index(volume)
+        volume = _ensure_datetime_index(volume).reindex(close.index)
+        high = _ensure_datetime_index(high).reindex(close.index)
+        low = _ensure_datetime_index(low).reindex(close.index)
 
         if close.dropna().empty:
             empty.error = "no price data"
@@ -1156,6 +1487,54 @@ def compute_signals(ticker: str, cfg: PipelineConfig) -> SignalResult:
             sma_50=sma_50,
             sma_200=sma_200,
             vwma_50=vwma_50,
+        )
+        (
+            bullish_impulse_score,
+            bullish_impulse_reasons,
+            liquidity_volume_score,
+            donchian_20_high,
+            donchian_55_high,
+            ret_z_20,
+            atr_14,
+            atr_move,
+            relative_volume,
+            ema_8,
+            ema_21,
+            ema_50,
+        ) = compute_bullish_impulse_metrics(
+            close=close,
+            high=high,
+            low=low,
+            volume=volume,
+            sma_50=sma_50,
+            sma_200=sma_200,
+            macd_hist=macd_hist,
+            rsi=rsi,
+            cfg=cfg,
+        )
+        relative_strength_score, relative_strength_reasons = compute_relative_strength_score(
+            ticker=ticker,
+            close=close,
+            cfg=cfg,
+        )
+        final_bullish_score = (
+            cfg.bullish_impulse_weight * bullish_impulse_score
+            + cfg.pre_golden_weight * pre_golden_score
+            + cfg.relative_strength_weight * relative_strength_score
+            + cfg.liquidity_volume_weight * liquidity_volume_score
+        )
+        latest_close = _series_value(close)
+        latest_sma_50 = _series_value(sma_50)
+        latest_sma_200 = _series_value(sma_200)
+        latest_spread = _series_value(spread)
+        regime_label = classify_regime(
+            latest_close=latest_close,
+            latest_sma_50=latest_sma_50,
+            latest_sma_200=latest_sma_200,
+            latest_spread=latest_spread,
+            bullish_impulse_score=bullish_impulse_score,
+            pre_golden_score=pre_golden_score,
+            cfg=cfg,
         )
 
         regular_bullish_trend = (close > sma_200) & (sma_50 > sma_200)
@@ -1227,6 +1606,14 @@ def compute_signals(ticker: str, cfg: PipelineConfig) -> SignalResult:
 
         latest_signal = cross_colors[-1] if cross_colors else None
         latest_date = cross_dates[-1] if cross_dates else None
+        log.info(
+            "%s regime=%s final_score=%.2f impulse=%.2f pre_golden=%.2f",
+            ticker,
+            regime_label,
+            final_bullish_score,
+            bullish_impulse_score,
+            pre_golden_score,
+        )
 
         return SignalResult(
             ticker=ticker,
@@ -1252,6 +1639,22 @@ def compute_signals(ticker: str, cfg: PipelineConfig) -> SignalResult:
             macd_signal=macd_signal,
             macd_hist=macd_hist,
             rsi=rsi,
+            bullish_impulse_score=bullish_impulse_score,
+            bullish_impulse_reasons=bullish_impulse_reasons,
+            relative_strength_score=relative_strength_score,
+            relative_strength_reasons=relative_strength_reasons,
+            liquidity_volume_score=liquidity_volume_score,
+            final_bullish_score=final_bullish_score,
+            regime_label=regime_label,
+            donchian_20_high=donchian_20_high,
+            donchian_55_high=donchian_55_high,
+            ret_z_20=ret_z_20,
+            atr_14=atr_14,
+            atr_move=atr_move,
+            relative_volume=relative_volume,
+            ema_8=ema_8,
+            ema_21=ema_21,
+            ema_50=ema_50,
         )
 
     except Exception as exc:
@@ -1264,40 +1667,52 @@ def rank_candidates(
     require_bullish: bool = False,
 ) -> list[SignalResult]:
     """
-    Rank tickers by pre-golden-cross setup strength.
+    Rank tickers by fast bullish score while retaining pre-golden setups.
 
     require_bullish is retained for backward compatibility with older callers.
     """
-    log.info("── Stage 3: ranking pre-golden-cross candidates ─────────────")
+    log.info("── Stage 3: ranking bullish candidates ─────────────")
 
     def latest_spread_for(r: SignalResult) -> float | None:
         return _latest_valid_value(r.spread)
 
+    allowed_regimes = {
+        "bullish_impulse",
+        "bullish_transition",
+        "pre_golden_setup",
+        "confirmed_bullish",
+    }
     filtered = [
         r for r in results
         if not r.error
-        and r.pre_golden_score is not None
-        and r.pre_golden_score > 0
-        and latest_spread_for(r) is not None
-        and latest_spread_for(r) < 0
+        and r.regime_label in allowed_regimes
+        and r.final_bullish_score is not None
+        and r.final_bullish_score > 0
     ]
 
     def sort_key(r: SignalResult):
-        latest_spread = abs(latest_spread_for(r) or 9999)
+        latest_spread = latest_spread_for(r)
+        closest_negative_spread = (
+            -abs(latest_spread)
+            if latest_spread is not None and latest_spread < 0
+            else -9999.0
+        )
         days_to_cross = (
             r.days_to_cross_estimate
             if r.days_to_cross_estimate is not None
             else 9999
         )
         return (
-            r.pre_golden_score,
-            -latest_spread,
+            r.final_bullish_score or 0.0,
+            r.bullish_impulse_score or 0.0,
+            r.pre_golden_score or 0.0,
+            closest_negative_spread,
             -days_to_cross,
         )
 
     ranked = sorted(filtered, key=sort_key, reverse=True)
     log.info(
-        "%d tickers with pre-golden-cross setups, returning top candidates",
+        "%d tickers with bullish regimes, returning top candidates",
         len(ranked),
     )
     return ranked
@@ -1330,6 +1745,12 @@ def plot_signal_result(
     sns.lineplot(x=r.sma_50.index, y=r.sma_50, ax=ax, color="orange", linewidth=1.5, linestyle="--", label=f"SMA({cfg.short_sma_period})")
     sns.lineplot(x=r.sma_200.index, y=r.sma_200, ax=ax, color="#facc15", linewidth=1.8, label=f"SMA({cfg.long_sma_period})")
     sns.lineplot(x=r.vwma_50.index, y=r.vwma_50, ax=ax, color="crimson", linewidth=1.5, linestyle="-.", label=f"VWMA({cfg.vwma_period})")
+    if r.ema_8 is not None:
+        sns.lineplot(x=r.ema_8.index, y=r.ema_8, ax=ax, color="#93c5fd", linewidth=0.9, alpha=0.75, label=f"EMA({cfg.impulse_ema_fast})")
+    if r.ema_21 is not None:
+        sns.lineplot(x=r.ema_21.index, y=r.ema_21, ax=ax, color="#a7f3d0", linewidth=0.9, alpha=0.75, linestyle="--", label=f"EMA({cfg.impulse_ema_mid})")
+    if r.ema_50 is not None:
+        sns.lineplot(x=r.ema_50.index, y=r.ema_50, ax=ax, color="#c4b5fd", linewidth=0.9, alpha=0.75, linestyle=":", label=f"EMA({cfg.impulse_ema_slow})")
 
     # Regime shading
     ymin, ymax = ax.get_ylim()
@@ -1351,6 +1772,20 @@ def plot_signal_result(
         rx, ry = zip(*bearish)
         ax.scatter(rx, ry, zorder=5, s=80, color="red", edgecolors="white", linewidths=0.8,
                    label=f"Confirmed SMA({cfg.short_sma_period}) cross below SMA({cfg.long_sma_period}) [{len(bearish)}]")
+    if r.regime_label == "bullish_impulse" and r.close is not None and not r.close.dropna().empty:
+        latest_close = r.close.dropna().iloc[-1]
+        latest_date = r.close.dropna().index[-1]
+        ax.scatter(
+            [latest_date],
+            [latest_close],
+            zorder=6,
+            s=130,
+            marker="*",
+            color="#38bdf8",
+            edgecolors="white",
+            linewidths=1.0,
+            label="Latest bullish impulse",
+        )
 
     # Forward return labels
     for d, p, fwd in zip(r.cross_dates, r.cross_prices, r.forward_returns):
@@ -1385,11 +1820,12 @@ def plot_signal_result(
         for txt in leg.get_texts():
             txt.set_color("white")
 
+    final_score_text = f"{r.final_bullish_score:.2f}" if r.final_bullish_score is not None else "N/A"
     ax.set_title(
-        f"{ticker} | {cfg.start_date} → {end_date} | "
-        f"SMA({cfg.short_sma_period}), SMA({cfg.long_sma_period}), VWMA({cfg.vwma_period}) | "
-        f"Confirmed crosses | {cfg.forward_days}d fwd return",
-        fontsize=13, color="white",
+        f"{ticker} | Regime={r.regime_label or 'N/A'} | Final Score={final_score_text} | "
+        f"{cfg.start_date} to {end_date} | Confirmed crosses | {cfg.forward_days}d fwd return",
+        fontsize=13,
+        color="white",
     )
     ax.set_ylabel("Price", color="white")
     ax2.xaxis.set_major_formatter(mdates.DateFormatter("%Y-%m-%d"))
@@ -1410,25 +1846,31 @@ def plot_signal_result(
     plt.close(fig)
 
 def print_summary(ranked: list[SignalResult], cfg: PipelineConfig) -> pd.DataFrame:
-    """Print and return a DataFrame summarising the top pre-cross candidates."""
+    """Print and return a DataFrame summarising the top bullish candidates."""
     rows = []
     for r in ranked[: cfg.top_n]:
         latest_spread = _latest_valid_value(r.spread)
+        reasons = (
+            list(r.bullish_impulse_reasons[:3])
+            + list(r.pre_golden_reasons[:2])
+            + list(r.relative_strength_reasons[:2])
+        )
         rows.append({
-            "ticker":            r.ticker,
-            "pre_golden_score":  round(r.pre_golden_score, 2) if r.pre_golden_score is not None else None,
-            "spread_%":          round(latest_spread * 100, 2) if latest_spread is not None else None,
-            "est_days_to_cross": round(r.days_to_cross_estimate, 1) if r.days_to_cross_estimate is not None else None,
-            "latest_signal":     r.latest_signal,
-            "signal_date":       r.latest_signal_date.date() if r.latest_signal_date else None,
-            "total_crosses":     len(r.cross_dates),
-            "golden_crosses":    r.cross_colors.count("green"),
-            "death_crosses":     r.cross_colors.count("red"),
-            "reasons":           " | ".join(r.pre_golden_reasons[:4]),
+            "ticker":                 r.ticker,
+            "regime_label":           r.regime_label,
+            "final_bullish_score":    round(r.final_bullish_score, 2) if r.final_bullish_score is not None else None,
+            "bullish_impulse_score":  round(r.bullish_impulse_score, 2) if r.bullish_impulse_score is not None else None,
+            "pre_golden_score":       round(r.pre_golden_score, 2) if r.pre_golden_score is not None else None,
+            "relative_strength_score": round(r.relative_strength_score, 2) if r.relative_strength_score is not None else None,
+            "spread_%":               round(latest_spread * 100, 2) if latest_spread is not None else None,
+            "est_days_to_cross":      round(r.days_to_cross_estimate, 1) if r.days_to_cross_estimate is not None else None,
+            "latest_signal":          r.latest_signal,
+            "signal_date":            r.latest_signal_date.date() if r.latest_signal_date else None,
+            "reasons":                " | ".join(reasons),
         })
 
     df = pd.DataFrame(rows)
-    print("\n── Top pre-golden-cross candidates ──────────────────────────")
+    print("\n── Top bullish candidates ──────────────────────────")
     print(df.to_string(index=False))
     print()
     return df
@@ -1472,7 +1914,7 @@ def run_pipeline(cfg: PipelineConfig | None = None) -> list[SignalResult]:
     ranked = rank_candidates(results, require_bullish=False)
 
     if not ranked:
-        log.info("No tickers with pre-golden-cross setups found.")
+        log.info("No tickers with bullish regimes found.")
         return []
 
     print_summary(ranked, cfg)

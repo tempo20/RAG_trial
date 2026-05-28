@@ -115,7 +115,11 @@ def result_summary_df(results: list[SignalResult], top_n: int) -> pd.DataFrame:
         rows.append({
             "rank": rank,
             "ticker": r.ticker,
+            "regime_label": r.regime_label,
+            "final_bullish_score": round(r.final_bullish_score, 2) if r.final_bullish_score is not None else None,
+            "bullish_impulse_score": round(r.bullish_impulse_score, 2) if r.bullish_impulse_score is not None else None,
             "pre_golden_score": round(r.pre_golden_score, 2) if r.pre_golden_score is not None else None,
+            "relative_strength_score": round(r.relative_strength_score, 2) if r.relative_strength_score is not None else None,
             "spread_%": round(latest_spread * 100, 2) if latest_spread is not None else None,
             "est_days_to_cross": round(r.days_to_cross_estimate, 1) if r.days_to_cross_estimate is not None else None,
             "latest_signal": r.latest_signal,
@@ -131,9 +135,26 @@ def selected_result_details_df(r: SignalResult) -> pd.DataFrame:
     latest_spread = _latest_valid_value(r.spread)
     values = [
         ("Ticker", r.ticker),
+        ("Regime", r.regime_label or "None"),
+        (
+            "Final bullish score",
+            f"{r.final_bullish_score:.2f}" if r.final_bullish_score is not None else "None",
+        ),
+        (
+            "Bullish impulse score",
+            f"{r.bullish_impulse_score:.2f}" if r.bullish_impulse_score is not None else "None",
+        ),
         (
             "Pre-golden score",
             f"{r.pre_golden_score:.2f}" if r.pre_golden_score is not None else "None",
+        ),
+        (
+            "Relative strength score",
+            f"{r.relative_strength_score:.2f}" if r.relative_strength_score is not None else "None",
+        ),
+        (
+            "Liquidity/volume score",
+            f"{r.liquidity_volume_score:.2f}" if r.liquidity_volume_score is not None else "None",
         ),
         (
             "Latest spread %",
@@ -155,12 +176,14 @@ def selected_result_details_df(r: SignalResult) -> pd.DataFrame:
 
 
 def selected_result_reasons_df(r: SignalResult) -> pd.DataFrame:
-    if not r.pre_golden_reasons:
-        return pd.DataFrame([{"reason": "None"}])
-    return pd.DataFrame(
-        {"reason": reason}
-        for reason in r.pre_golden_reasons
+    rows = (
+        [{"category": "bullish_impulse", "reason": reason} for reason in r.bullish_impulse_reasons]
+        + [{"category": "pre_golden", "reason": reason} for reason in r.pre_golden_reasons]
+        + [{"category": "relative_strength", "reason": reason} for reason in r.relative_strength_reasons]
     )
+    if not rows:
+        return pd.DataFrame([{"reason": "None"}])
+    return pd.DataFrame(rows)
 
 
 def ticker_news_df(
@@ -421,6 +444,32 @@ def make_signal_chart(r: SignalResult, cfg: PipelineConfig) -> go.Figure:
         color="#fb7185",
         dash="dot",
     )
+    _add_series_trace(
+        fig,
+        r.ema_8,
+        name=f"EMA {cfg.impulse_ema_fast}",
+        row=1,
+        col=1,
+        color="#93c5fd",
+    )
+    _add_series_trace(
+        fig,
+        r.ema_21,
+        name=f"EMA {cfg.impulse_ema_mid}",
+        row=1,
+        col=1,
+        color="#a7f3d0",
+        dash="dash",
+    )
+    _add_series_trace(
+        fig,
+        r.ema_50,
+        name=f"EMA {cfg.impulse_ema_slow}",
+        row=1,
+        col=1,
+        color="#c4b5fd",
+        dash="dot",
+    )
 
     golden = []
     death = []
@@ -461,6 +510,26 @@ def make_signal_chart(r: SignalResult, cfg: PipelineConfig) -> go.Figure:
                     "color": "#ef4444",
                     "size": 11,
                     "symbol": "triangle-down",
+                    "line": {"color": "white", "width": 1},
+                },
+            ),
+            row=1,
+            col=1,
+        )
+
+    if r.regime_label == "bullish_impulse" and r.close is not None and not r.close.dropna().empty:
+        latest_close = r.close.dropna().iloc[-1]
+        latest_date = r.close.dropna().index[-1]
+        fig.add_trace(
+            go.Scatter(
+                x=[latest_date],
+                y=[latest_close],
+                mode="markers",
+                name="Latest bullish impulse",
+                marker={
+                    "color": "#38bdf8",
+                    "size": 15,
+                    "symbol": "star",
                     "line": {"color": "white", "width": 1},
                 },
             ),
@@ -511,8 +580,9 @@ def make_signal_chart(r: SignalResult, cfg: PipelineConfig) -> go.Figure:
     fig.add_hline(y=45, line_dash="dot", row=4, col=1)
     fig.add_hline(y=70, line_dash="dot", row=4, col=1)
 
+    final_score_text = f"{r.final_bullish_score:.2f}" if r.final_bullish_score is not None else "N/A"
     fig.update_layout(
-        title=r.ticker,
+        title=f"{r.ticker} | Regime={r.regime_label or 'N/A'} | Final Score={final_score_text}",
         height=980,
         hovermode="x unified",
         template="plotly_dark",
@@ -573,7 +643,7 @@ def main() -> None:
         ):
             st.session_state.candidate_table_expanded = not st.session_state.candidate_table_expanded
             st.rerun()
-        title_col.markdown("**Top pre-golden-cross candidates**")
+        title_col.markdown("**Top bullish candidates**")
 
         if st.session_state.candidate_table_expanded:
             table_state = st.dataframe(
