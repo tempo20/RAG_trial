@@ -3,12 +3,29 @@
 
 from __future__ import annotations
 
+import importlib
+import json
+import re
+from pathlib import Path
+from typing import Any, Callable
+
 import pandas as pd
 import streamlit as st
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
+from rag_trial.chat import chatter
+from rag_trial.db import ta_cache
 from ta_pipe import PipelineConfig, run_pipeline, SignalResult
+
+if not all(
+    hasattr(ta_cache, name)
+    for name in ("load_fresh_fundamental_analysis", "load_articles_for_ticker")
+):
+    ta_cache = importlib.reload(ta_cache)
+
+
+FUNDAMENTAL_TOP_N = 15
 
 
 st.set_page_config(
@@ -130,9 +147,9 @@ def selected_result_details_df(r: SignalResult) -> pd.DataFrame:
         ),
         ("Latest signal", r.latest_signal or "None"),
         ("Signal date", str(_format_signal_date(r.latest_signal_date))),
-        ("Total crosses", len(r.cross_dates)),
-        ("Golden crosses", r.cross_colors.count("green")),
-        ("Death crosses", r.cross_colors.count("red")),
+        ("Total crosses", str(len(r.cross_dates))),
+        ("Golden crosses", str(r.cross_colors.count("green"))),
+        ("Death crosses", str(r.cross_colors.count("red"))),
     ]
     return pd.DataFrame(values, columns=["metric", "value"])
 
@@ -144,6 +161,202 @@ def selected_result_reasons_df(r: SignalResult) -> pd.DataFrame:
         {"reason": reason}
         for reason in r.pre_golden_reasons
     )
+
+
+def ticker_news_df(
+    ticker: str,
+    *,
+    db_path: str | Path | None = None,
+) -> pd.DataFrame:
+    rows = ta_cache.load_articles_for_ticker(ticker, db_path=db_path)
+    if not rows:
+        return pd.DataFrame(columns=["published", "source", "title", "url"])
+
+    return pd.DataFrame(
+        {
+            "published": row.get("publishedDate") or "",
+            "source": row.get("site") or "",
+            "title": row.get("title") or "",
+            "url": row.get("url") or "",
+        }
+        for row in rows
+    )
+
+
+def _fundamental_query(ticker: str) -> str:
+    return f"Is {ticker.upper()} fundamentally sound based on its financial statements?"
+
+
+def _extract_fundamental_fields(answer: str) -> tuple[str | None, int | None]:
+    assessment_match = re.search(
+        r"(?im)^\s*Fundamental Assessment:\s*(Sound|Mixed|Unsound)\s*$",
+        answer or "",
+    )
+    score_match = re.search(
+        r"(?im)^\s*Fundamental Score \(0-10\):\s*(10|[0-9])\s*$",
+        answer or "",
+    )
+    assessment = assessment_match.group(1) if assessment_match else None
+    score = int(score_match.group(1)) if score_match else None
+    return assessment, score
+
+
+def _successful_fundamental_result(result: dict[str, Any]) -> bool:
+    trace = result.get("retrieval_trace") or {}
+    return (
+        str(result.get("decision") or "").lower() == "answer"
+        and result.get("route_type") == "single_ticker_financial"
+        and bool(trace.get("finance_context_present"))
+        and bool(str(result.get("answer") or "").strip())
+    )
+
+
+def _row_from_cached_analysis(row: dict[str, Any]) -> dict[str, Any]:
+    trace_json = row.get("retrieval_trace_json") or "{}"
+    logs_json = row.get("logs_json") or "[]"
+    try:
+        retrieval_trace = json.loads(trace_json)
+    except json.JSONDecodeError:
+        retrieval_trace = {}
+    try:
+        logs = json.loads(logs_json)
+    except json.JSONDecodeError:
+        logs = []
+
+    return {
+        "ticker": row["ticker"],
+        "company_name": row.get("company_name"),
+        "query": row.get("query"),
+        "answer": row.get("answer") or "",
+        "decision": row.get("decision"),
+        "route_type": row.get("route_type"),
+        "fundamental_assessment": row.get("fundamental_assessment"),
+        "fundamental_score": row.get("fundamental_score"),
+        "finance_context_present": bool(row.get("finance_context_present")),
+        "news_context_present": bool(row.get("news_context_present")),
+        "news_query": row.get("news_query"),
+        "news_item_count": int(row.get("news_item_count") or 0),
+        "retrieval_trace": retrieval_trace,
+        "logs": logs,
+        "generated_at_utc": row.get("generated_at_utc"),
+        "updated_at_utc": row.get("updated_at_utc"),
+        "cache_status": "cache",
+        "stored": True,
+    }
+
+
+def _analysis_payload_from_route(
+    ticker: str,
+    company_name: str | None,
+    result: dict[str, Any],
+    *,
+    cache_status: str,
+    stored: bool,
+) -> dict[str, Any]:
+    trace = result.get("retrieval_trace") or {}
+    assessment, score = _extract_fundamental_fields(result.get("answer") or "")
+    resolved_target = result.get("resolved_target") or {}
+    return {
+        "ticker": ticker.upper(),
+        "company_name": resolved_target.get("display_name") or company_name,
+        "query": result.get("query") or _fundamental_query(ticker),
+        "answer": result.get("answer") or "",
+        "decision": result.get("decision"),
+        "route_type": result.get("route_type"),
+        "fundamental_assessment": assessment,
+        "fundamental_score": score,
+        "finance_context_present": bool(trace.get("finance_context_present")),
+        "news_context_present": bool(trace.get("news_context_present")),
+        "news_query": trace.get("news_query") or "",
+        "news_item_count": int(trace.get("news_item_count") or 0),
+        "retrieval_trace": trace,
+        "logs": result.get("logs") or [],
+        "generated_at_utc": None,
+        "updated_at_utc": None,
+        "cache_status": cache_status,
+        "stored": stored,
+    }
+
+
+def _persist_fundamental_result(
+    ticker: str,
+    company_name: str | None,
+    result: dict[str, Any],
+    *,
+    db_path: str | Path | None = None,
+) -> None:
+    trace = result.get("retrieval_trace") or {}
+    assessment, score = _extract_fundamental_fields(result.get("answer") or "")
+    resolved_target = result.get("resolved_target") or {}
+    ta_cache.upsert_fundamental_analysis(
+        ticker=ticker,
+        company_name=resolved_target.get("display_name") or company_name,
+        query=result.get("query") or _fundamental_query(ticker),
+        answer=result.get("answer") or "",
+        decision=result.get("decision"),
+        route_type=result.get("route_type"),
+        fundamental_assessment=assessment,
+        fundamental_score=score,
+        finance_context_present=bool(trace.get("finance_context_present")),
+        news_context_present=bool(trace.get("news_context_present")),
+        news_query=trace.get("news_query") or "",
+        news_item_count=int(trace.get("news_item_count") or 0),
+        retrieval_trace_json=json.dumps(trace, ensure_ascii=False),
+        logs_json=json.dumps(result.get("logs") or [], ensure_ascii=False),
+        db_path=db_path,
+    )
+
+
+def run_single_ticker_dashboard_analysis(
+    ticker: str,
+    company_name: str | None = None,
+) -> dict[str, Any]:
+    prompt = chatter.SINGLE_TICKER_FINANCIAL_PROMPT_TEMPLATE.format(
+        date_min="N/A",
+        date_max="N/A",
+    )
+    return chatter.run_single_ticker_fundamental_route(
+        query=_fundamental_query(ticker),
+        ticker=ticker,
+        company_name=company_name,
+        gen_client=chatter.create_generation_client(),
+        base_single_ticker_financial_prompt=prompt,
+        dump_query_contexts=False,
+    )
+
+
+def load_or_generate_fundamental_analyses(
+    ranked: list[SignalResult],
+    *,
+    top_n: int = FUNDAMENTAL_TOP_N,
+    route_runner: Callable[[str, str | None], dict[str, Any]] | None = None,
+    db_path: str | Path | None = None,
+) -> list[dict[str, Any]]:
+    runner = route_runner or run_single_ticker_dashboard_analysis
+    analyses: list[dict[str, Any]] = []
+
+    for result in ranked[:top_n]:
+        ticker = result.ticker.upper()
+        cached = ta_cache.load_fresh_fundamental_analysis(ticker, db_path=db_path)
+        if cached is not None:
+            analyses.append(_row_from_cached_analysis(cached))
+            continue
+
+        route_result = runner(ticker, None)
+        should_store = _successful_fundamental_result(route_result)
+        if should_store:
+            _persist_fundamental_result(ticker, None, route_result, db_path=db_path)
+        analyses.append(
+            _analysis_payload_from_route(
+                ticker,
+                None,
+                route_result,
+                cache_status="generated",
+                stored=should_store,
+            )
+        )
+
+    return analyses
 
 
 def _add_series_trace(
@@ -317,7 +530,7 @@ def make_signal_chart(r: SignalResult, cfg: PipelineConfig) -> go.Figure:
 @st.cache_data(show_spinner=True, ttl=3600)
 def load_results() -> tuple[list[SignalResult], PipelineConfig]:
     cfg = PipelineConfig(
-        top_n=20,
+        top_n=FUNDAMENTAL_TOP_N,
         plot=False,
         save_plots=False,
         start_date="2022-01-01",
@@ -341,6 +554,7 @@ def main() -> None:
         st.stop()
 
     summary = result_summary_df(ranked, cfg.top_n)
+    fundamental_analyses = load_or_generate_fundamental_analyses(ranked, top_n=FUNDAMENTAL_TOP_N)
     with st.container(key="candidate_table_sticky"):
         toggle_label = "▲" if st.session_state.candidate_table_expanded else "▼"
         toggle_col, title_col = st.columns(
@@ -350,7 +564,7 @@ def main() -> None:
         if toggle_col.button(
             toggle_label,
             key="toggle_candidate_table",
-            use_container_width=True,
+            width="stretch",
             help=(
                 "Collapse candidate table"
                 if st.session_state.candidate_table_expanded
@@ -364,7 +578,7 @@ def main() -> None:
         if st.session_state.candidate_table_expanded:
             table_state = st.dataframe(
                 summary,
-                use_container_width=True,
+                width="stretch",
                 hide_index=True,
                 on_select="rerun",
                 selection_mode="single-row",
@@ -387,22 +601,61 @@ def main() -> None:
     selected_result = next(r for r in ranked if r.ticker == selected_ticker)
 
     fig = make_signal_chart(selected_result, cfg)
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, width="stretch")
 
     st.subheader(f"{selected_result.ticker} details")
     st.dataframe(
         selected_result_details_df(selected_result),
-        use_container_width=True,
+        width="stretch",
         hide_index=True,
     )
     st.dataframe(
         selected_result_reasons_df(selected_result),
-        use_container_width=True,
+        width="stretch",
         hide_index=True,
     )
 
+    selected_analysis = next(
+        (
+            analysis
+            for analysis in fundamental_analyses
+            if analysis["ticker"] == selected_result.ticker
+        ),
+        None,
+    )
+    st.subheader(f"{selected_result.ticker} fundamental analysis")
+    if selected_analysis is None:
+        st.info("No fundamental analysis is available for the selected ticker.")
+    else:
+        source = "cache" if selected_analysis["cache_status"] == "cache" else "new"
+        stored_note = "" if selected_analysis["stored"] else " (not cached)"
+        st.caption(f"Source: {source}{stored_note}")
+        cols = st.columns(5)
+        cols[0].metric("Decision", selected_analysis.get("decision") or "N/A")
+        cols[1].metric("Assessment", selected_analysis.get("fundamental_assessment") or "N/A")
+        score = selected_analysis.get("fundamental_score")
+        cols[2].metric("Score", "N/A" if score is None else str(score))
+        cols[3].metric("Financial [F]", "yes" if selected_analysis.get("finance_context_present") else "no")
+        cols[4].metric("News Items", str(selected_analysis.get("news_item_count") or 0))
+        st.markdown(selected_analysis.get("answer") or "No analysis available.")
+
+        st.subheader(f"{selected_result.ticker} cached news")
+        news_df = ticker_news_df(selected_result.ticker)
+        if news_df.empty:
+            st.info("No cached news articles found for the selected ticker.")
+        else:
+            st.caption(f"{len(news_df)} cached articles from ta_cache.db")
+            st.dataframe(
+                news_df,
+                width="stretch",
+                hide_index=True,
+                column_config={
+                    "url": st.column_config.LinkColumn("URL"),
+                },
+            )
+
     _, refresh_col = st.columns([0.82, 0.18])
-    if refresh_col.button("Refresh pipeline", use_container_width=True):
+    if refresh_col.button("Refresh pipeline", width="stretch"):
         load_results.clear()
         st.session_state.selected_candidate_index = 0
         st.rerun()

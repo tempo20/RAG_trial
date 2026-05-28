@@ -4,7 +4,7 @@ import hashlib
 import os
 import re
 import sqlite3
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -43,6 +43,25 @@ CREATE TABLE IF NOT EXISTS ta_historical_daily_bars (
     fetched_at_utc TEXT NOT NULL,
     PRIMARY KEY (ticker, bar_date, provider)
 );
+
+CREATE TABLE IF NOT EXISTS ta_fundamental_analyses (
+    ticker TEXT PRIMARY KEY,
+    company_name TEXT,
+    query TEXT,
+    answer TEXT NOT NULL,
+    decision TEXT,
+    route_type TEXT,
+    fundamental_assessment TEXT,
+    fundamental_score INTEGER,
+    finance_context_present INTEGER,
+    news_context_present INTEGER,
+    news_query TEXT,
+    news_item_count INTEGER,
+    retrieval_trace_json TEXT,
+    logs_json TEXT,
+    generated_at_utc TEXT NOT NULL,
+    updated_at_utc TEXT NOT NULL
+);
 """
 
 
@@ -69,6 +88,25 @@ def cache_db_path() -> Path:
 
 def utc_now_iso() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+
+
+def _parse_utc_datetime(value: str) -> datetime | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _normalize_ticker(ticker: str) -> str:
+    return str(ticker or "").strip().upper()
 
 
 def connect(db_path: str | Path | None = None) -> sqlite3.Connection:
@@ -252,6 +290,62 @@ def load_articles_since(
     ]
 
 
+def load_articles_for_ticker(
+    ticker: str,
+    *,
+    provider: str = "fmp_stock_news",
+    limit: int | None = None,
+    db_path: str | Path | None = None,
+) -> list[dict[str, Any]]:
+    ticker_key = _normalize_ticker(ticker)
+    if not ticker_key:
+        return []
+
+    ensure_cache_db(db_path)
+    limit_clause = ""
+    params: list[Any] = [provider, ticker_key]
+    if limit is not None:
+        if limit <= 0:
+            return []
+        limit_clause = "LIMIT ?"
+        params.append(int(limit))
+
+    conn = connect(db_path)
+    try:
+        rows = conn.execute(
+            f"""
+            SELECT
+                a.article_id,
+                a.url,
+                a.title,
+                a.publisher,
+                a.published_at,
+                s.ticker
+            FROM ta_articles a
+            JOIN ta_article_symbols s ON s.article_id = a.article_id
+            WHERE a.provider = ?
+              AND s.ticker = ?
+            ORDER BY a.published_at DESC, a.article_id
+            {limit_clause}
+            """,
+            tuple(params),
+        ).fetchall()
+    finally:
+        conn.close()
+
+    return [
+        {
+            "article_id": row["article_id"],
+            "url": row["url"],
+            "title": row["title"],
+            "site": row["publisher"],
+            "publishedDate": row["published_at"],
+            "symbol": row["ticker"],
+        }
+        for row in rows
+    ]
+
+
 def latest_article_published_at(
     *,
     provider: str = "fmp_stock_news",
@@ -415,3 +509,150 @@ def latest_bar_date(
     finally:
         conn.close()
     return None if row is None else row["latest_date"]
+
+
+def upsert_fundamental_analysis(
+    *,
+    ticker: str,
+    answer: str,
+    company_name: str | None = None,
+    query: str | None = None,
+    decision: str | None = None,
+    route_type: str | None = None,
+    fundamental_assessment: str | None = None,
+    fundamental_score: int | None = None,
+    finance_context_present: bool | None = None,
+    news_context_present: bool | None = None,
+    news_query: str | None = None,
+    news_item_count: int | None = None,
+    retrieval_trace_json: str | None = None,
+    logs_json: str | None = None,
+    generated_at_utc: str | None = None,
+    updated_at_utc: str | None = None,
+    db_path: str | Path | None = None,
+) -> None:
+    ticker_key = _normalize_ticker(ticker)
+    if not ticker_key:
+        raise ValueError("ticker is required")
+    if not str(answer or "").strip():
+        raise ValueError("answer is required")
+
+    ensure_cache_db(db_path)
+    now = utc_now_iso()
+    generated_at = generated_at_utc or now
+    updated_at = updated_at_utc or now
+    conn = connect(db_path)
+    try:
+        conn.execute(
+            """
+            INSERT INTO ta_fundamental_analyses (
+                ticker, company_name, query, answer, decision, route_type,
+                fundamental_assessment, fundamental_score,
+                finance_context_present, news_context_present,
+                news_query, news_item_count, retrieval_trace_json, logs_json,
+                generated_at_utc, updated_at_utc
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(ticker) DO UPDATE SET
+                company_name = excluded.company_name,
+                query = excluded.query,
+                answer = excluded.answer,
+                decision = excluded.decision,
+                route_type = excluded.route_type,
+                fundamental_assessment = excluded.fundamental_assessment,
+                fundamental_score = excluded.fundamental_score,
+                finance_context_present = excluded.finance_context_present,
+                news_context_present = excluded.news_context_present,
+                news_query = excluded.news_query,
+                news_item_count = excluded.news_item_count,
+                retrieval_trace_json = excluded.retrieval_trace_json,
+                logs_json = excluded.logs_json,
+                generated_at_utc = excluded.generated_at_utc,
+                updated_at_utc = excluded.updated_at_utc
+            """,
+            (
+                ticker_key,
+                company_name,
+                query,
+                answer,
+                decision,
+                route_type,
+                fundamental_assessment,
+                fundamental_score,
+                None if finance_context_present is None else int(bool(finance_context_present)),
+                None if news_context_present is None else int(bool(news_context_present)),
+                news_query,
+                news_item_count,
+                retrieval_trace_json,
+                logs_json,
+                generated_at,
+                updated_at,
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def load_fundamental_analysis(
+    ticker: str,
+    *,
+    db_path: str | Path | None = None,
+) -> dict[str, Any] | None:
+    ticker_key = _normalize_ticker(ticker)
+    if not ticker_key:
+        return None
+
+    ensure_cache_db(db_path)
+    conn = connect(db_path)
+    try:
+        row = conn.execute(
+            """
+            SELECT
+                ticker, company_name, query, answer, decision, route_type,
+                fundamental_assessment, fundamental_score,
+                finance_context_present, news_context_present,
+                news_query, news_item_count, retrieval_trace_json, logs_json,
+                generated_at_utc, updated_at_utc
+            FROM ta_fundamental_analyses
+            WHERE ticker = ?
+            """,
+            (ticker_key,),
+        ).fetchone()
+    finally:
+        conn.close()
+    return None if row is None else dict(row)
+
+
+def load_fresh_fundamental_analysis(
+    ticker: str,
+    *,
+    max_age_days: int = 90,
+    now_utc: datetime | None = None,
+    db_path: str | Path | None = None,
+) -> dict[str, Any] | None:
+    row = load_fundamental_analysis(ticker, db_path=db_path)
+    if row is None:
+        return None
+    if str(row.get("decision") or "").lower() != "answer":
+        return None
+    if row.get("route_type") != "single_ticker_financial":
+        return None
+    if int(row.get("finance_context_present") or 0) != 1:
+        return None
+    if not str(row.get("answer") or "").strip():
+        return None
+
+    generated_at = _parse_utc_datetime(row.get("generated_at_utc", ""))
+    if generated_at is None:
+        return None
+
+    now = now_utc or datetime.now(timezone.utc)
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=timezone.utc)
+    else:
+        now = now.astimezone(timezone.utc)
+
+    if now - generated_at <= timedelta(days=max_age_days):
+        return row
+    return None
