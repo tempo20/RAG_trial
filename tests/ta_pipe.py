@@ -147,6 +147,27 @@ class PipelineConfig:
     pre_golden_weight: float = 0.25
     relative_strength_weight: float = 0.15
     liquidity_volume_weight: float = 0.10
+    overbought_rsi_level: float = 70.0
+    severe_overbought_rsi_level: float = 80.0
+    stoch_rsi_period: int = 14
+    overbought_stoch_rsi_level: float = 0.80
+    severe_overbought_stoch_rsi_level: float = 0.90
+    atr_period: int = 14
+    ema_extension_period: int = 20
+    overbought_extension_atr: float = 1.5
+    severe_overbought_extension_atr: float = 2.5
+    exhaustion_extension_atr: float = 3.0
+    overbought_sma50_distance: float = 0.08
+    severe_overbought_sma50_distance: float = 0.15
+    bollinger_period: int = 20
+    bollinger_std_mult: float = 2.0
+    overbought_bb_position: float = 1.0
+    severe_overbought_bb_position: float = 1.25
+    volume_climax_relative_volume: float = 2.0
+    volume_climax_extension_atr: float = 2.0
+    moderately_extended_threshold: float = 2.0
+    overbought_threshold: float = 4.0
+    severely_overbought_threshold: float = 7.0
 
 
 @dataclass
@@ -928,16 +949,38 @@ class SignalResult:
     liquidity_volume_score: float | None = None
     final_bullish_score: float | None = None
     regime_label: str | None = None
+    overbought_score: float | None = None
+    overbought_status: str | None = None
+    overbought_reasons: list[str] = field(default_factory=list)
     donchian_20_high: pd.Series | None = None
     donchian_55_high: pd.Series | None = None
     ret_z_20: pd.Series | None = None
     atr_14: pd.Series | None = None
     atr_move: pd.Series | None = None
     relative_volume: pd.Series | None = None
+    ema_20: pd.Series | None = None
+    extension_atr: pd.Series | None = None
+    stoch_rsi: pd.Series | None = None
+    bb_position: pd.Series | None = None
+    distance_from_sma50: pd.Series | None = None
     ema_8: pd.Series | None = None
     ema_21: pd.Series | None = None
     ema_50: pd.Series | None = None
     error: str | None = None
+
+
+@dataclass
+class OverboughtMetrics:
+    score: float
+    status: str
+    reasons: list[str]
+    atr: pd.Series
+    ema_20: pd.Series
+    extension_atr: pd.Series
+    stoch_rsi: pd.Series
+    bb_position: pd.Series
+    distance_from_sma50: pd.Series
+    relative_volume: pd.Series
 
 
 def _latest_valid_value(series: pd.Series | None) -> float | None:
@@ -1258,6 +1301,211 @@ def compute_bullish_impulse_metrics(
     )
 
 
+def compute_atr(
+    high: pd.Series,
+    low: pd.Series,
+    close: pd.Series,
+    period: int,
+) -> pd.Series:
+    """Compute simple rolling ATR from high/low/close series."""
+    close = pd.to_numeric(close, errors="coerce").sort_index()
+    high = pd.to_numeric(high, errors="coerce").reindex(close.index)
+    low = pd.to_numeric(low, errors="coerce").reindex(close.index)
+    prev_close = close.shift(1)
+    true_range = pd.concat(
+        [
+            high - low,
+            (high - prev_close).abs(),
+            (low - prev_close).abs(),
+        ],
+        axis=1,
+    ).max(axis=1, skipna=True)
+    return true_range.rolling(period).mean().replace([np.inf, -np.inf], np.nan)
+
+
+def compute_stoch_rsi(rsi: pd.Series, period: int) -> pd.Series:
+    """Compute stochastic RSI, leaving flat/insufficient windows as NaN."""
+    rsi = pd.to_numeric(rsi, errors="coerce").sort_index()
+    rsi_min = rsi.rolling(period).min()
+    rsi_max = rsi.rolling(period).max()
+    denominator = (rsi_max - rsi_min).replace(0, np.nan)
+    return ((rsi - rsi_min) / denominator).replace([np.inf, -np.inf], np.nan)
+
+
+def classify_overbought(score: float, cfg: PipelineConfig) -> str:
+    if score >= cfg.severely_overbought_threshold:
+        return "severely_overbought"
+    if score >= cfg.overbought_threshold:
+        return "overbought"
+    if score >= cfg.moderately_extended_threshold:
+        return "moderately_extended"
+    return "not_overbought"
+
+
+def compute_overbought_metrics(
+    close: pd.Series,
+    high: pd.Series,
+    low: pd.Series,
+    volume: pd.Series,
+    sma_50: pd.Series,
+    rsi: pd.Series,
+    cfg: PipelineConfig,
+) -> OverboughtMetrics:
+    """Score entry-risk extension without changing bullish/bearish regime."""
+    close = pd.to_numeric(close, errors="coerce").sort_index()
+    high = pd.to_numeric(high, errors="coerce").reindex(close.index)
+    low = pd.to_numeric(low, errors="coerce").reindex(close.index)
+    volume = pd.to_numeric(volume, errors="coerce").reindex(close.index)
+    sma_50 = pd.to_numeric(sma_50, errors="coerce").reindex(close.index)
+    rsi = pd.to_numeric(rsi, errors="coerce").reindex(close.index)
+
+    atr = compute_atr(high, low, close, cfg.atr_period)
+    ema_20 = close.ewm(span=cfg.ema_extension_period, adjust=False).mean()
+    extension_atr = ((close - ema_20) / atr.replace(0, np.nan)).replace(
+        [np.inf, -np.inf],
+        np.nan,
+    )
+    stoch_rsi = compute_stoch_rsi(rsi, cfg.stoch_rsi_period).reindex(close.index)
+    rolling_mean = close.rolling(cfg.bollinger_period).mean()
+    rolling_std = close.rolling(cfg.bollinger_period).std()
+    upper_band = rolling_mean + cfg.bollinger_std_mult * rolling_std
+    lower_band = rolling_mean - cfg.bollinger_std_mult * rolling_std
+    band_width = (upper_band - lower_band).replace(0, np.nan)
+    bb_position = ((close - lower_band) / band_width).replace(
+        [np.inf, -np.inf],
+        np.nan,
+    )
+    distance_from_sma50 = ((close - sma_50) / sma_50.replace(0, np.nan)).replace(
+        [np.inf, -np.inf],
+        np.nan,
+    )
+    volume_short = volume.rolling(cfg.impulse_relative_volume_short).mean()
+    volume_long = volume.rolling(cfg.impulse_relative_volume_long).mean()
+    relative_volume = (volume_short / volume_long.replace(0, np.nan)).replace(
+        [np.inf, -np.inf],
+        np.nan,
+    )
+
+    if high.dropna().empty or low.dropna().empty:
+        return OverboughtMetrics(
+            score=0.0,
+            status="not_overbought",
+            reasons=["insufficient high/low data for ATR-based extension"],
+            atr=atr,
+            ema_20=ema_20,
+            extension_atr=extension_atr,
+            stoch_rsi=stoch_rsi,
+            bb_position=bb_position,
+            distance_from_sma50=distance_from_sma50,
+            relative_volume=relative_volume,
+        )
+
+    score = 0.0
+    reasons: list[str] = []
+    latest_rsi = _latest_valid_value(rsi)
+    latest_stoch_rsi = _latest_valid_value(stoch_rsi)
+    latest_extension_atr = _latest_valid_value(extension_atr)
+    latest_distance_from_sma50 = _latest_valid_value(distance_from_sma50)
+    latest_bb_position = _latest_valid_value(bb_position)
+    latest_relative_volume = _latest_valid_value(relative_volume)
+
+    if latest_rsi is not None and latest_rsi > cfg.overbought_rsi_level:
+        score += 1.0
+        reasons.append(f"RSI above {cfg.overbought_rsi_level:g}")
+    if latest_rsi is not None and latest_rsi > cfg.severe_overbought_rsi_level:
+        score += 2.0
+        reasons.append(f"RSI above {cfg.severe_overbought_rsi_level:g}")
+    if (
+        latest_stoch_rsi is not None
+        and latest_stoch_rsi > cfg.overbought_stoch_rsi_level
+    ):
+        score += 1.0
+        reasons.append(f"StochRSI above {cfg.overbought_stoch_rsi_level:.2f}")
+    if (
+        latest_stoch_rsi is not None
+        and latest_stoch_rsi > cfg.severe_overbought_stoch_rsi_level
+    ):
+        score += 1.0
+        reasons.append(f"StochRSI above {cfg.severe_overbought_stoch_rsi_level:.2f}")
+    if (
+        latest_extension_atr is not None
+        and latest_extension_atr > cfg.overbought_extension_atr
+    ):
+        score += 1.5
+        reasons.append(
+            f"Price is more than {cfg.overbought_extension_atr:g} ATR above "
+            f"EMA{cfg.ema_extension_period}"
+        )
+    if (
+        latest_extension_atr is not None
+        and latest_extension_atr > cfg.severe_overbought_extension_atr
+    ):
+        score += 2.0
+        reasons.append(
+            f"Price is more than {cfg.severe_overbought_extension_atr:g} ATR above "
+            f"EMA{cfg.ema_extension_period}"
+        )
+    if (
+        latest_extension_atr is not None
+        and latest_extension_atr > cfg.exhaustion_extension_atr
+    ):
+        score += 1.0
+        reasons.append(
+            f"Price is more than {cfg.exhaustion_extension_atr:g} ATR above "
+            f"EMA{cfg.ema_extension_period}"
+        )
+    if (
+        latest_distance_from_sma50 is not None
+        and latest_distance_from_sma50 > cfg.overbought_sma50_distance
+    ):
+        score += 1.0
+        reasons.append(
+            f"Price is more than {cfg.overbought_sma50_distance:.0%} above SMA50"
+        )
+    if (
+        latest_distance_from_sma50 is not None
+        and latest_distance_from_sma50 > cfg.severe_overbought_sma50_distance
+    ):
+        score += 2.0
+        reasons.append(
+            f"Price is more than {cfg.severe_overbought_sma50_distance:.0%} above SMA50"
+        )
+    if (
+        latest_bb_position is not None
+        and latest_bb_position > cfg.overbought_bb_position
+    ):
+        score += 1.0
+        reasons.append("Price is above upper Bollinger Band")
+    if (
+        latest_bb_position is not None
+        and latest_bb_position > cfg.severe_overbought_bb_position
+    ):
+        score += 1.0
+        reasons.append("Price is severely above upper Bollinger Band")
+    if (
+        latest_relative_volume is not None
+        and latest_extension_atr is not None
+        and latest_relative_volume > cfg.volume_climax_relative_volume
+        and latest_extension_atr > cfg.volume_climax_extension_atr
+    ):
+        score += 2.0
+        reasons.append("Possible volume climax with price extension")
+
+    status = classify_overbought(score, cfg)
+    return OverboughtMetrics(
+        score=score,
+        status=status,
+        reasons=reasons,
+        atr=atr,
+        ema_20=ema_20,
+        extension_atr=extension_atr,
+        stoch_rsi=stoch_rsi,
+        bb_position=bb_position,
+        distance_from_sma50=distance_from_sma50,
+        relative_volume=relative_volume,
+    )
+
+
 def _normalize_datetime_index(series: pd.Series) -> pd.Series:
     normalized = series.copy()
     normalized.index = pd.to_datetime(normalized.index)
@@ -1512,6 +1760,15 @@ def compute_signals(ticker: str, cfg: PipelineConfig) -> SignalResult:
             rsi=rsi,
             cfg=cfg,
         )
+        overbought_metrics = compute_overbought_metrics(
+            close=close,
+            high=high,
+            low=low,
+            volume=volume,
+            sma_50=sma_50,
+            rsi=rsi,
+            cfg=cfg,
+        )
         relative_strength_score, relative_strength_reasons = compute_relative_strength_score(
             ticker=ticker,
             close=close,
@@ -1607,12 +1864,14 @@ def compute_signals(ticker: str, cfg: PipelineConfig) -> SignalResult:
         latest_signal = cross_colors[-1] if cross_colors else None
         latest_date = cross_dates[-1] if cross_dates else None
         log.info(
-            "%s regime=%s final_score=%.2f impulse=%.2f pre_golden=%.2f",
+            "%s regime=%s final_score=%.2f impulse=%.2f pre_golden=%.2f overbought=%s %.2f",
             ticker,
             regime_label,
             final_bullish_score,
             bullish_impulse_score,
             pre_golden_score,
+            overbought_metrics.status,
+            overbought_metrics.score,
         )
 
         return SignalResult(
@@ -1646,12 +1905,20 @@ def compute_signals(ticker: str, cfg: PipelineConfig) -> SignalResult:
             liquidity_volume_score=liquidity_volume_score,
             final_bullish_score=final_bullish_score,
             regime_label=regime_label,
+            overbought_score=overbought_metrics.score,
+            overbought_status=overbought_metrics.status,
+            overbought_reasons=overbought_metrics.reasons,
             donchian_20_high=donchian_20_high,
             donchian_55_high=donchian_55_high,
             ret_z_20=ret_z_20,
-            atr_14=atr_14,
+            atr_14=overbought_metrics.atr,
             atr_move=atr_move,
-            relative_volume=relative_volume,
+            relative_volume=overbought_metrics.relative_volume,
+            ema_20=overbought_metrics.ema_20,
+            extension_atr=overbought_metrics.extension_atr,
+            stoch_rsi=overbought_metrics.stoch_rsi,
+            bb_position=overbought_metrics.bb_position,
+            distance_from_sma50=overbought_metrics.distance_from_sma50,
             ema_8=ema_8,
             ema_21=ema_21,
             ema_50=ema_50,
@@ -1675,6 +1942,14 @@ def rank_candidates(
 
     def latest_spread_for(r: SignalResult) -> float | None:
         return _latest_valid_value(r.spread)
+
+    def adjusted_score(r: SignalResult) -> float:
+        base = r.final_bullish_score or 0.0
+        overbought_score = r.overbought_score or 0.0
+        penalty = min(overbought_score * 0.35, 3.0)
+        if r.overbought_status == "severely_overbought":
+            penalty += 1.5
+        return base - penalty
 
     allowed_regimes = {
         "bullish_impulse",
@@ -1702,12 +1977,15 @@ def rank_candidates(
             if r.days_to_cross_estimate is not None
             else 9999
         )
+        overbought_score = r.overbought_score or 0.0
         return (
+            adjusted_score(r),
             r.final_bullish_score or 0.0,
             r.bullish_impulse_score or 0.0,
             r.pre_golden_score or 0.0,
             closest_negative_spread,
             -days_to_cross,
+            -overbought_score,
         )
 
     ranked = sorted(filtered, key=sort_key, reverse=True)
@@ -1730,15 +2008,16 @@ def plot_signal_result(
     end_date = date.today().isoformat()
 
     sns.set_theme(style="darkgrid")
-    fig, (ax, ax2) = plt.subplots(
-        2, 1,
-        figsize=(14, 8),
-        gridspec_kw={"height_ratios": [3, 1]},
+    fig, (ax, ax2, ax3) = plt.subplots(
+        3, 1,
+        figsize=(14, 10),
+        gridspec_kw={"height_ratios": [3, 1, 1]},
         sharex=True,
     )
     fig.patch.set_facecolor("black")
     ax.set_facecolor("black")
     ax2.set_facecolor("black")
+    ax3.set_facecolor("black")
 
     # Price lines
     sns.lineplot(x=r.close.index, y=r.close, ax=ax, color="steelblue", linewidth=1.2, label="Close")
@@ -1807,8 +2086,26 @@ def plot_signal_result(
     ax2.axhline(-cfg.min_spread * 100, color="red", linewidth=0.6, linestyle=":", alpha=0.6)
     ax2.set_ylabel("Spread %", color="white")
 
+    # RSI / overbought subplot
+    if r.rsi is not None:
+        rsi = r.rsi.replace([np.inf, -np.inf], np.nan)
+        ax3.plot(rsi.index, rsi, color="#a78bfa", linewidth=1.1, label="RSI")
+    ax3.axhline(cfg.overbought_rsi_level, color="#facc15", linewidth=0.8, linestyle="--", label=f"RSI {cfg.overbought_rsi_level:g}")
+    ax3.axhline(cfg.severe_overbought_rsi_level, color="#fb7185", linewidth=0.8, linestyle="--", label=f"RSI {cfg.severe_overbought_rsi_level:g}")
+    ax3.axhline(50, color="white", linewidth=0.6, linestyle=":", alpha=0.6)
+    ax3.set_ylim(0, 100)
+    ax3.set_ylabel("RSI", color="white")
+    overbought_score_text = (
+        f"{r.overbought_score:.2f}" if r.overbought_score is not None else "N/A"
+    )
+    ax3.set_title(
+        f"Overbought: {r.overbought_status or 'N/A'} | score={overbought_score_text}",
+        fontsize=10,
+        color="white",
+    )
+
     # Shared styling
-    for axis in (ax, ax2):
+    for axis in (ax, ax2, ax3):
         axis.tick_params(axis="x", colors="white")
         axis.tick_params(axis="y", colors="white")
         axis.grid(True, color="gray", alpha=0.25)
@@ -1821,14 +2118,19 @@ def plot_signal_result(
             txt.set_color("white")
 
     final_score_text = f"{r.final_bullish_score:.2f}" if r.final_bullish_score is not None else "N/A"
+    overbought_title = (
+        f"{r.overbought_status or 'N/A'} "
+        f"({overbought_score_text})"
+    )
     ax.set_title(
         f"{ticker} | Regime={r.regime_label or 'N/A'} | Final Score={final_score_text} | "
-        f"{cfg.start_date} to {end_date} | Confirmed crosses | {cfg.forward_days}d fwd return",
+        f"Overbought={overbought_title} | {cfg.start_date} to {end_date} | "
+        f"Confirmed crosses | {cfg.forward_days}d fwd return",
         fontsize=13,
         color="white",
     )
     ax.set_ylabel("Price", color="white")
-    ax2.xaxis.set_major_formatter(mdates.DateFormatter("%Y-%m-%d"))
+    ax3.xaxis.set_major_formatter(mdates.DateFormatter("%Y-%m-%d"))
     fig.autofmt_xdate()
     plt.tight_layout()
 
@@ -1862,16 +2164,25 @@ def print_summary(ranked: list[SignalResult], cfg: PipelineConfig) -> pd.DataFra
             "bullish_impulse_score":  round(r.bullish_impulse_score, 2) if r.bullish_impulse_score is not None else None,
             "pre_golden_score":       round(r.pre_golden_score, 2) if r.pre_golden_score is not None else None,
             "relative_strength_score": round(r.relative_strength_score, 2) if r.relative_strength_score is not None else None,
+            "overbought_status":      r.overbought_status,
+            "overbought_score":       round(r.overbought_score, 2) if r.overbought_score is not None else None,
             "spread_%":               round(latest_spread * 100, 2) if latest_spread is not None else None,
             "est_days_to_cross":      round(r.days_to_cross_estimate, 1) if r.days_to_cross_estimate is not None else None,
             "latest_signal":          r.latest_signal,
             "signal_date":            r.latest_signal_date.date() if r.latest_signal_date else None,
             "reasons":                " | ".join(reasons),
+            "overbought_reasons":     " | ".join(r.overbought_reasons[:4]),
         })
 
     df = pd.DataFrame(rows)
     print("\n── Top bullish candidates ──────────────────────────")
     print(df.to_string(index=False))
+    print(
+        "\nInterpretation: a high bullish/pre-golden score with a low overbought "
+        "score is preferred. A high bullish/pre-golden score with a high "
+        "overbought score can still be bullish, but immediate entry timing risk "
+        "is elevated."
+    )
     print()
     return df
 

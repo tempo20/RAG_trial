@@ -121,6 +121,8 @@ def result_summary_df(results: list[SignalResult], top_n: int) -> pd.DataFrame:
             "bullish_impulse_score": round(r.bullish_impulse_score, 2) if r.bullish_impulse_score is not None else None,
             "pre_golden_score": round(r.pre_golden_score, 2) if r.pre_golden_score is not None else None,
             "relative_strength_score": round(r.relative_strength_score, 2) if r.relative_strength_score is not None else None,
+            "overbought_status": r.overbought_status,
+            "overbought_score": round(r.overbought_score, 2) if r.overbought_score is not None else None,
             "spread_%": round(latest_spread * 100, 2) if latest_spread is not None else None,
             "est_days_to_cross": round(r.days_to_cross_estimate, 1) if r.days_to_cross_estimate is not None else None,
             "latest_signal": r.latest_signal,
@@ -134,6 +136,11 @@ def result_summary_df(results: list[SignalResult], top_n: int) -> pd.DataFrame:
 
 def selected_result_details_df(r: SignalResult) -> pd.DataFrame:
     latest_spread = _latest_valid_value(r.spread)
+    latest_extension_atr = _latest_valid_value(r.extension_atr)
+    latest_distance_from_sma50 = _latest_valid_value(r.distance_from_sma50)
+    latest_stoch_rsi = _latest_valid_value(r.stoch_rsi)
+    latest_bb_position = _latest_valid_value(r.bb_position)
+    latest_relative_volume = _latest_valid_value(r.relative_volume)
     values = [
         ("Ticker", r.ticker),
         ("Regime", r.regime_label or "None"),
@@ -156,6 +163,33 @@ def selected_result_details_df(r: SignalResult) -> pd.DataFrame:
         (
             "Liquidity/volume score",
             f"{r.liquidity_volume_score:.2f}" if r.liquidity_volume_score is not None else "None",
+        ),
+        ("Overbought status", r.overbought_status or "None"),
+        (
+            "Overbought score",
+            f"{r.overbought_score:.2f}" if r.overbought_score is not None else "None",
+        ),
+        (
+            "Extension vs EMA20 (ATR)",
+            f"{latest_extension_atr:.2f}" if latest_extension_atr is not None else "None",
+        ),
+        (
+            "Distance from SMA50",
+            f"{latest_distance_from_sma50 * 100:.2f}%"
+            if latest_distance_from_sma50 is not None
+            else "None",
+        ),
+        (
+            "StochRSI",
+            f"{latest_stoch_rsi:.2f}" if latest_stoch_rsi is not None else "None",
+        ),
+        (
+            "Bollinger position",
+            f"{latest_bb_position:.2f}" if latest_bb_position is not None else "None",
+        ),
+        (
+            "Relative volume",
+            f"{latest_relative_volume:.2f}" if latest_relative_volume is not None else "None",
         ),
         (
             "Latest spread %",
@@ -181,6 +215,7 @@ def selected_result_reasons_df(r: SignalResult) -> pd.DataFrame:
         [{"category": "bullish_impulse", "reason": reason} for reason in r.bullish_impulse_reasons]
         + [{"category": "pre_golden", "reason": reason} for reason in r.pre_golden_reasons]
         + [{"category": "relative_strength", "reason": reason} for reason in r.relative_strength_reasons]
+        + [{"category": "overbought", "reason": reason} for reason in r.overbought_reasons]
     )
     if not rows:
         return pd.DataFrame([{"reason": "None"}])
@@ -584,11 +619,17 @@ def make_signal_chart(r: SignalResult, cfg: PipelineConfig) -> go.Figure:
 
     _add_series_trace(fig, r.rsi, name="RSI", row=4, col=1, color="#a78bfa")
     fig.add_hline(y=45, line_dash="dot", row=4, col=1)
-    fig.add_hline(y=70, line_dash="dot", row=4, col=1)
+    fig.add_hline(y=cfg.overbought_rsi_level, line_dash="dot", row=4, col=1)
+    fig.add_hline(y=cfg.severe_overbought_rsi_level, line_dash="dash", row=4, col=1)
 
     final_score_text = f"{r.final_bullish_score:.2f}" if r.final_bullish_score is not None else "N/A"
+    overbought_score_text = f"{r.overbought_score:.2f}" if r.overbought_score is not None else "N/A"
     fig.update_layout(
-        title=f"{r.ticker} | Regime={r.regime_label or 'N/A'} | Final Score={final_score_text}",
+        title=(
+            f"{r.ticker} | Regime={r.regime_label or 'N/A'} | "
+            f"Final Score={final_score_text} | "
+            f"Overbought={r.overbought_status or 'N/A'} ({overbought_score_text})"
+        ),
         height=980,
         hovermode="x unified",
         template="plotly_dark",
