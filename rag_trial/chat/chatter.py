@@ -7162,6 +7162,363 @@ def _validate_single_ticker_output(text: str) -> list[str]:
 
     return errors
 
+
+def _resolved_target_payload(target: QueryTarget | None) -> dict[str, Any]:
+    return {
+        "canonical_name": target.canonical_name if target else None,
+        "display_name": target.display_name if target else None,
+        "ticker": target.ticker if target else None,
+        "query_type": target.query_type if target else QUERY_TYPE_GENERAL,
+        "entity_type": target.entity_type if target else None,
+        "best_candidate": target.best_candidate if target else None,
+        "candidates": target.candidates if target else [],
+        "ambiguity_score": target.ambiguity_score if target else 0.0,
+        "resolution_mode": target.resolution_mode if target else "unresolved",
+        "needs_disambiguation": target.needs_disambiguation if target else False,
+    }
+
+
+def _single_ticker_route_empty_result(
+    *,
+    run_id: str,
+    query: str,
+    target: QueryTarget | None,
+    logs: list[str],
+    retrieval_traces: list[dict[str, Any]],
+    date_start: str | None,
+    date_end: str | None,
+    message: str,
+) -> dict[str, Any]:
+    retrieval_trace_payload = {
+        "route_type": "single_ticker_financial",
+        "route_profile": _resolve_route_profile("single_ticker_financial"),
+        "scoring_weights": _resolve_scoring_weights("single_ticker_financial"),
+        "selected_chunk_count": 0,
+        "finance_context_present": any(bool(trace.get("finance_context_present")) for trace in retrieval_traces),
+        "news_context_present": any(bool(trace.get("news_context_present")) for trace in retrieval_traces),
+        "news_query": "",
+        "news_item_count": 0,
+        "sub_trace_count": len(retrieval_traces),
+        "sub_traces": retrieval_traces,
+    }
+    resolved_target = _resolved_target_payload(target)
+    return {
+        "run_id": run_id,
+        "query": query,
+        "answer": message,
+        "chunks": [],
+        "urls": [],
+        "logs": logs,
+        "citation_map": {},
+        "provenance": "Why this answer: FINANCIAL DATA [F] only.",
+        "target": target,
+        "resolved_target": resolved_target,
+        "resolved_target_json": resolved_target,
+        "route_type": "single_ticker_financial",
+        "retrieval_trace": retrieval_trace_payload,
+        "answer_confidence": 0.0,
+        "decision": "abstain",
+        "answer_meta": {
+            "answer_confidence": 0.0,
+            "decision": "abstain",
+            "route_type": "single_ticker_financial",
+            "signals": {
+                "finance_context_present": False,
+                "route_type": "single_ticker_financial",
+            },
+            "contradiction_signals": False,
+        },
+        "selected_macro_events": [],
+        "selected_signals": [],
+        "contradiction_signals": False,
+        "date_start": date_start,
+        "date_end": date_end,
+    }
+
+
+def create_generation_client() -> Any:
+    if not ANTHROPIC_API_KEY:
+        raise RuntimeError("ANTHROPIC_API_KEY is not set in environment.")
+    try:
+        anthropic_module = importlib.import_module("anthropic")
+    except ImportError as exc:
+        raise RuntimeError("anthropic package is not installed. Run: pip install anthropic") from exc
+    Anthropic = getattr(anthropic_module, "Anthropic")
+    return Anthropic(api_key=ANTHROPIC_API_KEY)
+
+
+def run_single_ticker_fundamental_route(
+    *,
+    query: str,
+    gen_client: Any,
+    base_single_ticker_financial_prompt: str,
+    target: QueryTarget | None = None,
+    ticker: str | None = None,
+    company_name: str | None = None,
+    date_start: str | None = None,
+    date_end: str | None = None,
+    logs: list[str] | None = None,
+    run_id: str | None = None,
+    sqlite_conn: sqlite3.Connection | None = None,
+    skip_generation: bool = False,
+    dump_query_contexts: bool = True,
+) -> dict[str, Any]:
+    route_run_id = run_id or str(uuid.uuid4())
+    route_logs = logs if logs is not None else []
+    if not any("[route_type=single_ticker_financial]" in line for line in route_logs):
+        route_logs.append("  [route_type=single_ticker_financial]")
+    if date_start or date_end:
+        route_logs.append(f"  [time filter: {date_start} -> {date_end}]")
+
+    normalized_ticker = str(ticker or (target.ticker if target else "") or "").strip().upper()
+    if target is None:
+        target = QueryTarget(
+            query_type=QUERY_TYPE_SINGLE if normalized_ticker else QUERY_TYPE_GENERAL,
+            canonical_name=company_name or normalized_ticker or None,
+            display_name=company_name or normalized_ticker or "general news",
+            ticker=normalized_ticker or None,
+            entity_type="ORG" if normalized_ticker else None,
+            confidence=0.99 if normalized_ticker else 0.0,
+            resolution_mode="ticker_first" if normalized_ticker else "unresolved",
+        )
+
+    retrieval_traces: list[dict[str, Any]] = []
+    if not target.ticker:
+        retrieval_traces.append(
+            {
+                "sub_query": query,
+                "date_start": date_start,
+                "date_end": date_end,
+                "route_type": "single_ticker_financial",
+                "candidate_count": 0,
+                "ranked_count": 0,
+                "ranked_candidates": [],
+                "finance_context_present": False,
+                "news_context_present": False,
+                "news_query": "",
+                "news_item_count": 0,
+            }
+        )
+        return _single_ticker_route_empty_result(
+            run_id=route_run_id,
+            query=query,
+            target=target,
+            logs=route_logs,
+            retrieval_traces=retrieval_traces,
+            date_start=date_start,
+            date_end=date_end,
+            message=_single_ticker_fundamental_fail_closed_answer(),
+        )
+
+    fin_ctx = fetch_financial_context(
+        ticker=target.ticker,
+        date_start=date_start,
+        date_end=date_end,
+        include_technicals=True,
+    )
+    if not bool((fin_ctx or "").strip()):
+        retrieval_traces.append(
+            {
+                "sub_query": query,
+                "date_start": date_start,
+                "date_end": date_end,
+                "route_type": "single_ticker_financial",
+                "candidate_count": 0,
+                "ranked_count": 0,
+                "ranked_candidates": [],
+                "finance_context_present": False,
+                "news_context_present": False,
+                "news_query": "",
+                "news_item_count": 0,
+            }
+        )
+        route_logs.append(f"  [financial data] no usable [F] block for {target.ticker}")
+        return _single_ticker_route_empty_result(
+            run_id=route_run_id,
+            query=query,
+            target=target,
+            logs=route_logs,
+            retrieval_traces=retrieval_traces,
+            date_start=date_start,
+            date_end=date_end,
+            message=_single_ticker_fundamental_fail_closed_answer(),
+        )
+
+    resolved_company_name = (
+        _extract_company_name_from_financial_context(fin_ctx)
+        or (company_name or "")
+        or (target.display_name or "")
+        or (target.ticker or "")
+    )
+    news_ctx, news_query, news_item_count = fetch_single_ticker_news_context(resolved_company_name)
+    news_context_present = bool((news_ctx or "").strip())
+    retrieval_traces.append(
+        {
+            "sub_query": query,
+            "date_start": date_start,
+            "date_end": date_end,
+            "route_type": "single_ticker_financial",
+            "candidate_count": 0,
+            "ranked_count": 0,
+            "ranked_candidates": [],
+            "finance_context_present": True,
+            "news_context_present": news_context_present,
+            "news_query": news_query,
+            "news_item_count": int(news_item_count),
+        }
+    )
+    route_logs.append(f"  [financial data] fetched [F] block for {target.ticker}")
+    if news_context_present:
+        route_logs.append(f"  [news data] fetched [N] block for '{news_query}' ({news_item_count} items)")
+    else:
+        route_logs.append(f"  [news data] no usable [N] block for '{news_query or resolved_company_name}'")
+
+    merged_context = build_financial_only_context(
+        query,
+        target,
+        fin_ctx,
+        news_context=news_ctx,
+    )
+
+    if dump_query_contexts:
+        try:
+            import datetime as _dt
+            _ts = _dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+            _full_dump_path, _fin_dump_path, _news_dump_path = _dump_query_contexts(
+                base_dir=str(QUERY_CONTEXT_DIR),
+                query=query,
+                final_route="single_ticker_financial",
+                timestamp=_ts,
+                merged_context=merged_context,
+                financial_context=fin_ctx,
+                news_context=news_ctx,
+                news_query=news_query,
+                news_item_count=news_item_count,
+            )
+            print(f"  [context dump] {_full_dump_path}")
+            print(f"  [context dump] {_fin_dump_path}")
+            print(f"  [context dump] {_news_dump_path}")
+        except Exception as _dump_exc:
+            print(f"  [context dump] failed: {_dump_exc}")
+
+    if skip_generation or DEBUG_SKIP_GENERATION:
+        final = "Generation skipped because DEBUG_SKIP_GENERATION is enabled."
+    else:
+        final = generate_answer(
+            query,
+            merged_context,
+            gen_client,
+            base_single_ticker_financial_prompt,
+            max_tokens=SINGLE_TICKER_GEN_MAX_TOKENS,
+        )
+        enforced_final = _remove_orphan_single_ticker_value_lines(_enforce_single_ticker_fundamental_sections(final))
+        if enforced_final != final:
+            route_logs.append(
+                "  [single_ticker_fundamental_enforcement] "
+                f"applied ({SINGLE_TICKER_FUNDAMENTAL_ENFORCEMENT_VERSION})"
+            )
+        else:
+            route_logs.append(
+                "  [single_ticker_fundamental_enforcement] "
+                f"already_satisfied ({SINGLE_TICKER_FUNDAMENTAL_ENFORCEMENT_VERSION})"
+            )
+        validation_errors = _validate_single_ticker_output(enforced_final)
+        if validation_errors:
+            route_logs.append("  [single_ticker_validation] failed: " + "; ".join(validation_errors))
+        else:
+            route_logs.append("  [single_ticker_validation] passed")
+        final = enforced_final
+
+    resolved_target = _resolved_target_payload(target)
+    retrieval_trace_payload = {
+        "route_type": "single_ticker_financial",
+        "route_profile": _resolve_route_profile("single_ticker_financial"),
+        "scoring_weights": _resolve_scoring_weights("single_ticker_financial"),
+        "selected_chunk_count": 0,
+        "finance_context_present": True,
+        "news_context_present": news_context_present,
+        "news_query": news_query,
+        "news_item_count": int(news_item_count),
+        "sub_trace_count": len(retrieval_traces),
+        "sub_traces": retrieval_traces,
+    }
+    answer_confidence = 78.0
+    decision = "answer"
+    confidence_signals = {
+        "relevant_chunks": 0.0,
+        "source_diversity": 0.0,
+        "retrieval_margin": 0.0,
+        "verifier_support": 0.0,
+        "recency_coverage": 0.0,
+        "ambiguity_score": _clamp01(target.ambiguity_score if target else 0.0),
+        "contradiction_signals": 0.0,
+        "stream_brief_count": 0,
+        "stream_brief_share": 0.0,
+        "finance_context_present": True,
+        "route_type": "single_ticker_financial",
+    }
+
+    if sqlite_conn is not None:
+        try:
+            _log_observability(
+                conn=sqlite_conn,
+                run_id=route_run_id,
+                query=query,
+                route_type="single_ticker_financial",
+                target=target,
+                candidates=[],
+                selected_chunks=[],
+                selected_signals=[],
+                answer_confidence=answer_confidence,
+                decision=decision,
+                latency_ms=0.0,
+                retrieval_trace=retrieval_trace_payload,
+                route_reason={
+                    "route_seed": "single_ticker_financial",
+                    "final_route": "single_ticker_financial",
+                    "triggered_by": "single_ticker_financial_intent",
+                },
+                answer_meta={
+                    "answer_confidence": answer_confidence,
+                    "decision": decision,
+                    "route_type": "single_ticker_financial",
+                    "selected_signal_count": 0,
+                },
+            )
+        except Exception as exc:
+            route_logs.append(f"  [observability] logging skipped: {exc}")
+
+    return {
+        "run_id": route_run_id,
+        "query": query,
+        "answer": final,
+        "chunks": [],
+        "urls": [],
+        "logs": route_logs,
+        "citation_map": {},
+        "provenance": "Why this answer: FINANCIAL DATA [F] only.",
+        "target": target,
+        "resolved_target": resolved_target,
+        "resolved_target_json": resolved_target,
+        "route_type": "single_ticker_financial",
+        "retrieval_trace": retrieval_trace_payload,
+        "answer_confidence": answer_confidence,
+        "decision": decision,
+        "answer_meta": {
+            "answer_confidence": answer_confidence,
+            "decision": decision,
+            "route_type": "single_ticker_financial",
+            "signals": confidence_signals,
+            "contradiction_signals": False,
+        },
+        "selected_macro_events": [],
+        "selected_signals": [],
+        "contradiction_signals": False,
+        "date_start": date_start,
+        "date_end": date_end,
+    }
+
+
 def generate_answer(
     query: str,
     context: str,
@@ -7614,8 +7971,6 @@ def run_query_once(
         financial_sub_query = sub_queries[0] if sub_queries else {"query": query, "time_start": None, "time_end": None}
         primary_date_start = financial_sub_query.get("time_start")
         primary_date_end = financial_sub_query.get("time_end")
-        if primary_date_start or primary_date_end:
-            logs.append(f"  [time filter: {primary_date_start} -> {primary_date_end}]")
 
         if primary_target is None:
             primary_target = early_target
@@ -7629,94 +7984,19 @@ def run_query_once(
                 confidence=0.0,
             )
 
-        if not primary_target.ticker:
-            retrieval_traces.append(
-                {
-                    "sub_query": query,
-                    "date_start": primary_date_start,
-                    "date_end": primary_date_end,
-                    "route_type": "single_ticker_financial",
-                    "candidate_count": 0,
-                    "ranked_count": 0,
-                    "ranked_candidates": [],
-                    "finance_context_present": False,
-                    "news_context_present": False,
-                    "news_query": "",
-                    "news_item_count": 0,
-                }
-            )
-            return _empty_result(
-                _single_ticker_fundamental_fail_closed_answer(),
-                "single_ticker_financial",
-            )
-
-        fin_ctx = fetch_financial_context(
-            ticker=primary_target.ticker,
+        return run_single_ticker_fundamental_route(
+            query=query,
+            gen_client=gen_client,
+            base_single_ticker_financial_prompt=base_single_ticker_financial_prompt,
+            target=primary_target,
             date_start=primary_date_start,
             date_end=primary_date_end,
-            include_technicals=True,
+            logs=logs,
+            run_id=run_id,
+            sqlite_conn=sqlite_conn,
+            skip_generation=skip_generation,
+            dump_query_contexts=True,
         )
-        finance_context_present = bool((fin_ctx or "").strip())
-        if not finance_context_present:
-            retrieval_traces.append(
-                {
-                    "sub_query": query,
-                    "date_start": primary_date_start,
-                    "date_end": primary_date_end,
-                    "route_type": "single_ticker_financial",
-                    "candidate_count": 0,
-                    "ranked_count": 0,
-                    "ranked_candidates": [],
-                    "finance_context_present": False,
-                    "news_context_present": False,
-                    "news_query": "",
-                    "news_item_count": 0,
-                }
-            )
-            logs.append(f"  [financial data] no usable [F] block for {primary_target.ticker}")
-            return _empty_result(
-                _single_ticker_fundamental_fail_closed_answer(),
-                "single_ticker_financial",
-            )
-
-        company_name = (
-            _extract_company_name_from_financial_context(fin_ctx)
-            or (primary_target.display_name or "")
-            or (primary_target.ticker or "")
-        )
-        news_ctx, news_query, news_item_count = fetch_single_ticker_news_context(company_name)
-        news_context_present = bool((news_ctx or "").strip())
-        retrieval_traces.append(
-            {
-                "sub_query": query,
-                "date_start": primary_date_start,
-                "date_end": primary_date_end,
-                "route_type": "single_ticker_financial",
-                "candidate_count": 0,
-                "ranked_count": 0,
-                "ranked_candidates": [],
-                "finance_context_present": True,
-                "news_context_present": news_context_present,
-                "news_query": news_query,
-                "news_item_count": int(news_item_count),
-            }
-        )
-        logs.append(f"  [financial data] fetched [F] block for {primary_target.ticker}")
-        if news_context_present:
-            logs.append(
-                f"  [news data] fetched [N] block for '{news_query}' ({news_item_count} items)"
-            )
-        else:
-            logs.append(f"  [news data] no usable [N] block for '{news_query or company_name}'")
-        all_contexts.append(
-            build_financial_only_context(
-                query,
-                primary_target,
-                fin_ctx,
-                news_context=news_ctx,
-            )
-        )
-        sub_queries = []
 
     for sq in sub_queries:
         sub_query = sq["query"]
@@ -8338,14 +8618,7 @@ def main():
     reranker = load_reranker()
 
     print("Loading generation model...")
-    if not ANTHROPIC_API_KEY:
-        raise RuntimeError("ANTHROPIC_API_KEY is not set in environment.")
-    try:
-        anthropic_module = importlib.import_module("anthropic")
-    except ImportError as exc:
-        raise RuntimeError("anthropic package is not installed. Run: pip install anthropic") from exc
-    Anthropic = getattr(anthropic_module, "Anthropic")
-    gen_client = Anthropic(api_key=ANTHROPIC_API_KEY)
+    gen_client = create_generation_client()
 
     print("Connecting to Neo4j...")
     driver = GraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASSWORD))
