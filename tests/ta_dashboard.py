@@ -16,7 +16,7 @@ from plotly.subplots import make_subplots
 
 from rag_trial.chat import chatter
 from rag_trial.db import ta_cache
-from ta_pipe import PipelineConfig, run_pipeline, SignalResult
+from ta_pipe import PipelineConfig, compute_signals, run_pipeline, SignalResult
 
 if not all(
     hasattr(ta_cache, name)
@@ -26,6 +26,7 @@ if not all(
 
 
 FUNDAMENTAL_TOP_N = 15
+TICKER_PATTERN = re.compile(r"^[A-Z][A-Z0-9.-]{0,9}$")
 
 
 st.set_page_config(
@@ -204,6 +205,11 @@ def ticker_news_df(
         }
         for row in rows
     )
+
+
+def normalize_search_ticker(value: str) -> str | None:
+    ticker = str(value or "").strip().upper()
+    return ticker if TICKER_PATTERN.fullmatch(ticker) else None
 
 
 def _fundamental_query(ticker: str) -> str:
@@ -586,8 +592,14 @@ def make_signal_chart(r: SignalResult, cfg: PipelineConfig) -> go.Figure:
         height=980,
         hovermode="x unified",
         template="plotly_dark",
-        legend={"orientation": "h", "yanchor": "bottom", "y": 1.02, "xanchor": "left", "x": 0},
-        margin={"l": 40, "r": 30, "t": 80, "b": 40},
+        legend={
+            "orientation": "v",
+            "yanchor": "top",
+            "y": 1,
+            "xanchor": "left",
+            "x": 1.02,
+        },
+        margin={"l": 40, "r": 170, "t": 80, "b": 40},
     )
     fig.update_yaxes(title_text="Price", row=1, col=1)
     fig.update_yaxes(title_text="Spread %", row=2, col=1)
@@ -597,9 +609,8 @@ def make_signal_chart(r: SignalResult, cfg: PipelineConfig) -> go.Figure:
     return fig
 
 
-@st.cache_data(show_spinner=True, ttl=3600)
-def load_results() -> tuple[list[SignalResult], PipelineConfig]:
-    cfg = PipelineConfig(
+def dashboard_pipeline_config() -> PipelineConfig:
+    return PipelineConfig(
         top_n=FUNDAMENTAL_TOP_N,
         plot=False,
         save_plots=False,
@@ -607,26 +618,109 @@ def load_results() -> tuple[list[SignalResult], PipelineConfig]:
         news_days=7,
         forward_days=20,
     )
+
+
+@st.cache_data(show_spinner=True, ttl=3600)
+def load_results() -> tuple[list[SignalResult], PipelineConfig]:
+    cfg = dashboard_pipeline_config()
     ranked = run_pipeline(cfg)
     return ranked, cfg
 
 
-def main() -> None:
-    if "candidate_table_expanded" not in st.session_state:
-        st.session_state.candidate_table_expanded = True
-    if "selected_candidate_index" not in st.session_state:
-        st.session_state.selected_candidate_index = 0
+def compute_search_result(ticker: str) -> tuple[SignalResult, PipelineConfig]:
+    cfg = dashboard_pipeline_config()
+    return compute_signals(ticker, cfg), cfg
 
-    ranked, cfg = load_results()
 
+@st.cache_data(show_spinner=True, ttl=3600)
+def load_search_result(ticker: str) -> tuple[SignalResult, PipelineConfig]:
+    return compute_search_result(ticker)
+
+
+def analysis_for_ticker(
+    analyses: list[dict[str, Any]],
+    ticker: str,
+) -> dict[str, Any] | None:
+    ticker_key = ticker.upper()
+    return next(
+        (
+            analysis
+            for analysis in analyses
+            if analysis["ticker"] == ticker_key
+        ),
+        None,
+    )
+
+
+def render_ticker_view(
+    result: SignalResult,
+    cfg: PipelineConfig,
+    analysis: dict[str, Any] | None,
+) -> None:
+    if result.error:
+        st.warning(f"{result.ticker}: {result.error}")
+    elif result.close is None or result.close.dropna().empty:
+        st.warning(f"{result.ticker}: no price data")
+    else:
+        fig = make_signal_chart(result, cfg)
+        st.plotly_chart(fig, width="stretch")
+
+    st.subheader(f"{result.ticker} details")
+    st.dataframe(
+        selected_result_details_df(result),
+        width="stretch",
+        hide_index=True,
+    )
+    st.dataframe(
+        selected_result_reasons_df(result),
+        width="stretch",
+        hide_index=True,
+    )
+
+    st.subheader(f"{result.ticker} fundamental analysis")
+    if analysis is None:
+        st.info("No fundamental analysis is available for the selected ticker.")
+    else:
+        source = "cache" if analysis["cache_status"] == "cache" else "new"
+        stored_note = "" if analysis["stored"] else " (not cached)"
+        st.caption(f"Source: {source}{stored_note}")
+        cols = st.columns(5)
+        cols[0].metric("Decision", analysis.get("decision") or "N/A")
+        cols[1].metric("Assessment", analysis.get("fundamental_assessment") or "N/A")
+        score = analysis.get("fundamental_score")
+        cols[2].metric("Score", "N/A" if score is None else str(score))
+        cols[3].metric("Financial [F]", "yes" if analysis.get("finance_context_present") else "no")
+        cols[4].metric("News Items", str(analysis.get("news_item_count") or 0))
+        st.markdown(analysis.get("answer") or "No analysis available.")
+
+    st.subheader(f"{result.ticker} cached news")
+    news_df = ticker_news_df(result.ticker)
+    if news_df.empty:
+        st.info("No cached news articles found for the selected ticker.")
+    else:
+        st.caption(f"{len(news_df)} cached articles from ta_cache.db")
+        st.dataframe(
+            news_df,
+            width="stretch",
+            hide_index=True,
+            column_config={
+                "url": st.column_config.LinkColumn("URL"),
+            },
+        )
+
+
+def render_bullish_candidates_tab(
+    ranked: list[SignalResult],
+    cfg: PipelineConfig,
+) -> None:
     if not ranked:
         st.warning("No ranked candidates found.")
-        st.stop()
+        return
 
     summary = result_summary_df(ranked, cfg.top_n)
     fundamental_analyses = load_or_generate_fundamental_analyses(ranked, top_n=FUNDAMENTAL_TOP_N)
     with st.container(key="candidate_table_sticky"):
-        toggle_label = "▲" if st.session_state.candidate_table_expanded else "▼"
+        toggle_label = "^" if st.session_state.candidate_table_expanded else "v"
         toggle_col, title_col = st.columns(
             [0.06, 0.94],
             vertical_alignment="center",
@@ -669,66 +763,57 @@ def main() -> None:
         st.session_state.selected_candidate_index = selected_index
     selected_ticker = summary.iloc[selected_index]["ticker"]
     selected_result = next(r for r in ranked if r.ticker == selected_ticker)
+    selected_analysis = analysis_for_ticker(fundamental_analyses, selected_result.ticker)
 
-    fig = make_signal_chart(selected_result, cfg)
-    st.plotly_chart(fig, width="stretch")
-
-    st.subheader(f"{selected_result.ticker} details")
-    st.dataframe(
-        selected_result_details_df(selected_result),
-        width="stretch",
-        hide_index=True,
-    )
-    st.dataframe(
-        selected_result_reasons_df(selected_result),
-        width="stretch",
-        hide_index=True,
-    )
-
-    selected_analysis = next(
-        (
-            analysis
-            for analysis in fundamental_analyses
-            if analysis["ticker"] == selected_result.ticker
-        ),
-        None,
-    )
-    st.subheader(f"{selected_result.ticker} fundamental analysis")
-    if selected_analysis is None:
-        st.info("No fundamental analysis is available for the selected ticker.")
-    else:
-        source = "cache" if selected_analysis["cache_status"] == "cache" else "new"
-        stored_note = "" if selected_analysis["stored"] else " (not cached)"
-        st.caption(f"Source: {source}{stored_note}")
-        cols = st.columns(5)
-        cols[0].metric("Decision", selected_analysis.get("decision") or "N/A")
-        cols[1].metric("Assessment", selected_analysis.get("fundamental_assessment") or "N/A")
-        score = selected_analysis.get("fundamental_score")
-        cols[2].metric("Score", "N/A" if score is None else str(score))
-        cols[3].metric("Financial [F]", "yes" if selected_analysis.get("finance_context_present") else "no")
-        cols[4].metric("News Items", str(selected_analysis.get("news_item_count") or 0))
-        st.markdown(selected_analysis.get("answer") or "No analysis available.")
-
-        st.subheader(f"{selected_result.ticker} cached news")
-        news_df = ticker_news_df(selected_result.ticker)
-        if news_df.empty:
-            st.info("No cached news articles found for the selected ticker.")
-        else:
-            st.caption(f"{len(news_df)} cached articles from ta_cache.db")
-            st.dataframe(
-                news_df,
-                width="stretch",
-                hide_index=True,
-                column_config={
-                    "url": st.column_config.LinkColumn("URL"),
-                },
-            )
+    render_ticker_view(selected_result, cfg, selected_analysis)
 
     _, refresh_col = st.columns([0.82, 0.18])
     if refresh_col.button("Refresh pipeline", width="stretch"):
         load_results.clear()
         st.session_state.selected_candidate_index = 0
         st.rerun()
+
+
+def render_ticker_search_tab(cfg: PipelineConfig) -> None:
+    if "searched_ticker" not in st.session_state:
+        st.session_state.searched_ticker = ""
+
+    search_col, button_col = st.columns([0.82, 0.18], vertical_alignment="bottom")
+    raw_ticker = search_col.text_input(
+        "Ticker",
+        value=st.session_state.searched_ticker,
+        key="ticker_search_input",
+    )
+    if button_col.button("Search", width="stretch"):
+        ticker = normalize_search_ticker(raw_ticker)
+        if ticker is None:
+            st.session_state.searched_ticker = ""
+            st.warning("Enter a valid ticker.")
+        else:
+            st.session_state.searched_ticker = ticker
+
+    searched_ticker = normalize_search_ticker(st.session_state.searched_ticker)
+    if searched_ticker is None:
+        return
+
+    result, search_cfg = load_search_result(searched_ticker)
+    analyses = load_or_generate_fundamental_analyses([result], top_n=1)
+    render_ticker_view(result, search_cfg or cfg, analysis_for_ticker(analyses, searched_ticker))
+
+
+def main() -> None:
+    if "candidate_table_expanded" not in st.session_state:
+        st.session_state.candidate_table_expanded = True
+    if "selected_candidate_index" not in st.session_state:
+        st.session_state.selected_candidate_index = 0
+
+    ranked, cfg = load_results()
+
+    candidates_tab, search_tab = st.tabs(["Bullish candidates", "Ticker search"])
+    with candidates_tab:
+        render_bullish_candidates_tab(ranked, cfg)
+    with search_tab:
+        render_ticker_search_tab(cfg)
 
 
 if __name__ == "__main__":
