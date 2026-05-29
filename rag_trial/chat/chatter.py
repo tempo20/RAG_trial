@@ -3597,17 +3597,25 @@ def _compute_price_trend(hist_df) -> dict:
     m["latest_close"] = (latest_close, latest_date, None)
     m["latest_date"]  = (latest_date,  latest_date, None)
 
+    def _pct_change(current: float, reference: float) -> float | None:
+        if reference == 0:
+            return None
+        return (current / reference - 1) * 100
+
     def _ret(n):
         if len(close) > n:
-            return (float(close.iloc[-1]) / float(close.iloc[-1 - n]) - 1) * 100
-        return None
+            value = _pct_change(latest_close, float(close.iloc[-1 - n]))
+            if value is None:
+                return None, "zero reference close"
+            return value, None
+        return None, "insufficient history"
 
     for key, n in [
         ("return_1d", 1), ("return_5d", 5), ("return_1m", 21),
         ("return_3m", 63), ("return_6m", 126), ("return_1y", 252),
     ]:
-        v = _ret(n)
-        m[key] = (v, latest_date, None if v is not None else "insufficient history")
+        v, reason = _ret(n)
+        m[key] = (v, latest_date, reason)
 
     # YTD
     try:
@@ -3615,10 +3623,8 @@ def _compute_price_trend(hist_df) -> dict:
         yr = close_dates[-1].year
         ytd_slice = close[close_dates >= pd.Timestamp(f"{yr}-01-01")]
         if len(ytd_slice) >= 2:
-            m["return_ytd"] = (
-                (float(ytd_slice.iloc[-1]) / float(ytd_slice.iloc[0]) - 1) * 100,
-                latest_date, None,
-            )
+            v = _pct_change(float(ytd_slice.iloc[-1]), float(ytd_slice.iloc[0]))
+            m["return_ytd"] = (v, latest_date, None if v is not None else "zero YTD reference close")
         else:
             m["return_ytd"] = (None, None, "insufficient data for YTD")
     except Exception as e:
@@ -3630,8 +3636,18 @@ def _compute_price_trend(hist_df) -> dict:
     l52   = float(w52.min())
     m["high_52w"]      = (h52, latest_date, None)
     m["low_52w"]       = (l52, latest_date, None)
-    m["dist_52w_high"] = ((latest_close / h52 - 1) * 100, latest_date, None)
-    m["dist_52w_low"]  = ((latest_close / l52 - 1) * 100, latest_date, None)
+    dist_52w_high = _pct_change(latest_close, h52)
+    dist_52w_low = _pct_change(latest_close, l52)
+    m["dist_52w_high"] = (
+        dist_52w_high,
+        latest_date,
+        None if dist_52w_high is not None else "zero 52-week high",
+    )
+    m["dist_52w_low"] = (
+        dist_52w_low,
+        latest_date,
+        None if dist_52w_low is not None else "zero 52-week low",
+    )
 
     # Volume
     if "Volume" in hist_df.columns:

@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+from collections import Counter
+from datetime import datetime, timedelta, timezone
 import importlib
 import json
 import re
@@ -20,7 +22,11 @@ from ta_pipe import PipelineConfig, compute_signals, run_pipeline, SignalResult
 
 if not all(
     hasattr(ta_cache, name)
-    for name in ("load_fresh_fundamental_analysis", "load_articles_for_ticker")
+    for name in (
+        "load_fresh_fundamental_analysis",
+        "load_articles_for_ticker",
+        "load_articles_since",
+    )
 ):
     ta_cache = importlib.reload(ta_cache)
 
@@ -242,6 +248,31 @@ def ticker_news_df(
     )
 
 
+def ticker_counts_df(
+    cfg: PipelineConfig,
+    *,
+    db_path: str | Path | None = None,
+) -> pd.DataFrame:
+    cutoff_date = (
+        datetime.now(timezone.utc) - timedelta(days=cfg.news_days)
+    ).date().isoformat()
+    week_articles = ta_cache.load_articles_since(cutoff_date, db_path=db_path)
+    ticker_counter = Counter(
+        str(article.get("symbol") or "").strip().upper()
+        for article in week_articles
+        if article.get("symbol")
+    )
+
+    rows = [
+        {
+            "ticker": ticker,
+            "article_count": count,
+        }
+        for ticker, count in ticker_counter.most_common()
+    ]
+    return pd.DataFrame(rows, columns=["ticker", "article_count"])
+
+
 def normalize_search_ticker(value: str) -> str | None:
     ticker = str(value or "").strip().upper()
     return ticker if TICKER_PATTERN.fullmatch(ticker) else None
@@ -342,6 +373,34 @@ def _analysis_payload_from_route(
     }
 
 
+def _analysis_payload_from_error(
+    ticker: str,
+    company_name: str | None,
+    exc: Exception,
+) -> dict[str, Any]:
+    error_text = f"{type(exc).__name__}: {exc}"
+    return {
+        "ticker": ticker.upper(),
+        "company_name": company_name,
+        "query": _fundamental_query(ticker),
+        "answer": f"Fundamental analysis failed: {error_text}",
+        "decision": "error",
+        "route_type": "single_ticker_financial",
+        "fundamental_assessment": None,
+        "fundamental_score": None,
+        "finance_context_present": False,
+        "news_context_present": False,
+        "news_query": "",
+        "news_item_count": 0,
+        "retrieval_trace": {"error": error_text},
+        "logs": [error_text],
+        "generated_at_utc": None,
+        "updated_at_utc": None,
+        "cache_status": "error",
+        "stored": False,
+    }
+
+
 def _persist_fundamental_result(
     ticker: str,
     company_name: str | None,
@@ -406,7 +465,12 @@ def load_or_generate_fundamental_analyses(
             analyses.append(_row_from_cached_analysis(cached))
             continue
 
-        route_result = runner(ticker, None)
+        try:
+            route_result = runner(ticker, None)
+        except Exception as exc:
+            analyses.append(_analysis_payload_from_error(ticker, None, exc))
+            continue
+
         should_store = _successful_fundamental_result(route_result)
         if should_store:
             _persist_fundamental_result(ticker, None, route_result, db_path=db_path)
@@ -842,6 +906,20 @@ def render_ticker_search_tab(cfg: PipelineConfig) -> None:
     render_ticker_view(result, search_cfg or cfg, analysis_for_ticker(analyses, searched_ticker))
 
 
+def render_ticker_counts_tab(cfg: PipelineConfig) -> None:
+    counts = ticker_counts_df(cfg)
+    if counts.empty:
+        st.info("No cached ticker articles found for the current news window.")
+        return
+
+    st.caption(f"Cached article-symbol counts from the last {cfg.news_days} days")
+    st.dataframe(
+        counts,
+        width="stretch",
+        hide_index=True,
+    )
+
+
 def main() -> None:
     if "candidate_table_expanded" not in st.session_state:
         st.session_state.candidate_table_expanded = True
@@ -850,11 +928,15 @@ def main() -> None:
 
     ranked, cfg = load_results()
 
-    candidates_tab, search_tab = st.tabs(["Bullish candidates", "Ticker search"])
+    candidates_tab, search_tab, ticker_counts_tab = st.tabs(
+        ["Bullish candidates", "Ticker search", "Ticker News Mentions"]
+    )
     with candidates_tab:
         render_bullish_candidates_tab(ranked, cfg)
     with search_tab:
         render_ticker_search_tab(cfg)
+    with ticker_counts_tab:
+        render_ticker_counts_tab(cfg)
 
 
 if __name__ == "__main__":
