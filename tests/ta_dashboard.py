@@ -7,10 +7,12 @@ from collections import Counter
 from datetime import datetime, timedelta, timezone
 import importlib
 import json
+import os
 import re
 from pathlib import Path
 from typing import Any, Callable
 
+from financetoolkit import Toolkit
 import pandas as pd
 import streamlit as st
 import plotly.graph_objects as go
@@ -276,6 +278,159 @@ def ticker_counts_df(
 def normalize_search_ticker(value: str) -> str | None:
     ticker = str(value or "").strip().upper()
     return ticker if TICKER_PATTERN.fullmatch(ticker) else None
+
+
+def _empty_profile_payload(ticker: str, error: str | None = None) -> dict[str, Any]:
+    return {
+        "ticker": ticker.upper(),
+        "description": None,
+        "sector": None,
+        "industry": None,
+        "error": error,
+    }
+
+
+def _profile_error_text(exc: Exception, api_key: str | None = None) -> str:
+    text = f"{type(exc).__name__}: {exc}"
+    if api_key:
+        text = text.replace(api_key, "<redacted>")
+    return text
+
+
+def _clean_profile_value(value: Any) -> str | None:
+    if value is None:
+        return None
+    try:
+        if pd.isna(value):
+            return None
+    except (TypeError, ValueError):
+        pass
+    text = str(value).strip()
+    if not text or text.lower() in {"nan", "none", "na", "n/a"}:
+        return None
+    return text
+
+
+def _profile_value(profile: pd.DataFrame, field: str, ticker: str) -> str | None:
+    ticker_key = ticker.upper()
+    field_keys = [field, field.lower(), field.upper()]
+
+    for field_key in field_keys:
+        if field_key in profile.index:
+            row = profile.loc[field_key]
+            if isinstance(row, pd.DataFrame):
+                row = row.iloc[0]
+            if isinstance(row, pd.Series):
+                if ticker_key in row.index:
+                    return _clean_profile_value(row.loc[ticker_key])
+                if len(row) == 1:
+                    return _clean_profile_value(row.iloc[0])
+            return _clean_profile_value(row)
+
+        if field_key in profile.columns and ticker_key in profile.index:
+            return _clean_profile_value(profile.loc[ticker_key, field_key])
+
+    return None
+
+
+def _profile_payload_from_frame(
+    ticker: str,
+    profile: pd.DataFrame,
+) -> dict[str, Any]:
+    return {
+        "ticker": ticker.upper(),
+        "description": _profile_value(profile, "Description", ticker),
+        "sector": _profile_value(profile, "Sector", ticker),
+        "industry": _profile_value(profile, "Industry", ticker),
+        "error": None,
+    }
+
+
+def _normalized_profile_tickers(tickers: tuple[str, ...]) -> tuple[str, ...]:
+    seen: set[str] = set()
+    normalized: list[str] = []
+    for ticker in tickers:
+        ticker_key = normalize_search_ticker(ticker)
+        if ticker_key is not None and ticker_key not in seen:
+            seen.add(ticker_key)
+            normalized.append(ticker_key)
+    return tuple(normalized)
+
+
+@st.cache_data(show_spinner=True, ttl=86400)
+def load_company_profiles(tickers: tuple[str, ...]) -> dict[str, dict[str, Any]]:
+    normalized = _normalized_profile_tickers(tickers)
+    if not normalized:
+        return {}
+
+    api_key = os.getenv("FMP_API_KEY")
+    if not api_key:
+        error = "FMP_API_KEY is not set."
+        return {ticker: _empty_profile_payload(ticker, error) for ticker in normalized}
+
+    try:
+        toolkit = Toolkit(list(normalized), api_key=api_key)
+        profile = toolkit.get_profile()
+    except Exception as exc:
+        error = _profile_error_text(exc, api_key)
+        return {ticker: _empty_profile_payload(ticker, error) for ticker in normalized}
+
+    if profile is None or profile.empty:
+        return {
+            ticker: _empty_profile_payload(ticker, "FinanceToolkit returned no profile data.")
+            for ticker in normalized
+        }
+
+    return {
+        ticker: _profile_payload_from_frame(ticker, profile)
+        for ticker in normalized
+    }
+
+
+def add_company_profile_columns(
+    summary: pd.DataFrame,
+    profiles: dict[str, dict[str, Any]],
+) -> pd.DataFrame:
+    if summary.empty:
+        return summary
+
+    with_profiles = summary.copy()
+    with_profiles.insert(
+        2,
+        "sector",
+        [
+            profiles.get(str(ticker).upper(), {}).get("sector")
+            for ticker in with_profiles["ticker"]
+        ],
+    )
+    with_profiles.insert(
+        3,
+        "industry",
+        [
+            profiles.get(str(ticker).upper(), {}).get("industry")
+            for ticker in with_profiles["ticker"]
+        ],
+    )
+    return with_profiles
+
+
+def render_company_profile(
+    ticker: str,
+    profile: dict[str, Any] | None,
+) -> None:
+    st.subheader(f"{ticker} company profile")
+    if profile is None:
+        st.info("No company profile is available for the selected ticker.")
+        return
+
+    if profile.get("error"):
+        st.info(f"Company profile unavailable: {profile['error']}")
+        return
+
+    cols = st.columns(2)
+    cols[0].metric("Sector", profile.get("sector") or "N/A")
+    cols[1].metric("Industry", profile.get("industry") or "N/A")
+    st.markdown(profile.get("description") or "No description available.")
 
 
 def _fundamental_query(ticker: str) -> str:
@@ -761,6 +916,7 @@ def render_ticker_view(
     result: SignalResult,
     cfg: PipelineConfig,
     analysis: dict[str, Any] | None,
+    profile: dict[str, Any] | None,
 ) -> None:
     if result.error:
         st.warning(f"{result.ticker}: {result.error}")
@@ -781,6 +937,8 @@ def render_ticker_view(
         width="stretch",
         hide_index=True,
     )
+
+    render_company_profile(result.ticker, profile)
 
     st.subheader(f"{result.ticker} fundamental analysis")
     if analysis is None:
@@ -823,6 +981,8 @@ def render_bullish_candidates_tab(
         return
 
     summary = result_summary_df(ranked, cfg.top_n)
+    company_profiles = load_company_profiles(tuple(summary["ticker"].astype(str).tolist()))
+    summary = add_company_profile_columns(summary, company_profiles)
     fundamental_analyses = load_or_generate_fundamental_analyses(ranked, top_n=FUNDAMENTAL_TOP_N)
     with st.container(key="candidate_table_sticky"):
         toggle_label = "^" if st.session_state.candidate_table_expanded else "v"
@@ -869,8 +1029,9 @@ def render_bullish_candidates_tab(
     selected_ticker = summary.iloc[selected_index]["ticker"]
     selected_result = next(r for r in ranked if r.ticker == selected_ticker)
     selected_analysis = analysis_for_ticker(fundamental_analyses, selected_result.ticker)
+    selected_profile = company_profiles.get(selected_result.ticker.upper())
 
-    render_ticker_view(selected_result, cfg, selected_analysis)
+    render_ticker_view(selected_result, cfg, selected_analysis, selected_profile)
 
     _, refresh_col = st.columns([0.82, 0.18])
     if refresh_col.button("Refresh pipeline", width="stretch"):
@@ -903,7 +1064,13 @@ def render_ticker_search_tab(cfg: PipelineConfig) -> None:
 
     result, search_cfg = load_search_result(searched_ticker)
     analyses = load_or_generate_fundamental_analyses([result], top_n=1)
-    render_ticker_view(result, search_cfg or cfg, analysis_for_ticker(analyses, searched_ticker))
+    company_profiles = load_company_profiles((searched_ticker,))
+    render_ticker_view(
+        result,
+        search_cfg or cfg,
+        analysis_for_ticker(analyses, searched_ticker),
+        company_profiles.get(searched_ticker),
+    )
 
 
 def render_ticker_counts_tab(cfg: PipelineConfig) -> None:
