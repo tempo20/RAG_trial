@@ -23,6 +23,11 @@ anthropic>=0.25.0
 
 # Market data (chatter.py market block, hist_to_db.py — needs FMP_API_KEY)
 financetoolkit>=2.0.0
+yfinance>=0.2.0
+
+# TA dashboard / signal pipeline visualization
+matplotlib>=3.7.0
+seaborn>=0.13.0
 
 # Entity fuzzy match (tgrag_setup.py)
 rapidfuzz>=3.0.0
