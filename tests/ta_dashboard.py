@@ -9,8 +9,15 @@ import importlib
 import json
 import os
 import re
+import sys
 from pathlib import Path
 from typing import Any, Callable
+
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent
+_SCRIPT_DIR = Path(__file__).resolve().parent
+for _path in (_PROJECT_ROOT, _SCRIPT_DIR):
+    if str(_path) not in sys.path:
+        sys.path.insert(0, str(_path))
 
 from financetoolkit import Toolkit
 import pandas as pd
