@@ -27,3 +27,5 @@ test*.py
 !tests/test_ta_cache.py
 parallel_progress_suite.py
 # tests/test*.py
+test_ta_cache.py
+overbought_test.py
