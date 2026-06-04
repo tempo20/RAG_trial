@@ -24,8 +24,7 @@ my_database_snapshot.db
 notebooks/test.py
 timesfm*
 test*.py
-# tests/test_ta_cache.py
 parallel_progress_suite.py
 # tests/test*.py
-# test_ta_cache.py
+test_ta_cache.py
 overbought_test.py

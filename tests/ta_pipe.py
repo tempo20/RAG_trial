@@ -1514,20 +1514,15 @@ def _normalize_datetime_index(series: pd.Series) -> pd.Series:
     return normalized.sort_index()
 
 
-def compute_relative_strength_score(
-    ticker: str,
-    close: pd.Series,
+def _fetch_benchmark_closes(
     cfg: PipelineConfig,
-) -> tuple[float, list[str]]:
-    """Compare latest ticker relative strength against configured benchmarks."""
-    close = _normalize_datetime_index(pd.to_numeric(close, errors="coerce").dropna())
-    if close.empty or not cfg.relative_strength_benchmarks:
-        return 0.0, ["relative strength unavailable"]
-
-    start = close.index.min().date().isoformat()
-    end = (close.index.max().date() + timedelta(days=1)).isoformat()
-    scores: list[float] = []
-    reasons: list[str] = []
+    start: str,
+    end: str,
+) -> dict[str, pd.Series]:
+    """Download configured RS benchmarks once per pipeline run."""
+    closes: dict[str, pd.Series] = {}
+    if not cfg.relative_strength_benchmarks:
+        return closes
 
     for benchmark in cfg.relative_strength_benchmarks:
         try:
@@ -1542,13 +1537,71 @@ def compute_relative_strength_score(
             )
             bench_hist = _history_for_ticker(downloaded, benchmark)
             if bench_hist is None or bench_hist.empty:
+                log.warning("Benchmark %s returned no price data", benchmark)
                 continue
             price_col = "Adj Close" if "Adj Close" in bench_hist.columns else "Close"
             if price_col not in bench_hist.columns:
+                log.warning("Benchmark %s has no close column", benchmark)
                 continue
             bench_close = _normalize_datetime_index(
                 pd.to_numeric(bench_hist[price_col], errors="coerce").dropna()
             )
+            if not bench_close.empty:
+                closes[benchmark] = bench_close
+        except Exception as exc:
+            log.warning("Benchmark download failed for %s: %s", benchmark, exc)
+
+    log.info(
+        "Cached %d/%d relative-strength benchmarks",
+        len(closes),
+        len(cfg.relative_strength_benchmarks),
+    )
+    return closes
+
+
+def compute_relative_strength_score(
+    ticker: str,
+    close: pd.Series,
+    cfg: PipelineConfig,
+    *,
+    benchmark_closes: dict[str, pd.Series] | None = None,
+) -> tuple[float, list[str]]:
+    """Compare latest ticker relative strength against configured benchmarks."""
+    close = _normalize_datetime_index(pd.to_numeric(close, errors="coerce").dropna())
+    if close.empty or not cfg.relative_strength_benchmarks:
+        return 0.0, ["relative strength unavailable"]
+
+    start = close.index.min().date().isoformat()
+    end = (close.index.max().date() + timedelta(days=1)).isoformat()
+    scores: list[float] = []
+    reasons: list[str] = []
+
+    for benchmark in cfg.relative_strength_benchmarks:
+        try:
+            bench_close = None
+            if benchmark_closes and benchmark in benchmark_closes:
+                bench_close = benchmark_closes[benchmark]
+            else:
+                downloaded = yf.download(
+                    benchmark,
+                    start=start,
+                    end=end,
+                    interval="1d",
+                    auto_adjust=False,
+                    progress=False,
+                    threads=False,
+                )
+                bench_hist = _history_for_ticker(downloaded, benchmark)
+                if bench_hist is None or bench_hist.empty:
+                    continue
+                price_col = "Adj Close" if "Adj Close" in bench_hist.columns else "Close"
+                if price_col not in bench_hist.columns:
+                    continue
+                bench_close = _normalize_datetime_index(
+                    pd.to_numeric(bench_hist[price_col], errors="coerce").dropna()
+                )
+            if bench_close is None or bench_close.empty:
+                continue
             aligned_benchmark = bench_close.reindex(close.index).ffill()
             aligned = pd.DataFrame(
                 {"ticker": close, "benchmark": aligned_benchmark}
@@ -1675,7 +1728,12 @@ def _load_or_fetch_signal_history(
     return hist
 
 
-def compute_signals(ticker: str, cfg: PipelineConfig) -> SignalResult:
+def compute_signals(
+    ticker: str,
+    cfg: PipelineConfig,
+    *,
+    benchmark_closes: dict[str, pd.Series] | None = None,
+) -> SignalResult:
     """Compute all MA signals for a single ticker. Returns SignalResult."""
     empty = SignalResult(
         ticker=ticker,
@@ -1773,6 +1831,7 @@ def compute_signals(ticker: str, cfg: PipelineConfig) -> SignalResult:
             ticker=ticker,
             close=close,
             cfg=cfg,
+            benchmark_closes=benchmark_closes,
         )
         final_bullish_score = (
             cfg.bullish_impulse_weight * bullish_impulse_score
@@ -2211,13 +2270,15 @@ def run_pipeline(cfg: PipelineConfig | None = None) -> list[SignalResult]:
 
     log.info("%d candidates to process", len(candidates))
 
+    benchmark_end = (date.today() + timedelta(days=1)).isoformat()
+    benchmark_closes = _fetch_benchmark_closes(cfg, cfg.start_date, benchmark_end)
 
     log.info("── Stage 2: computing signals ───────────────────────────────")
     results: list[SignalResult] = []
 
     for i, ticker in enumerate(candidates, 1):
         log.info("[%d/%d] %s", i, len(candidates), ticker)
-        result = compute_signals(ticker, cfg)
+        result = compute_signals(ticker, cfg, benchmark_closes=benchmark_closes)
         results.append(result)
         time.sleep(cfg.signal_sleep_s)
 
