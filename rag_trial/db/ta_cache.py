@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import re
 import sqlite3
@@ -42,6 +43,11 @@ CREATE TABLE IF NOT EXISTS ta_historical_daily_bars (
     volume REAL,
     fetched_at_utc TEXT NOT NULL,
     PRIMARY KEY (ticker, bar_date, provider)
+);
+
+CREATE TABLE IF NOT EXISTS ta_stock_pick_snapshots (
+    pick_date TEXT PRIMARY KEY,
+    tickers_json TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS ta_fundamental_analyses (
@@ -509,6 +515,104 @@ def latest_bar_date(
     finally:
         conn.close()
     return None if row is None else row["latest_date"]
+
+
+def _normalize_ticker_list(tickers: list[str]) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+    for value in tickers:
+        ticker = _normalize_ticker(value)
+        if not ticker or ticker in seen:
+            continue
+        seen.add(ticker)
+        out.append(ticker)
+    return out
+
+
+def upsert_stock_pick_snapshot(
+    pick_date: str,
+    tickers: list[str],
+    *,
+    db_path: str | Path | None = None,
+) -> None:
+    date_key = str(pick_date or "").strip()
+    if not date_key:
+        raise ValueError("pick_date is required")
+
+    normalized = _normalize_ticker_list(tickers)
+    ensure_cache_db(db_path)
+    conn = connect(db_path)
+    try:
+        conn.execute(
+            """
+            INSERT INTO ta_stock_pick_snapshots (pick_date, tickers_json)
+            VALUES (?, ?)
+            ON CONFLICT(pick_date) DO UPDATE SET
+                tickers_json = excluded.tickers_json
+            """,
+            (date_key, json.dumps(normalized)),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def load_stock_pick_snapshot(
+    pick_date: str,
+    *,
+    db_path: str | Path | None = None,
+) -> dict[str, Any] | None:
+    date_key = str(pick_date or "").strip()
+    if not date_key:
+        return None
+
+    ensure_cache_db(db_path)
+    conn = connect(db_path)
+    try:
+        row = conn.execute(
+            """
+            SELECT pick_date, tickers_json
+            FROM ta_stock_pick_snapshots
+            WHERE pick_date = ?
+            """,
+            (date_key,),
+        ).fetchone()
+    finally:
+        conn.close()
+
+    if row is None:
+        return None
+
+    try:
+        raw_tickers = json.loads(row["tickers_json"])
+    except (TypeError, json.JSONDecodeError):
+        raw_tickers = []
+    if not isinstance(raw_tickers, list):
+        raw_tickers = []
+
+    return {
+        "pick_date": row["pick_date"],
+        "tickers": _normalize_ticker_list([str(ticker) for ticker in raw_tickers]),
+    }
+
+
+def load_stock_pick_dates(
+    *,
+    db_path: str | Path | None = None,
+) -> list[str]:
+    ensure_cache_db(db_path)
+    conn = connect(db_path)
+    try:
+        rows = conn.execute(
+            """
+            SELECT pick_date
+            FROM ta_stock_pick_snapshots
+            ORDER BY pick_date DESC
+            """
+        ).fetchall()
+    finally:
+        conn.close()
+    return [str(row["pick_date"]) for row in rows]
 
 
 def upsert_fundamental_analysis(

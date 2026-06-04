@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 from collections import Counter
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 import importlib
 import json
 import os
@@ -35,12 +35,16 @@ if not all(
         "load_fresh_fundamental_analysis",
         "load_articles_for_ticker",
         "load_articles_since",
+        "load_stock_pick_dates",
+        "load_stock_pick_snapshot",
+        "upsert_stock_pick_snapshot",
     )
 ):
     ta_cache = importlib.reload(ta_cache)
 
 
 FUNDAMENTAL_TOP_N = 15
+STOCK_PICK_HISTORY_START_DATE = "2017-12-31"
 TICKER_PATTERN = re.compile(r"^[A-Z][A-Z0-9.-]{0,9}$")
 
 
@@ -280,6 +284,287 @@ def ticker_counts_df(
         for ticker, count in ticker_counter.most_common()
     ]
     return pd.DataFrame(rows, columns=["ticker", "article_count"])
+
+
+def _stock_pick_snapshot_date(today: date | None = None) -> str:
+    return (today or datetime.now(timezone.utc).date()).isoformat()
+
+
+def _stock_pick_price_start_date(pick_date: str) -> str:
+    try:
+        parsed = date.fromisoformat(str(pick_date))
+    except ValueError:
+        return str(pick_date)
+    return (parsed - timedelta(days=10)).isoformat()
+
+
+def save_stock_pick_snapshot(
+    ranked: list[SignalResult],
+    cfg: PipelineConfig,
+    *,
+    today: date | None = None,
+    db_path: str | Path | None = None,
+) -> bool:
+    tickers: list[str] = []
+    seen: set[str] = set()
+    for result in ranked[: cfg.top_n]:
+        ticker = str(result.ticker or "").strip().upper()
+        if not TICKER_PATTERN.fullmatch(ticker) or ticker in seen:
+            continue
+        seen.add(ticker)
+        tickers.append(ticker)
+
+    if not tickers:
+        return False
+
+    ta_cache.upsert_stock_pick_snapshot(
+        _stock_pick_snapshot_date(today),
+        tickers,
+        db_path=db_path,
+    )
+    return True
+
+
+def _price_from_bar(row: dict[str, Any]) -> float | None:
+    value = row.get("adj_close")
+    if value is None:
+        value = row.get("close")
+    try:
+        if value is None or pd.isna(value):
+            return None
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _return_from_bar_rows(
+    pick_date: str,
+    ticker: str,
+    rows: list[dict[str, Any]],
+) -> dict[str, Any]:
+    clean = sorted(
+        (
+            {
+                "bar_date": str(row.get("bar_date") or ""),
+                "price": _price_from_bar(row),
+            }
+            for row in rows
+        ),
+        key=lambda row: row["bar_date"],
+    )
+    clean = [
+        row
+        for row in clean
+        if row["bar_date"] and row["price"] is not None
+    ]
+    base_rows = [row for row in clean if row["bar_date"] >= pick_date]
+    prior_rows = [row for row in clean if row["bar_date"] <= pick_date]
+
+    base = base_rows[0] if base_rows else (prior_rows[-1] if prior_rows else None)
+    latest = clean[-1] if clean else None
+    change_pct = None
+    if base is not None and latest is not None and base["price"] not in (None, 0):
+        change_pct = round((latest["price"] / base["price"] - 1.0) * 100, 2)
+
+    return {
+        "ticker": ticker,
+        "base_date": None if base is None else base["bar_date"],
+        "base_close": None if base is None else round(float(base["price"]), 4),
+        "latest_date": None if latest is None else latest["bar_date"],
+        "latest_close": None if latest is None else round(float(latest["price"]), 4),
+        "change_%": change_pct,
+    }
+
+
+def _history_for_stock_pick_ticker(
+    downloaded: pd.DataFrame,
+    ticker: str,
+) -> pd.DataFrame | None:
+    if downloaded is None or downloaded.empty:
+        return None
+
+    if isinstance(downloaded.columns, pd.MultiIndex):
+        level0 = downloaded.columns.get_level_values(0)
+        level1 = downloaded.columns.get_level_values(1)
+        if ticker in set(level0):
+            return downloaded[ticker].dropna(how="all")
+        if ticker in set(level1):
+            return downloaded.xs(ticker, axis=1, level=1).dropna(how="all")
+        return None
+
+    return downloaded.dropna(how="all")
+
+
+def _float_or_none(value: Any) -> float | None:
+    try:
+        if value is None or pd.isna(value):
+            return None
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _history_frame_to_stock_pick_bar_rows(
+    ticker: str,
+    hist: pd.DataFrame | None,
+) -> list[dict[str, Any]]:
+    if hist is None or hist.empty:
+        return []
+
+    rows: list[dict[str, Any]] = []
+    for index, row in hist.iterrows():
+        timestamp = index.to_timestamp() if hasattr(index, "to_timestamp") else pd.Timestamp(index)
+        rows.append({
+            "ticker": ticker,
+            "bar_date": timestamp.date().isoformat(),
+            "open": _float_or_none(row.get("Open")),
+            "high": _float_or_none(row.get("High")),
+            "low": _float_or_none(row.get("Low")),
+            "close": _float_or_none(row.get("Close")),
+            "adj_close": _float_or_none(row.get("Adj Close")),
+            "volume": _float_or_none(row.get("Volume")),
+        })
+    return rows
+
+
+def _fetch_missing_stock_pick_bars(
+    tickers: list[str],
+    *,
+    start_date: str,
+    end_date: str,
+    toolkit_factory: Callable[..., Any] = Toolkit,
+    db_path: str | Path | None = None,
+) -> str | None:
+    if not tickers:
+        return None
+
+    api_key = os.getenv("FMP_API_KEY")
+    if not api_key:
+        return "FMP_API_KEY is not set; missing price rows were left blank."
+
+    try:
+        toolkit = toolkit_factory(
+            list(tickers),
+            api_key=api_key,
+            start_date=start_date,
+            end_date=end_date,
+        )
+        downloaded = toolkit.get_historical_data()
+    except Exception as exc:
+        return f"FinanceToolkit price fetch failed: {type(exc).__name__}: {exc}"
+
+    for ticker in tickers:
+        hist = _history_for_stock_pick_ticker(downloaded, ticker)
+        rows = _history_frame_to_stock_pick_bar_rows(ticker, hist)
+        if rows:
+            ta_cache.upsert_daily_bars(
+                rows,
+                provider="financetoolkit",
+                db_path=db_path,
+            )
+    return None
+
+
+def stock_pick_returns_df(
+    pick_date: str,
+    tickers: list[str],
+    *,
+    today: date | None = None,
+    toolkit_factory: Callable[..., Any] = Toolkit,
+    db_path: str | Path | None = None,
+) -> tuple[pd.DataFrame, list[str]]:
+    date_key = str(pick_date or "").strip()
+    if not date_key or not tickers:
+        return pd.DataFrame(
+            columns=[
+                "rank",
+                "pick_date",
+                "ticker",
+                "base_date",
+                "base_close",
+                "latest_date",
+                "latest_close",
+                "change_%",
+            ]
+        ), []
+
+    end_date = (today or datetime.now(timezone.utc).date()).isoformat()
+    price_start_date = _stock_pick_price_start_date(date_key)
+    normalized = []
+    seen: set[str] = set()
+    for ticker in tickers:
+        ticker_key = str(ticker or "").strip().upper()
+        if not TICKER_PATTERN.fullmatch(ticker_key) or ticker_key in seen:
+            continue
+        seen.add(ticker_key)
+        normalized.append(ticker_key)
+
+    rows_by_ticker = {
+        ticker: ta_cache.load_daily_bars(
+            ticker,
+            price_start_date,
+            end_date,
+            provider="financetoolkit",
+            db_path=db_path,
+        )
+        for ticker in normalized
+    }
+    returns_by_ticker = {
+        ticker: _return_from_bar_rows(date_key, ticker, rows)
+        for ticker, rows in rows_by_ticker.items()
+    }
+    missing = [
+        ticker
+        for ticker, row in returns_by_ticker.items()
+        if row["base_close"] is None or row["latest_close"] is None
+    ]
+
+    warnings: list[str] = []
+    fetch_warning = _fetch_missing_stock_pick_bars(
+        missing,
+        start_date=STOCK_PICK_HISTORY_START_DATE,
+        end_date=end_date,
+        toolkit_factory=toolkit_factory,
+        db_path=db_path,
+    )
+    if fetch_warning:
+        warnings.append(fetch_warning)
+
+    if missing and not fetch_warning:
+        for ticker in missing:
+            rows_by_ticker[ticker] = ta_cache.load_daily_bars(
+                ticker,
+                price_start_date,
+                end_date,
+                provider="financetoolkit",
+                db_path=db_path,
+            )
+            returns_by_ticker[ticker] = _return_from_bar_rows(
+                date_key,
+                ticker,
+                rows_by_ticker[ticker],
+            )
+
+    out_rows = []
+    for rank, ticker in enumerate(normalized, start=1):
+        row = returns_by_ticker.get(ticker) or _return_from_bar_rows(date_key, ticker, [])
+        out_rows.append({
+            "rank": rank,
+            "pick_date": date_key,
+            **row,
+        })
+
+    missing_after_fetch = [
+        row["ticker"]
+        for row in out_rows
+        if row["base_close"] is None or row["latest_close"] is None
+    ]
+    if missing_after_fetch:
+        warnings.append(
+            "Missing price data for: " + ", ".join(missing_after_fetch)
+        )
+
+    return pd.DataFrame(out_rows), warnings
 
 
 def normalize_search_ticker(value: str) -> str | None:
@@ -891,6 +1176,7 @@ def dashboard_pipeline_config() -> PipelineConfig:
 def load_results() -> tuple[list[SignalResult], PipelineConfig]:
     cfg = dashboard_pipeline_config()
     ranked = run_pipeline(cfg)
+    save_stock_pick_snapshot(ranked, cfg)
     return ranked, cfg
 
 
@@ -1094,6 +1380,42 @@ def render_ticker_counts_tab(cfg: PipelineConfig) -> None:
     )
 
 
+def render_stock_pick_returns_tab() -> None:
+    pick_dates = ta_cache.load_stock_pick_dates()
+    if not pick_dates:
+        st.info("No cached stock pick dates found yet.")
+        return
+
+    today = datetime.now(timezone.utc).date().isoformat()
+    default_index = next(
+        (index for index, pick_date in enumerate(pick_dates) if pick_date < today),
+        0,
+    )
+    selected_date = st.selectbox(
+        "Pick date",
+        pick_dates,
+        index=default_index,
+    )
+    snapshot = ta_cache.load_stock_pick_snapshot(selected_date)
+    if not snapshot or not snapshot.get("tickers"):
+        st.info("No stock picks found for the selected date.")
+        return
+
+    returns, warnings = stock_pick_returns_df(
+        selected_date,
+        list(snapshot["tickers"]),
+    )
+    st.caption(f"Stock picks cached for {selected_date}")
+    if warnings:
+        for warning in warnings:
+            st.warning(warning)
+    st.dataframe(
+        returns,
+        width="stretch",
+        hide_index=True,
+    )
+
+
 def main() -> None:
     if "candidate_table_expanded" not in st.session_state:
         st.session_state.candidate_table_expanded = True
@@ -1102,8 +1424,13 @@ def main() -> None:
 
     ranked, cfg = load_results()
 
-    candidates_tab, search_tab, ticker_counts_tab = st.tabs(
-        ["Bullish candidates", "Ticker search", "Ticker News Mentions"]
+    candidates_tab, search_tab, ticker_counts_tab, stock_pick_returns_tab = st.tabs(
+        [
+            "Bullish candidates",
+            "Ticker search",
+            "Ticker News Mentions",
+            "Stock Pick Returns",
+        ]
     )
     with candidates_tab:
         render_bullish_candidates_tab(ranked, cfg)
@@ -1111,6 +1438,8 @@ def main() -> None:
         render_ticker_search_tab(cfg)
     with ticker_counts_tab:
         render_ticker_counts_tab(cfg)
+    with stock_pick_returns_tab:
+        render_stock_pick_returns_tab()
 
 
 if __name__ == "__main__":
