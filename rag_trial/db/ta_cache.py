@@ -50,6 +50,30 @@ CREATE TABLE IF NOT EXISTS ta_stock_pick_snapshots (
     tickers_json TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS ta_bullish_candidate_snapshots (
+    pick_date TEXT PRIMARY KEY,
+    ranked_json TEXT NOT NULL,
+    cfg_json TEXT NOT NULL,
+    generated_at_utc TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS ta_signal_snapshots (
+    snapshot_date TEXT NOT NULL,
+    ticker TEXT NOT NULL,
+    result_json TEXT NOT NULL,
+    cfg_json TEXT NOT NULL,
+    generated_at_utc TEXT NOT NULL,
+    PRIMARY KEY (snapshot_date, ticker)
+);
+
+CREATE TABLE IF NOT EXISTS ta_company_profiles (
+    ticker TEXT PRIMARY KEY,
+    description TEXT,
+    sector TEXT,
+    industry TEXT,
+    fetched_at_utc TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS ta_fundamental_analyses (
     ticker TEXT PRIMARY KEY,
     company_name TEXT,
@@ -80,6 +104,8 @@ CREATE INDEX IF NOT EXISTS idx_ta_article_symbols_ticker
     ON ta_article_symbols(ticker);
 CREATE INDEX IF NOT EXISTS idx_ta_bars_ticker_date
     ON ta_historical_daily_bars(ticker, bar_date);
+CREATE INDEX IF NOT EXISTS idx_ta_signal_snapshots_ticker_date
+    ON ta_signal_snapshots(ticker, snapshot_date DESC);
 """
 
 
@@ -88,8 +114,30 @@ def cache_enabled() -> bool:
     return value not in {"0", "false", "no", "off"}
 
 
+def _env_truthy(name: str, default: str = "0") -> bool:
+    value = os.getenv(name, default).strip().lower()
+    return value in {"1", "true", "yes", "on"}
+
+
+def read_only_mode() -> bool:
+    return _env_truthy("TA_CACHE_READ_ONLY")
+
+
+def force_turso_mode() -> bool:
+    return _env_truthy("TA_CACHE_FORCE_TURSO")
+
+
 def cache_db_path() -> Path:
     return Path(env_str_path("TA_SQLITE_CACHE_DB", TA_SQLITE_CACHE_DB_PATH))
+
+
+def turso_configured() -> bool:
+    return bool(os.getenv("TURSO_DATABASE_URL") and os.getenv("TURSO_AUTH_TOKEN"))
+
+
+def require_turso_configured() -> None:
+    if not turso_configured():
+        raise RuntimeError("TURSO_DATABASE_URL and TURSO_AUTH_TOKEN are required")
 
 
 def utc_now_iso() -> str:
@@ -115,7 +163,47 @@ def _normalize_ticker(ticker: str) -> str:
     return str(ticker or "").strip().upper()
 
 
-def connect(db_path: str | Path | None = None) -> sqlite3.Connection:
+def _row_dict(row: Any, columns: list[str] | tuple[str, ...]) -> dict[str, Any]:
+    if isinstance(row, dict):
+        return {column: row.get(column) for column in columns}
+    try:
+        return {column: row[column] for column in columns}
+    except (TypeError, KeyError, IndexError):
+        return {
+            column: row[index] if index < len(row) else None
+            for index, column in enumerate(columns)
+        }
+
+
+def _connect_turso():
+    url = os.getenv("TURSO_DATABASE_URL")
+    auth_token = os.getenv("TURSO_AUTH_TOKEN")
+    if not url or not auth_token:
+        raise RuntimeError("TURSO_DATABASE_URL and TURSO_AUTH_TOKEN are required for Turso mode")
+    try:
+        import libsql
+    except ImportError as exc:
+        raise RuntimeError(
+            "libsql is required for Turso mode. Install project requirements first."
+        ) from exc
+
+    return libsql.connect(database=url, auth_token=auth_token)
+
+
+def connect(db_path: str | Path | None = None):
+    local_cache_override = bool(os.getenv("TA_SQLITE_CACHE_DB"))
+    if db_path is None and turso_configured() and (force_turso_mode() or not local_cache_override):
+        conn = _connect_turso()
+        try:
+            conn.row_factory = sqlite3.Row
+        except Exception:
+            pass
+        try:
+            conn.execute("PRAGMA foreign_keys = ON")
+        except Exception:
+            pass
+        return conn
+
     path = Path(db_path) if db_path is not None else cache_db_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(path)
@@ -127,11 +215,26 @@ def connect(db_path: str | Path | None = None) -> sqlite3.Connection:
 def ensure_cache_db(db_path: str | Path | None = None) -> None:
     conn = connect(db_path)
     try:
-        conn.executescript(SCHEMA_SQL)
-        conn.executescript(INDEX_SQL)
+        _execute_script(conn, SCHEMA_SQL)
+        _execute_script(conn, INDEX_SQL)
         conn.commit()
     finally:
         conn.close()
+
+
+def _execute_script(conn, script: str) -> None:
+    if hasattr(conn, "executescript"):
+        conn.executescript(script)
+        return
+    for statement in script.split(";"):
+        sql = statement.strip()
+        if sql:
+            conn.execute(sql)
+
+
+def _ensure_cache_db_for_read(db_path: str | Path | None = None) -> None:
+    if not read_only_mode():
+        ensure_cache_db(db_path)
 
 
 def _normalize_text(value: Any) -> str:
@@ -260,7 +363,7 @@ def load_articles_since(
     provider: str = "fmp_stock_news",
     db_path: str | Path | None = None,
 ) -> list[dict[str, Any]]:
-    ensure_cache_db(db_path)
+    _ensure_cache_db_for_read(db_path)
     conn = connect(db_path)
     try:
         rows = conn.execute(
@@ -283,6 +386,10 @@ def load_articles_since(
     finally:
         conn.close()
 
+    rows = [
+        _row_dict(row, ("article_id", "url", "title", "publisher", "published_at", "ticker"))
+        for row in rows
+    ]
     return [
         {
             "article_id": row["article_id"],
@@ -307,7 +414,7 @@ def load_articles_for_ticker(
     if not ticker_key:
         return []
 
-    ensure_cache_db(db_path)
+    _ensure_cache_db_for_read(db_path)
     limit_clause = ""
     params: list[Any] = [provider, ticker_key]
     if limit is not None:
@@ -339,6 +446,10 @@ def load_articles_for_ticker(
     finally:
         conn.close()
 
+    rows = [
+        _row_dict(row, ("article_id", "url", "title", "publisher", "published_at", "ticker"))
+        for row in rows
+    ]
     return [
         {
             "article_id": row["article_id"],
@@ -357,7 +468,7 @@ def latest_article_published_at(
     provider: str = "fmp_stock_news",
     db_path: str | Path | None = None,
 ) -> str | None:
-    ensure_cache_db(db_path)
+    _ensure_cache_db_for_read(db_path)
     conn = connect(db_path)
     try:
         row = conn.execute(
@@ -374,6 +485,7 @@ def latest_article_published_at(
 
     if not row:
         return None
+    row = _row_dict(row, ("latest_published_at",))
     return row["latest_published_at"] or None
 
 
@@ -384,7 +496,7 @@ def article_cache_has_coverage(
     db_path: str | Path | None = None,
     now_utc: datetime | None = None,
 ) -> bool:
-    ensure_cache_db(db_path)
+    _ensure_cache_db_for_read(db_path)
     today = (now_utc or datetime.now(timezone.utc)).date().isoformat()
     conn = connect(db_path)
     try:
@@ -402,7 +514,10 @@ def article_cache_has_coverage(
     finally:
         conn.close()
 
-    if not row or int(row["row_count"] or 0) == 0:
+    if not row:
+        return False
+    row = _row_dict(row, ("row_count", "oldest_date", "newest_fetch_date"))
+    if int(row["row_count"] or 0) == 0:
         return False
     oldest_date = row["oldest_date"] or ""
     newest_fetch_date = row["newest_fetch_date"] or ""
@@ -473,7 +588,7 @@ def load_daily_bars(
     provider: str,
     db_path: str | Path | None = None,
 ) -> list[dict[str, Any]]:
-    ensure_cache_db(db_path)
+    _ensure_cache_db_for_read(db_path)
     conn = connect(db_path)
     try:
         rows = conn.execute(
@@ -492,7 +607,13 @@ def load_daily_bars(
     finally:
         conn.close()
 
-    return [dict(row) for row in rows]
+    return [
+        _row_dict(
+            row,
+            ("ticker", "bar_date", "open", "high", "low", "close", "adj_close", "volume"),
+        )
+        for row in rows
+    ]
 
 
 def latest_bar_date(
@@ -501,7 +622,7 @@ def latest_bar_date(
     provider: str,
     db_path: str | Path | None = None,
 ) -> str | None:
-    ensure_cache_db(db_path)
+    _ensure_cache_db_for_read(db_path)
     conn = connect(db_path)
     try:
         row = conn.execute(
@@ -514,7 +635,10 @@ def latest_bar_date(
         ).fetchone()
     finally:
         conn.close()
-    return None if row is None else row["latest_date"]
+    if row is None:
+        return None
+    row = _row_dict(row, ("latest_date",))
+    return row["latest_date"]
 
 
 def _normalize_ticker_list(tickers: list[str]) -> list[str]:
@@ -566,7 +690,7 @@ def load_stock_pick_snapshot(
     if not date_key:
         return None
 
-    ensure_cache_db(db_path)
+    _ensure_cache_db_for_read(db_path)
     conn = connect(db_path)
     try:
         row = conn.execute(
@@ -582,6 +706,7 @@ def load_stock_pick_snapshot(
 
     if row is None:
         return None
+    row = _row_dict(row, ("pick_date", "tickers_json"))
 
     try:
         raw_tickers = json.loads(row["tickers_json"])
@@ -600,7 +725,7 @@ def load_stock_pick_dates(
     *,
     db_path: str | Path | None = None,
 ) -> list[str]:
-    ensure_cache_db(db_path)
+    _ensure_cache_db_for_read(db_path)
     conn = connect(db_path)
     try:
         rows = conn.execute(
@@ -612,7 +737,377 @@ def load_stock_pick_dates(
         ).fetchall()
     finally:
         conn.close()
-    return [str(row["pick_date"]) for row in rows]
+    return [str(_row_dict(row, ("pick_date",))["pick_date"]) for row in rows]
+
+
+def upsert_bullish_candidate_snapshot(
+    pick_date: str,
+    ranked: list[dict[str, Any]],
+    cfg: dict[str, Any],
+    *,
+    generated_at_utc: str | None = None,
+    db_path: str | Path | None = None,
+) -> None:
+    date_key = str(pick_date or "").strip()
+    if not date_key:
+        raise ValueError("pick_date is required")
+    if not isinstance(ranked, list):
+        raise ValueError("ranked must be a list")
+    if not isinstance(cfg, dict):
+        raise ValueError("cfg must be a dict")
+
+    ensure_cache_db(db_path)
+    generated_at = generated_at_utc or utc_now_iso()
+    conn = connect(db_path)
+    try:
+        conn.execute(
+            """
+            INSERT INTO ta_bullish_candidate_snapshots (
+                pick_date, ranked_json, cfg_json, generated_at_utc
+            )
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(pick_date) DO UPDATE SET
+                ranked_json = excluded.ranked_json,
+                cfg_json = excluded.cfg_json,
+                generated_at_utc = excluded.generated_at_utc
+            """,
+            (
+                date_key,
+                json.dumps(ranked, ensure_ascii=True),
+                json.dumps(cfg, ensure_ascii=True),
+                generated_at,
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def load_bullish_candidate_snapshot(
+    pick_date: str,
+    *,
+    db_path: str | Path | None = None,
+) -> dict[str, Any] | None:
+    date_key = str(pick_date or "").strip()
+    if not date_key:
+        return None
+
+    _ensure_cache_db_for_read(db_path)
+    conn = connect(db_path)
+    try:
+        row = conn.execute(
+            """
+            SELECT pick_date, ranked_json, cfg_json, generated_at_utc
+            FROM ta_bullish_candidate_snapshots
+            WHERE pick_date = ?
+            """,
+            (date_key,),
+        ).fetchone()
+    finally:
+        conn.close()
+
+    if row is None:
+        return None
+    row = _row_dict(row, ("pick_date", "ranked_json", "cfg_json", "generated_at_utc"))
+
+    try:
+        ranked = json.loads(row["ranked_json"])
+    except (TypeError, json.JSONDecodeError):
+        ranked = []
+    try:
+        cfg = json.loads(row["cfg_json"])
+    except (TypeError, json.JSONDecodeError):
+        cfg = {}
+
+    if not isinstance(ranked, list):
+        ranked = []
+    if not isinstance(cfg, dict):
+        cfg = {}
+
+    return {
+        "pick_date": row["pick_date"],
+        "ranked": ranked,
+        "cfg": cfg,
+        "generated_at_utc": row["generated_at_utc"],
+    }
+
+
+def upsert_signal_snapshot(
+    snapshot_date: str,
+    ticker: str,
+    result: dict[str, Any],
+    cfg: dict[str, Any],
+    *,
+    generated_at_utc: str | None = None,
+    db_path: str | Path | None = None,
+) -> None:
+    date_key = str(snapshot_date or "").strip()
+    ticker_key = _normalize_ticker(ticker)
+    if not date_key:
+        raise ValueError("snapshot_date is required")
+    if not ticker_key:
+        raise ValueError("ticker is required")
+    if not isinstance(result, dict):
+        raise ValueError("result must be a dict")
+    if not isinstance(cfg, dict):
+        raise ValueError("cfg must be a dict")
+
+    ensure_cache_db(db_path)
+    generated_at = generated_at_utc or utc_now_iso()
+    conn = connect(db_path)
+    try:
+        conn.execute(
+            """
+            INSERT INTO ta_signal_snapshots (
+                snapshot_date, ticker, result_json, cfg_json, generated_at_utc
+            )
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(snapshot_date, ticker) DO UPDATE SET
+                result_json = excluded.result_json,
+                cfg_json = excluded.cfg_json,
+                generated_at_utc = excluded.generated_at_utc
+            """,
+            (
+                date_key,
+                ticker_key,
+                json.dumps(result, ensure_ascii=True),
+                json.dumps(cfg, ensure_ascii=True),
+                generated_at,
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def upsert_signal_snapshots(
+    snapshot_date: str,
+    snapshots: list[dict[str, Any]],
+    *,
+    db_path: str | Path | None = None,
+) -> int:
+    written = 0
+    for snapshot in snapshots:
+        ticker = str(snapshot.get("ticker") or "").strip()
+        result = snapshot.get("result")
+        cfg = snapshot.get("cfg")
+        if not ticker or not isinstance(result, dict) or not isinstance(cfg, dict):
+            continue
+        upsert_signal_snapshot(
+            snapshot_date,
+            ticker,
+            result,
+            cfg,
+            generated_at_utc=snapshot.get("generated_at_utc"),
+            db_path=db_path,
+        )
+        written += 1
+    return written
+
+
+def _decode_json_object(value: Any) -> dict[str, Any]:
+    try:
+        decoded = json.loads(value or "{}")
+    except (TypeError, json.JSONDecodeError):
+        return {}
+    return decoded if isinstance(decoded, dict) else {}
+
+
+def load_signal_snapshot(
+    snapshot_date: str,
+    ticker: str,
+    *,
+    db_path: str | Path | None = None,
+) -> dict[str, Any] | None:
+    date_key = str(snapshot_date or "").strip()
+    ticker_key = _normalize_ticker(ticker)
+    if not date_key or not ticker_key:
+        return None
+
+    _ensure_cache_db_for_read(db_path)
+    conn = connect(db_path)
+    try:
+        row = conn.execute(
+            """
+            SELECT snapshot_date, ticker, result_json, cfg_json, generated_at_utc
+            FROM ta_signal_snapshots
+            WHERE snapshot_date = ? AND ticker = ?
+            """,
+            (date_key, ticker_key),
+        ).fetchone()
+    finally:
+        conn.close()
+
+    if row is None:
+        return None
+    row = _row_dict(row, ("snapshot_date", "ticker", "result_json", "cfg_json", "generated_at_utc"))
+    return {
+        "snapshot_date": row["snapshot_date"],
+        "ticker": row["ticker"],
+        "result": _decode_json_object(row["result_json"]),
+        "cfg": _decode_json_object(row["cfg_json"]),
+        "generated_at_utc": row["generated_at_utc"],
+    }
+
+
+def load_latest_signal_snapshot(
+    ticker: str,
+    *,
+    db_path: str | Path | None = None,
+) -> dict[str, Any] | None:
+    ticker_key = _normalize_ticker(ticker)
+    if not ticker_key:
+        return None
+
+    _ensure_cache_db_for_read(db_path)
+    conn = connect(db_path)
+    try:
+        row = conn.execute(
+            """
+            SELECT snapshot_date, ticker, result_json, cfg_json, generated_at_utc
+            FROM ta_signal_snapshots
+            WHERE ticker = ?
+            ORDER BY snapshot_date DESC, generated_at_utc DESC
+            LIMIT 1
+            """,
+            (ticker_key,),
+        ).fetchone()
+    finally:
+        conn.close()
+
+    if row is None:
+        return None
+    row = _row_dict(row, ("snapshot_date", "ticker", "result_json", "cfg_json", "generated_at_utc"))
+    return {
+        "snapshot_date": row["snapshot_date"],
+        "ticker": row["ticker"],
+        "result": _decode_json_object(row["result_json"]),
+        "cfg": _decode_json_object(row["cfg_json"]),
+        "generated_at_utc": row["generated_at_utc"],
+    }
+
+
+def upsert_company_profile(
+    ticker: str,
+    *,
+    description: str | None = None,
+    sector: str | None = None,
+    industry: str | None = None,
+    fetched_at_utc: str | None = None,
+    db_path: str | Path | None = None,
+) -> None:
+    ticker_key = _normalize_ticker(ticker)
+    if not ticker_key:
+        raise ValueError("ticker is required")
+
+    ensure_cache_db(db_path)
+    fetched_at = fetched_at_utc or utc_now_iso()
+    conn = connect(db_path)
+    try:
+        conn.execute(
+            """
+            INSERT INTO ta_company_profiles (
+                ticker, description, sector, industry, fetched_at_utc
+            )
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(ticker) DO UPDATE SET
+                description = excluded.description,
+                sector = excluded.sector,
+                industry = excluded.industry,
+                fetched_at_utc = excluded.fetched_at_utc
+            """,
+            (ticker_key, description, sector, industry, fetched_at),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def upsert_company_profiles(
+    profiles: dict[str, dict[str, Any]] | list[dict[str, Any]],
+    *,
+    fetched_at_utc: str | None = None,
+    db_path: str | Path | None = None,
+) -> int:
+    items = profiles.items() if isinstance(profiles, dict) else []
+    if isinstance(profiles, list):
+        iterable = ((str(profile.get("ticker") or ""), profile) for profile in profiles)
+    else:
+        iterable = items
+
+    written = 0
+    for ticker, profile in iterable:
+        if not isinstance(profile, dict):
+            continue
+        upsert_company_profile(
+            ticker,
+            description=profile.get("description"),
+            sector=profile.get("sector"),
+            industry=profile.get("industry"),
+            fetched_at_utc=fetched_at_utc or profile.get("fetched_at_utc"),
+            db_path=db_path,
+        )
+        written += 1
+    return written
+
+
+def load_company_profile(
+    ticker: str,
+    *,
+    db_path: str | Path | None = None,
+) -> dict[str, Any] | None:
+    ticker_key = _normalize_ticker(ticker)
+    if not ticker_key:
+        return None
+
+    _ensure_cache_db_for_read(db_path)
+    conn = connect(db_path)
+    try:
+        row = conn.execute(
+            """
+            SELECT ticker, description, sector, industry, fetched_at_utc
+            FROM ta_company_profiles
+            WHERE ticker = ?
+            """,
+            (ticker_key,),
+        ).fetchone()
+    finally:
+        conn.close()
+
+    if row is None:
+        return None
+    return _row_dict(row, ("ticker", "description", "sector", "industry", "fetched_at_utc"))
+
+
+def load_company_profiles(
+    tickers: list[str] | tuple[str, ...],
+    *,
+    db_path: str | Path | None = None,
+) -> dict[str, dict[str, Any]]:
+    normalized = _normalize_ticker_list([str(ticker) for ticker in tickers])
+    if not normalized:
+        return {}
+
+    placeholders = ",".join("?" for _ in normalized)
+    _ensure_cache_db_for_read(db_path)
+    conn = connect(db_path)
+    try:
+        rows = conn.execute(
+            f"""
+            SELECT ticker, description, sector, industry, fetched_at_utc
+            FROM ta_company_profiles
+            WHERE ticker IN ({placeholders})
+            """,
+            tuple(normalized),
+        ).fetchall()
+    finally:
+        conn.close()
+
+    rows = [
+        _row_dict(row, ("ticker", "description", "sector", "industry", "fetched_at_utc"))
+        for row in rows
+    ]
+    return {row["ticker"]: row for row in rows}
 
 
 def upsert_fundamental_analysis(
@@ -707,7 +1202,7 @@ def load_fundamental_analysis(
     if not ticker_key:
         return None
 
-    ensure_cache_db(db_path)
+    _ensure_cache_db_for_read(db_path)
     conn = connect(db_path)
     try:
         row = conn.execute(
@@ -725,7 +1220,29 @@ def load_fundamental_analysis(
         ).fetchone()
     finally:
         conn.close()
-    return None if row is None else dict(row)
+    if row is None:
+        return None
+    return _row_dict(
+        row,
+        (
+            "ticker",
+            "company_name",
+            "query",
+            "answer",
+            "decision",
+            "route_type",
+            "fundamental_assessment",
+            "fundamental_score",
+            "finance_context_present",
+            "news_context_present",
+            "news_query",
+            "news_item_count",
+            "retrieval_trace_json",
+            "logs_json",
+            "generated_at_utc",
+            "updated_at_utc",
+        ),
+    )
 
 
 def load_fresh_fundamental_analysis(
