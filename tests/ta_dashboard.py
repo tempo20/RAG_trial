@@ -4,14 +4,16 @@
 from __future__ import annotations
 
 from collections import Counter
+from dataclasses import MISSING, fields as dataclass_fields
 from datetime import date, datetime, timedelta, timezone
 import importlib
 import json
+import math
 import os
 import re
 import sys
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 _SCRIPT_DIR = Path(__file__).resolve().parent
@@ -19,15 +21,13 @@ for _path in (_PROJECT_ROOT, _SCRIPT_DIR):
     if str(_path) not in sys.path:
         sys.path.insert(0, str(_path))
 
-from financetoolkit import Toolkit
 import pandas as pd
 import streamlit as st
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
-from rag_trial.chat import chatter
 from rag_trial.db import ta_cache
-from ta_pipe import PipelineConfig, compute_signals, run_pipeline, SignalResult
+from ta_pipe import PipelineConfig, SignalResult
 
 if not all(
     hasattr(ta_cache, name)
@@ -37,7 +37,9 @@ if not all(
         "load_articles_since",
         "load_stock_pick_dates",
         "load_stock_pick_snapshot",
-        "upsert_stock_pick_snapshot",
+        "load_bullish_candidate_snapshot",
+        "load_latest_signal_snapshot",
+        "load_company_profiles",
     )
 ):
     ta_cache = importlib.reload(ta_cache)
@@ -46,6 +48,44 @@ if not all(
 FUNDAMENTAL_TOP_N = 15
 STOCK_PICK_HISTORY_START_DATE = "2017-12-31"
 TICKER_PATTERN = re.compile(r"^[A-Z][A-Z0-9.-]{0,9}$")
+_BULLISH_SNAPSHOT_CACHE_HIT_ATTR = "_bullish_candidate_snapshot_cache_hit"
+_SIGNAL_SERIES_FIELDS = {
+    "spread",
+    "close",
+    "sma_50",
+    "sma_200",
+    "vwma_50",
+    "regular_bullish_trend",
+    "strong_bullish_confirmation",
+    "regular_bearish_trend",
+    "strong_bearish_confirmation",
+    "macd",
+    "macd_signal",
+    "macd_hist",
+    "rsi",
+    "donchian_20_high",
+    "donchian_55_high",
+    "ret_z_20",
+    "atr_14",
+    "atr_move",
+    "relative_volume",
+    "ema_20",
+    "extension_atr",
+    "stoch_rsi",
+    "bb_position",
+    "distance_from_sma50",
+    "ema_8",
+    "ema_21",
+    "ema_50",
+}
+
+
+def require_turso_dashboard(db_path: str | Path | None = None) -> None:
+    if db_path is not None:
+        return
+    ta_cache.require_turso_configured()
+    os.environ["TA_CACHE_READ_ONLY"] = "1"
+    os.environ["TA_CACHE_FORCE_TURSO"] = "1"
 
 
 st.set_page_config(
@@ -325,6 +365,206 @@ def save_stock_pick_snapshot(
     return True
 
 
+def _json_safe_value(value: Any) -> Any:
+    if isinstance(value, pd.Timestamp):
+        return value.isoformat()
+    if isinstance(value, datetime):
+        return value.isoformat()
+    if isinstance(value, date):
+        return value.isoformat()
+    if isinstance(value, (list, tuple, set)):
+        return [_json_safe_value(item) for item in value]
+    if isinstance(value, dict):
+        return {str(key): _json_safe_value(item) for key, item in value.items()}
+    if hasattr(value, "item"):
+        try:
+            return _json_safe_value(value.item())
+        except (TypeError, ValueError):
+            pass
+    if isinstance(value, float) and not math.isfinite(value):
+        return None
+    try:
+        if pd.isna(value):
+            return None
+    except (TypeError, ValueError):
+        pass
+    return value
+
+
+def _serialize_series(series: pd.Series | None) -> list[list[Any]]:
+    if series is None or series.empty:
+        return []
+    rows: list[list[Any]] = []
+    for index, value in series.items():
+        timestamp = index.to_timestamp() if hasattr(index, "to_timestamp") else pd.Timestamp(index)
+        rows.append([timestamp.isoformat(), _json_safe_value(value)])
+    return rows
+
+
+def _deserialize_series(rows: Any) -> pd.Series | None:
+    if not isinstance(rows, list) or not rows:
+        return None
+
+    index: list[pd.Timestamp] = []
+    values: list[Any] = []
+    for row in rows:
+        if not isinstance(row, list) or len(row) != 2:
+            continue
+        timestamp = pd.to_datetime(row[0], errors="coerce")
+        if pd.isna(timestamp):
+            continue
+        index.append(timestamp)
+        values.append(row[1])
+
+    if not index:
+        return None
+    return pd.Series(values, index=pd.DatetimeIndex(index))
+
+
+def _parse_cached_datetime(value: Any) -> datetime | None:
+    if value in (None, ""):
+        return None
+    timestamp = pd.to_datetime(value, errors="coerce")
+    if pd.isna(timestamp):
+        return None
+    return timestamp.to_pydatetime()
+
+
+def _field_default(field) -> Any:
+    if field.default_factory is not MISSING:  # type: ignore[attr-defined]
+        return field.default_factory()  # type: ignore[misc]
+    if field.default is not MISSING:
+        return field.default
+    return None
+
+
+def _serialize_signal_result(result: SignalResult) -> dict[str, Any]:
+    payload: dict[str, Any] = {}
+    for field in dataclass_fields(SignalResult):
+        value = getattr(result, field.name)
+        if field.name in _SIGNAL_SERIES_FIELDS:
+            payload[field.name] = _serialize_series(value)
+        else:
+            payload[field.name] = _json_safe_value(value)
+    return payload
+
+
+def _deserialize_signal_result(payload: dict[str, Any]) -> SignalResult:
+    kwargs: dict[str, Any] = {}
+    for field in dataclass_fields(SignalResult):
+        value = payload.get(field.name, _field_default(field))
+        if field.name in _SIGNAL_SERIES_FIELDS:
+            value = _deserialize_series(value)
+        elif field.name == "latest_signal_date":
+            value = _parse_cached_datetime(value)
+        elif field.name == "cross_dates":
+            raw_values = value if isinstance(value, list) else []
+            value = [
+                parsed
+                for parsed in (_parse_cached_datetime(item) for item in raw_values)
+                if parsed is not None
+            ]
+        kwargs[field.name] = value
+
+    kwargs["ticker"] = str(kwargs.get("ticker") or "").upper()
+    for list_field in (
+        "cross_dates",
+        "cross_prices",
+        "cross_colors",
+        "forward_returns",
+        "pre_golden_reasons",
+        "bullish_impulse_reasons",
+        "relative_strength_reasons",
+        "overbought_reasons",
+    ):
+        if kwargs.get(list_field) is None:
+            kwargs[list_field] = []
+    return SignalResult(**kwargs)
+
+
+def _pipeline_config_to_snapshot(cfg: PipelineConfig) -> dict[str, Any]:
+    return {
+        field.name: _json_safe_value(getattr(cfg, field.name))
+        for field in dataclass_fields(PipelineConfig)
+    }
+
+
+def _pipeline_config_from_snapshot(payload: dict[str, Any]) -> PipelineConfig:
+    valid_fields = {field.name for field in dataclass_fields(PipelineConfig)}
+    kwargs = {
+        key: value
+        for key, value in payload.items()
+        if key in valid_fields
+    }
+    if isinstance(kwargs.get("screener_noise"), list):
+        kwargs["screener_noise"] = set(kwargs["screener_noise"])
+    return PipelineConfig(**kwargs)
+
+
+def save_bullish_candidate_snapshot(
+    ranked: list[SignalResult],
+    cfg: PipelineConfig,
+    *,
+    today: date | None = None,
+    db_path: str | Path | None = None,
+) -> bool:
+    if not ranked:
+        return False
+
+    ta_cache.upsert_bullish_candidate_snapshot(
+        _stock_pick_snapshot_date(today),
+        [_serialize_signal_result(result) for result in ranked],
+        _pipeline_config_to_snapshot(cfg),
+        db_path=db_path,
+    )
+    return True
+
+
+def load_bullish_candidate_snapshot_results(
+    pick_date: str,
+    *,
+    db_path: str | Path | None = None,
+) -> tuple[list[SignalResult], PipelineConfig] | None:
+    snapshot = ta_cache.load_bullish_candidate_snapshot(pick_date, db_path=db_path)
+    if snapshot is None:
+        return None
+
+    ranked_payload = snapshot.get("ranked")
+    cfg_payload = snapshot.get("cfg")
+    if not isinstance(ranked_payload, list) or not isinstance(cfg_payload, dict):
+        return None
+
+    ranked = [
+        _deserialize_signal_result(row)
+        for row in ranked_payload
+        if isinstance(row, dict)
+    ]
+    if not ranked:
+        return None
+
+    cfg = _pipeline_config_from_snapshot(cfg_payload)
+    setattr(cfg, _BULLISH_SNAPSHOT_CACHE_HIT_ATTR, True)
+    return ranked, cfg
+
+
+def _bullish_snapshot_cache_hit(cfg: PipelineConfig) -> bool:
+    return bool(getattr(cfg, _BULLISH_SNAPSHOT_CACHE_HIT_ATTR, False))
+
+
+def load_cached_fundamental_analyses(
+    ranked: list[SignalResult],
+    *,
+    top_n: int = FUNDAMENTAL_TOP_N,
+    db_path: str | Path | None = None,
+) -> list[dict[str, Any]]:
+    analyses: list[dict[str, Any]] = []
+    for result in ranked[:top_n]:
+        cached = ta_cache.load_fresh_fundamental_analysis(result.ticker, db_path=db_path)
+        if cached is not None:
+            analyses.append(_row_from_cached_analysis(cached))
+    return analyses
+
+
 def _price_from_bar(row: dict[str, Any]) -> float | None:
     value = row.get("adj_close")
     if value is None:
@@ -432,36 +672,8 @@ def _fetch_missing_stock_pick_bars(
     *,
     start_date: str,
     end_date: str,
-    toolkit_factory: Callable[..., Any] = Toolkit,
     db_path: str | Path | None = None,
 ) -> str | None:
-    if not tickers:
-        return None
-
-    api_key = os.getenv("FMP_API_KEY")
-    if not api_key:
-        return "FMP_API_KEY is not set; missing price rows were left blank."
-
-    try:
-        toolkit = toolkit_factory(
-            list(tickers),
-            api_key=api_key,
-            start_date=start_date,
-            end_date=end_date,
-        )
-        downloaded = toolkit.get_historical_data()
-    except Exception as exc:
-        return f"FinanceToolkit price fetch failed: {type(exc).__name__}: {exc}"
-
-    for ticker in tickers:
-        hist = _history_for_stock_pick_ticker(downloaded, ticker)
-        rows = _history_frame_to_stock_pick_bar_rows(ticker, hist)
-        if rows:
-            ta_cache.upsert_daily_bars(
-                rows,
-                provider="financetoolkit",
-                db_path=db_path,
-            )
     return None
 
 
@@ -470,7 +682,6 @@ def stock_pick_returns_df(
     tickers: list[str],
     *,
     today: date | None = None,
-    toolkit_factory: Callable[..., Any] = Toolkit,
     db_path: str | Path | None = None,
 ) -> tuple[pd.DataFrame, list[str]]:
     date_key = str(pick_date or "").strip()
@@ -520,30 +731,6 @@ def stock_pick_returns_df(
     ]
 
     warnings: list[str] = []
-    fetch_warning = _fetch_missing_stock_pick_bars(
-        missing,
-        start_date=STOCK_PICK_HISTORY_START_DATE,
-        end_date=end_date,
-        toolkit_factory=toolkit_factory,
-        db_path=db_path,
-    )
-    if fetch_warning:
-        warnings.append(fetch_warning)
-
-    if missing and not fetch_warning:
-        for ticker in missing:
-            rows_by_ticker[ticker] = ta_cache.load_daily_bars(
-                ticker,
-                price_start_date,
-                end_date,
-                provider="financetoolkit",
-                db_path=db_path,
-            )
-            returns_by_ticker[ticker] = _return_from_bar_rows(
-                date_key,
-                ticker,
-                rows_by_ticker[ticker],
-            )
 
     out_rows = []
     for rank, ticker in enumerate(normalized, start=1):
@@ -650,31 +837,17 @@ def _normalized_profile_tickers(tickers: tuple[str, ...]) -> tuple[str, ...]:
 
 
 @st.cache_data(show_spinner=True, ttl=86400)
-def load_company_profiles(tickers: tuple[str, ...]) -> dict[str, dict[str, Any]]:
+def load_company_profiles(
+    tickers: tuple[str, ...],
+    db_path: str | Path | None = None,
+) -> dict[str, dict[str, Any]]:
+    require_turso_dashboard(db_path)
     normalized = _normalized_profile_tickers(tickers)
     if not normalized:
         return {}
-
-    api_key = os.getenv("FMP_API_KEY")
-    if not api_key:
-        error = "FMP_API_KEY is not set."
-        return {ticker: _empty_profile_payload(ticker, error) for ticker in normalized}
-
-    try:
-        toolkit = Toolkit(list(normalized), api_key=api_key)
-        profile = toolkit.get_profile()
-    except Exception as exc:
-        error = _profile_error_text(exc, api_key)
-        return {ticker: _empty_profile_payload(ticker, error) for ticker in normalized}
-
-    if profile is None or profile.empty:
-        return {
-            ticker: _empty_profile_payload(ticker, "FinanceToolkit returned no profile data.")
-            for ticker in normalized
-        }
-
+    cached = ta_cache.load_company_profiles(normalized, db_path=db_path)
     return {
-        ticker: _profile_payload_from_frame(ticker, profile)
+        ticker: cached.get(ticker, _empty_profile_payload(ticker))
         for ticker in normalized
     }
 
@@ -743,16 +916,6 @@ def _extract_fundamental_fields(answer: str) -> tuple[str | None, int | None]:
     return assessment, score
 
 
-def _successful_fundamental_result(result: dict[str, Any]) -> bool:
-    trace = result.get("retrieval_trace") or {}
-    return (
-        str(result.get("decision") or "").lower() == "answer"
-        and result.get("route_type") == "single_ticker_financial"
-        and bool(trace.get("finance_context_present"))
-        and bool(str(result.get("answer") or "").strip())
-    )
-
-
 def _row_from_cached_analysis(row: dict[str, Any]) -> dict[str, Any]:
     trace_json = row.get("retrieval_trace_json") or "{}"
     logs_json = row.get("logs_json") or "[]"
@@ -787,151 +950,13 @@ def _row_from_cached_analysis(row: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _analysis_payload_from_route(
-    ticker: str,
-    company_name: str | None,
-    result: dict[str, Any],
-    *,
-    cache_status: str,
-    stored: bool,
-) -> dict[str, Any]:
-    trace = result.get("retrieval_trace") or {}
-    assessment, score = _extract_fundamental_fields(result.get("answer") or "")
-    resolved_target = result.get("resolved_target") or {}
-    return {
-        "ticker": ticker.upper(),
-        "company_name": resolved_target.get("display_name") or company_name,
-        "query": result.get("query") or _fundamental_query(ticker),
-        "answer": result.get("answer") or "",
-        "decision": result.get("decision"),
-        "route_type": result.get("route_type"),
-        "fundamental_assessment": assessment,
-        "fundamental_score": score,
-        "finance_context_present": bool(trace.get("finance_context_present")),
-        "news_context_present": bool(trace.get("news_context_present")),
-        "news_query": trace.get("news_query") or "",
-        "news_item_count": int(trace.get("news_item_count") or 0),
-        "retrieval_trace": trace,
-        "logs": result.get("logs") or [],
-        "generated_at_utc": None,
-        "updated_at_utc": None,
-        "cache_status": cache_status,
-        "stored": stored,
-    }
-
-
-def _analysis_payload_from_error(
-    ticker: str,
-    company_name: str | None,
-    exc: Exception,
-) -> dict[str, Any]:
-    error_text = f"{type(exc).__name__}: {exc}"
-    return {
-        "ticker": ticker.upper(),
-        "company_name": company_name,
-        "query": _fundamental_query(ticker),
-        "answer": f"Fundamental analysis failed: {error_text}",
-        "decision": "error",
-        "route_type": "single_ticker_financial",
-        "fundamental_assessment": None,
-        "fundamental_score": None,
-        "finance_context_present": False,
-        "news_context_present": False,
-        "news_query": "",
-        "news_item_count": 0,
-        "retrieval_trace": {"error": error_text},
-        "logs": [error_text],
-        "generated_at_utc": None,
-        "updated_at_utc": None,
-        "cache_status": "error",
-        "stored": False,
-    }
-
-
-def _persist_fundamental_result(
-    ticker: str,
-    company_name: str | None,
-    result: dict[str, Any],
-    *,
-    db_path: str | Path | None = None,
-) -> None:
-    trace = result.get("retrieval_trace") or {}
-    assessment, score = _extract_fundamental_fields(result.get("answer") or "")
-    resolved_target = result.get("resolved_target") or {}
-    ta_cache.upsert_fundamental_analysis(
-        ticker=ticker,
-        company_name=resolved_target.get("display_name") or company_name,
-        query=result.get("query") or _fundamental_query(ticker),
-        answer=result.get("answer") or "",
-        decision=result.get("decision"),
-        route_type=result.get("route_type"),
-        fundamental_assessment=assessment,
-        fundamental_score=score,
-        finance_context_present=bool(trace.get("finance_context_present")),
-        news_context_present=bool(trace.get("news_context_present")),
-        news_query=trace.get("news_query") or "",
-        news_item_count=int(trace.get("news_item_count") or 0),
-        retrieval_trace_json=json.dumps(trace, ensure_ascii=False),
-        logs_json=json.dumps(result.get("logs") or [], ensure_ascii=False),
-        db_path=db_path,
-    )
-
-
-def run_single_ticker_dashboard_analysis(
-    ticker: str,
-    company_name: str | None = None,
-) -> dict[str, Any]:
-    prompt = chatter.SINGLE_TICKER_FINANCIAL_PROMPT_TEMPLATE.format(
-        date_min="N/A",
-        date_max="N/A",
-    )
-    return chatter.run_single_ticker_fundamental_route(
-        query=_fundamental_query(ticker),
-        ticker=ticker,
-        company_name=company_name,
-        gen_client=chatter.create_generation_client(),
-        base_single_ticker_financial_prompt=prompt,
-        dump_query_contexts=False,
-    )
-
-
 def load_or_generate_fundamental_analyses(
     ranked: list[SignalResult],
     *,
     top_n: int = FUNDAMENTAL_TOP_N,
-    route_runner: Callable[[str, str | None], dict[str, Any]] | None = None,
     db_path: str | Path | None = None,
 ) -> list[dict[str, Any]]:
-    runner = route_runner or run_single_ticker_dashboard_analysis
-    analyses: list[dict[str, Any]] = []
-
-    for result in ranked[:top_n]:
-        ticker = result.ticker.upper()
-        cached = ta_cache.load_fresh_fundamental_analysis(ticker, db_path=db_path)
-        if cached is not None:
-            analyses.append(_row_from_cached_analysis(cached))
-            continue
-
-        try:
-            route_result = runner(ticker, None)
-        except Exception as exc:
-            analyses.append(_analysis_payload_from_error(ticker, None, exc))
-            continue
-
-        should_store = _successful_fundamental_result(route_result)
-        if should_store:
-            _persist_fundamental_result(ticker, None, route_result, db_path=db_path)
-        analyses.append(
-            _analysis_payload_from_route(
-                ticker,
-                None,
-                route_result,
-                cache_status="generated",
-                stored=should_store,
-            )
-        )
-
-    return analyses
+    return load_cached_fundamental_analyses(ranked, top_n=top_n, db_path=db_path)
 
 
 def _add_series_trace(
@@ -1173,21 +1198,36 @@ def dashboard_pipeline_config() -> PipelineConfig:
 
 
 @st.cache_data(show_spinner=True, ttl=3600)
-def load_results() -> tuple[list[SignalResult], PipelineConfig]:
+def load_results(db_path: str | Path | None = None) -> tuple[list[SignalResult], PipelineConfig]:
+    require_turso_dashboard(db_path)
     cfg = dashboard_pipeline_config()
-    ranked = run_pipeline(cfg)
-    save_stock_pick_snapshot(ranked, cfg)
-    return ranked, cfg
+    today = _stock_pick_snapshot_date()
+    cached = load_bullish_candidate_snapshot_results(today, db_path=db_path)
+    if cached is not None:
+        return cached
 
-
-def compute_search_result(ticker: str) -> tuple[SignalResult, PipelineConfig]:
-    cfg = dashboard_pipeline_config()
-    return compute_signals(ticker, cfg), cfg
+    setattr(cfg, _BULLISH_SNAPSHOT_CACHE_HIT_ATTR, False)
+    return [], cfg
 
 
 @st.cache_data(show_spinner=True, ttl=3600)
-def load_search_result(ticker: str) -> tuple[SignalResult, PipelineConfig]:
-    return compute_search_result(ticker)
+def load_search_result(
+    ticker: str,
+    db_path: str | Path | None = None,
+) -> tuple[SignalResult, PipelineConfig, dict[str, Any]] | None:
+    require_turso_dashboard(db_path)
+    snapshot = ta_cache.load_latest_signal_snapshot(ticker, db_path=db_path)
+    if snapshot is None:
+        return None
+    result_payload = snapshot.get("result")
+    cfg_payload = snapshot.get("cfg")
+    if not isinstance(result_payload, dict) or not isinstance(cfg_payload, dict):
+        return None
+    return (
+        _deserialize_signal_result(result_payload),
+        _pipeline_config_from_snapshot(cfg_payload),
+        snapshot,
+    )
 
 
 def analysis_for_ticker(
@@ -1254,7 +1294,7 @@ def render_ticker_view(
     if news_df.empty:
         st.info("No cached news articles found for the selected ticker.")
     else:
-        st.caption(f"{len(news_df)} cached articles from ta_cache.db")
+        st.caption(f"{len(news_df)} cached articles from Turso")
         st.dataframe(
             news_df,
             width="stretch",
@@ -1270,13 +1310,14 @@ def render_bullish_candidates_tab(
     cfg: PipelineConfig,
 ) -> None:
     if not ranked:
-        st.warning("No ranked candidates found.")
+        st.warning("No ranked candidates found in today's Turso snapshot. Run the updater first.")
         return
 
     summary = result_summary_df(ranked, cfg.top_n)
+    st.caption("Loaded from today's Turso bullish-candidate snapshot.")
     company_profiles = load_company_profiles(tuple(summary["ticker"].astype(str).tolist()))
     summary = add_company_profile_columns(summary, company_profiles)
-    fundamental_analyses = load_or_generate_fundamental_analyses(ranked, top_n=FUNDAMENTAL_TOP_N)
+    fundamental_analyses = load_cached_fundamental_analyses(ranked, top_n=FUNDAMENTAL_TOP_N)
     with st.container(key="candidate_table_sticky"):
         toggle_label = "^" if st.session_state.candidate_table_expanded else "v"
         toggle_col, title_col = st.columns(
@@ -1326,12 +1367,6 @@ def render_bullish_candidates_tab(
 
     render_ticker_view(selected_result, cfg, selected_analysis, selected_profile)
 
-    _, refresh_col = st.columns([0.82, 0.18])
-    if refresh_col.button("Refresh pipeline", width="stretch"):
-        load_results.clear()
-        st.session_state.selected_candidate_index = 0
-        st.rerun()
-
 
 def render_ticker_search_tab(cfg: PipelineConfig) -> None:
     if "searched_ticker" not in st.session_state:
@@ -1355,8 +1390,17 @@ def render_ticker_search_tab(cfg: PipelineConfig) -> None:
     if searched_ticker is None:
         return
 
-    result, search_cfg = load_search_result(searched_ticker)
-    analyses = load_or_generate_fundamental_analyses([result], top_n=1)
+    cached = load_search_result(searched_ticker)
+    if cached is None:
+        st.info(
+            f"{searched_ticker} is not cached yet. Run `python -B tests\\ta_cache_updater.py` "
+            "to refresh Turso before searching this ticker."
+        )
+        return
+
+    result, search_cfg, snapshot = cached
+    st.caption(f"Loaded cached signal snapshot from {snapshot.get('snapshot_date')}.")
+    analyses = load_cached_fundamental_analyses([result], top_n=1)
     company_profiles = load_company_profiles((searched_ticker,))
     render_ticker_view(
         result,
@@ -1422,7 +1466,11 @@ def main() -> None:
     if "selected_candidate_index" not in st.session_state:
         st.session_state.selected_candidate_index = 0
 
-    ranked, cfg = load_results()
+    try:
+        ranked, cfg = load_results()
+    except RuntimeError as exc:
+        st.error(str(exc))
+        st.stop()
 
     candidates_tab, search_tab, ticker_counts_tab, stock_pick_returns_tab = st.tabs(
         [
