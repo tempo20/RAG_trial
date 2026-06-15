@@ -237,6 +237,20 @@ def _ensure_cache_db_for_read(db_path: str | Path | None = None) -> None:
         ensure_cache_db(db_path)
 
 
+def _is_turso_stream_error(exc: Exception) -> bool:
+    text = str(exc).lower()
+    return "stream not found" in text or ("hrana" in text and "404" in text)
+
+
+def _run_turso_retryable(operation, *, db_path: str | Path | None = None):
+    try:
+        return operation()
+    except Exception as exc:
+        if db_path is None and turso_configured() and _is_turso_stream_error(exc):
+            return operation()
+        raise
+
+
 def _normalize_text(value: Any) -> str:
     return re.sub(r"\s+", " ", str(value or "").strip()).lower()
 
@@ -756,31 +770,34 @@ def upsert_bullish_candidate_snapshot(
     if not isinstance(cfg, dict):
         raise ValueError("cfg must be a dict")
 
-    ensure_cache_db(db_path)
-    generated_at = generated_at_utc or utc_now_iso()
-    conn = connect(db_path)
-    try:
-        conn.execute(
-            """
-            INSERT INTO ta_bullish_candidate_snapshots (
-                pick_date, ranked_json, cfg_json, generated_at_utc
+    def write() -> None:
+        ensure_cache_db(db_path)
+        generated_at = generated_at_utc or utc_now_iso()
+        conn = connect(db_path)
+        try:
+            conn.execute(
+                """
+                INSERT INTO ta_bullish_candidate_snapshots (
+                    pick_date, ranked_json, cfg_json, generated_at_utc
+                )
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(pick_date) DO UPDATE SET
+                    ranked_json = excluded.ranked_json,
+                    cfg_json = excluded.cfg_json,
+                    generated_at_utc = excluded.generated_at_utc
+                """,
+                (
+                    date_key,
+                    json.dumps(ranked, ensure_ascii=True),
+                    json.dumps(cfg, ensure_ascii=True),
+                    generated_at,
+                ),
             )
-            VALUES (?, ?, ?, ?)
-            ON CONFLICT(pick_date) DO UPDATE SET
-                ranked_json = excluded.ranked_json,
-                cfg_json = excluded.cfg_json,
-                generated_at_utc = excluded.generated_at_utc
-            """,
-            (
-                date_key,
-                json.dumps(ranked, ensure_ascii=True),
-                json.dumps(cfg, ensure_ascii=True),
-                generated_at,
-            ),
-        )
-        conn.commit()
-    finally:
-        conn.close()
+            conn.commit()
+        finally:
+            conn.close()
+
+    _run_turso_retryable(write, db_path=db_path)
 
 
 def load_bullish_candidate_snapshot(
@@ -852,32 +869,35 @@ def upsert_signal_snapshot(
     if not isinstance(cfg, dict):
         raise ValueError("cfg must be a dict")
 
-    ensure_cache_db(db_path)
-    generated_at = generated_at_utc or utc_now_iso()
-    conn = connect(db_path)
-    try:
-        conn.execute(
-            """
-            INSERT INTO ta_signal_snapshots (
-                snapshot_date, ticker, result_json, cfg_json, generated_at_utc
+    def write() -> None:
+        ensure_cache_db(db_path)
+        generated_at = generated_at_utc or utc_now_iso()
+        conn = connect(db_path)
+        try:
+            conn.execute(
+                """
+                INSERT INTO ta_signal_snapshots (
+                    snapshot_date, ticker, result_json, cfg_json, generated_at_utc
+                )
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(snapshot_date, ticker) DO UPDATE SET
+                    result_json = excluded.result_json,
+                    cfg_json = excluded.cfg_json,
+                    generated_at_utc = excluded.generated_at_utc
+                """,
+                (
+                    date_key,
+                    ticker_key,
+                    json.dumps(result, ensure_ascii=True),
+                    json.dumps(cfg, ensure_ascii=True),
+                    generated_at,
+                ),
             )
-            VALUES (?, ?, ?, ?, ?)
-            ON CONFLICT(snapshot_date, ticker) DO UPDATE SET
-                result_json = excluded.result_json,
-                cfg_json = excluded.cfg_json,
-                generated_at_utc = excluded.generated_at_utc
-            """,
-            (
-                date_key,
-                ticker_key,
-                json.dumps(result, ensure_ascii=True),
-                json.dumps(cfg, ensure_ascii=True),
-                generated_at,
-            ),
-        )
-        conn.commit()
-    finally:
-        conn.close()
+            conn.commit()
+        finally:
+            conn.close()
+
+    _run_turso_retryable(write, db_path=db_path)
 
 
 def upsert_signal_snapshots(

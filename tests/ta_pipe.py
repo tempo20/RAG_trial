@@ -260,6 +260,7 @@ def _fetch_news_articles_online(
 ) -> list[dict]:
     articles: list[dict] = []
     seen: set = set()
+    consecutive_old_pages = 0          # NEW
 
     for page in range(cfg.news_max_pages):
         try:
@@ -271,8 +272,24 @@ def _fetch_news_articles_online(
         if not batch:
             break
 
+        # Pass 1: compute oldest timestamp across ALL articles
         oldest_in_batch = None
+        for article in batch:
+            if not isinstance(article, dict):
+                continue
+            published = _parse_fmp_news_datetime(
+                article.get("publishedDate")
+                or article.get("date")
+                or article.get("publishedAt")
+            )
+            if published:
+                oldest_in_batch = (
+                    published if oldest_in_batch is None
+                    else min(oldest_in_batch, published)
+                )
 
+        # Pass 2: filter and collect articles
+        new_in_batch = 0               # NEW
         for article in batch:
             if not isinstance(article, dict):
                 continue
@@ -285,13 +302,6 @@ def _fetch_news_articles_online(
                 or article.get("date")
                 or article.get("publishedAt")
             )
-
-            if published:
-                oldest_in_batch = (
-                    published
-                    if oldest_in_batch is None
-                    else min(oldest_in_batch, published)
-                )
 
             if published and published < cutoff:
                 continue
@@ -308,6 +318,7 @@ def _fetch_news_articles_online(
                 continue
 
             articles.append(article)
+            new_in_batch += 1          # NEW
 
         log.info("News page=%d  batch=%d  kept_articles=%d", page, len(batch), len(articles))
 
@@ -315,6 +326,14 @@ def _fetch_news_articles_online(
             break
         if stop_at_or_before and oldest_in_batch and oldest_in_batch <= stop_at_or_before:
             break
+
+        if new_in_batch == 0:
+            consecutive_old_pages += 1
+            if consecutive_old_pages >= 2:
+                log.info("News fetch: 2 consecutive pages with no new articles, stopping early")
+                break
+        else:
+            consecutive_old_pages = 0  # NEW
 
         time.sleep(cfg.news_sleep_s)
 
