@@ -45,6 +45,7 @@ if not all(
 
 FUNDAMENTAL_TOP_N = 15
 TICKER_PATTERN = re.compile(r"^[A-Z][A-Z0-9.-]{0,9}$")
+TICKER_NEWS_DAY_OPTIONS = [7, 6, 5, 4, 3, 2, 1]
 
 
 st.set_page_config(
@@ -264,14 +265,19 @@ def ticker_counts_df(
     cfg: PipelineConfig,
     *,
     db_path: str | Path | None = None,
+    news_days: int | None = None,
+    articles: list[dict[str, Any]] | None = None,
 ) -> pd.DataFrame:
-    cutoff_date = (
-        datetime.now(timezone.utc) - timedelta(days=cfg.news_days)
-    ).date().isoformat()
-    week_articles = ta_cache.load_articles_since(cutoff_date, db_path=db_path)
+    if articles is None:
+        articles = load_ticker_news_window_articles(
+            cfg,
+            db_path=db_path,
+            news_days=news_days,
+        )
+
     ticker_counter = Counter(
         str(article.get("symbol") or "").strip().upper()
-        for article in week_articles
+        for article in articles
         if article.get("symbol")
     )
 
@@ -283,6 +289,49 @@ def ticker_counts_df(
         for ticker, count in ticker_counter.most_common()
     ]
     return pd.DataFrame(rows, columns=["ticker", "article_count"])
+
+
+def load_ticker_news_window_articles(
+    cfg: PipelineConfig,
+    *,
+    db_path: str | Path | None = None,
+    news_days: int | None = None,
+) -> list[dict[str, Any]]:
+    selected_news_days = news_days if news_days is not None else cfg.news_days
+    cutoff_date = (
+        datetime.now(timezone.utc) - timedelta(days=selected_news_days)
+    ).date().isoformat()
+    return ta_cache.load_articles_since(cutoff_date, db_path=db_path)
+
+
+def ticker_articles_df(
+    cfg: PipelineConfig,
+    *,
+    db_path: str | Path | None = None,
+    news_days: int | None = None,
+    articles: list[dict[str, Any]] | None = None,
+) -> pd.DataFrame:
+    if articles is None:
+        articles = load_ticker_news_window_articles(
+            cfg,
+            db_path=db_path,
+            news_days=news_days,
+        )
+    rows = [
+        {
+            "published": article.get("publishedDate") or "",
+            "ticker": str(article.get("symbol") or "").strip().upper(),
+            "source": article.get("site") or "",
+            "title": article.get("title") or "",
+            "url": article.get("url") or "",
+        }
+        for article in articles
+        if article.get("symbol")
+    ]
+    return pd.DataFrame(
+        rows,
+        columns=["published", "ticker", "source", "title", "url"],
+    )
 
 
 def _stock_pick_snapshot_date(today: date | None = None) -> str:
@@ -1379,16 +1428,53 @@ def render_ticker_search_tab(cfg: PipelineConfig) -> None:
 
 
 def render_ticker_counts_tab(cfg: PipelineConfig) -> None:
-    counts = ticker_counts_df(cfg)
+    selected_news_days = st.selectbox(
+        "News mention window",
+        TICKER_NEWS_DAY_OPTIONS,
+        index=0,
+        format_func=lambda days: f"Last {days} day{'s' if days != 1 else ''}",
+    )
+    articles = load_ticker_news_window_articles(
+        cfg,
+        news_days=selected_news_days,
+    )
+    counts = ticker_counts_df(
+        cfg,
+        news_days=selected_news_days,
+        articles=articles,
+    )
     if counts.empty:
-        st.info("No cached ticker articles found for the current news window.")
+        st.info(
+            "No cached ticker articles found for the selected news mention window."
+        )
         return
 
-    st.caption(f"Cached article-symbol counts from the last {cfg.news_days} days")
+    st.caption(
+        f"Cached article-symbol counts from the last {selected_news_days} "
+        f"day{'s' if selected_news_days != 1 else ''}"
+    )
     st.dataframe(
         counts,
         width="stretch",
         hide_index=True,
+    )
+
+    article_rows = ticker_articles_df(
+        cfg,
+        news_days=selected_news_days,
+        articles=articles,
+    )
+    st.caption(
+        f"Cached articles from the last {selected_news_days} "
+        f"day{'s' if selected_news_days != 1 else ''}"
+    )
+    st.dataframe(
+        article_rows,
+        width="stretch",
+        hide_index=True,
+        column_config={
+            "url": st.column_config.LinkColumn("URL"),
+        },
     )
 
 
