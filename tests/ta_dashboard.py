@@ -44,7 +44,6 @@ if not all(
 
 
 FUNDAMENTAL_TOP_N = 15
-STOCK_PICK_HISTORY_START_DATE = "2017-12-31"
 TICKER_PATTERN = re.compile(r"^[A-Z][A-Z0-9.-]{0,9}$")
 
 
@@ -427,7 +426,7 @@ def _history_frame_to_stock_pick_bar_rows(
     return rows
 
 
-def _fetch_missing_stock_pick_bars(
+def _fetch_stock_pick_bars(
     tickers: list[str],
     *,
     start_date: str,
@@ -440,7 +439,7 @@ def _fetch_missing_stock_pick_bars(
 
     api_key = os.getenv("FMP_API_KEY")
     if not api_key:
-        return "FMP_API_KEY is not set; missing price rows were left blank."
+        return "FMP_API_KEY is not set; stock-pick price rows were not refreshed."
 
     try:
         toolkit = toolkit_factory(
@@ -463,6 +462,19 @@ def _fetch_missing_stock_pick_bars(
                 db_path=db_path,
             )
     return None
+
+
+def _needs_stock_pick_price_refresh(
+    row: dict[str, Any],
+    end_date: str,
+) -> bool:
+    latest_date = row.get("latest_date")
+    return (
+        row.get("base_close") is None
+        or row.get("latest_close") is None
+        or not latest_date
+        or str(latest_date) < end_date
+    )
 
 
 def stock_pick_returns_df(
@@ -513,16 +525,16 @@ def stock_pick_returns_df(
         ticker: _return_from_bar_rows(date_key, ticker, rows)
         for ticker, rows in rows_by_ticker.items()
     }
-    missing = [
+    refresh_tickers = [
         ticker
         for ticker, row in returns_by_ticker.items()
-        if row["base_close"] is None or row["latest_close"] is None
+        if _needs_stock_pick_price_refresh(row, end_date)
     ]
 
     warnings: list[str] = []
-    fetch_warning = _fetch_missing_stock_pick_bars(
-        missing,
-        start_date=STOCK_PICK_HISTORY_START_DATE,
+    fetch_warning = _fetch_stock_pick_bars(
+        refresh_tickers,
+        start_date=price_start_date,
         end_date=end_date,
         toolkit_factory=toolkit_factory,
         db_path=db_path,
@@ -530,8 +542,8 @@ def stock_pick_returns_df(
     if fetch_warning:
         warnings.append(fetch_warning)
 
-    if missing and not fetch_warning:
-        for ticker in missing:
+    if refresh_tickers and not fetch_warning:
+        for ticker in refresh_tickers:
             rows_by_ticker[ticker] = ta_cache.load_daily_bars(
                 ticker,
                 price_start_date,
