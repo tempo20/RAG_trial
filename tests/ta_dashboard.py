@@ -60,51 +60,6 @@ st.markdown(
     [data-testid="stSidebar"], [data-testid="collapsedControl"] {
         display: none;
     }
-
-    .st-key-candidate_table_sticky {
-        position: fixed;
-        top: 3.25rem;
-        left: 0;
-        right: 0;
-        width: auto;
-        max-width: none;
-        z-index: 1000;
-        background: var(--background-color);
-        padding: 0.6rem 0 0.6rem;
-        border-bottom: 1px solid var(--border-color);
-        box-shadow: 0 8px 18px rgba(0, 0, 0, 0.18);
-    }
-
-    .st-key-candidate_table_sticky [data-testid="stHorizontalBlock"],
-    .st-key-candidate_table_sticky [data-testid="column"],
-    .st-key-candidate_table_sticky .stMarkdown {
-        background: var(--background-color);
-        color: var(--text-color);
-        margin-bottom: 0;
-    }
-
-    .st-key-candidate_table_sticky .stMarkdown p,
-    .st-key-candidate_table_sticky .stMarkdown strong {
-        color: var(--text-color);
-    }
-
-    .st-key-candidate_table_sticky [data-testid="stButton"] button {
-        background: var(--secondary-background-color) !important;
-        border: 2px solid var(--border-color) !important;
-        color: var(--text-color) !important;
-        font-size: 1.35rem;
-        font-weight: 700;
-        min-height: 2.75rem;
-        padding: 0;
-    }
-
-    @media (max-width: 900px) {
-        .st-key-candidate_table_sticky {
-            left: 0;
-            right: 0;
-            width: auto;
-        }
-    }
     </style>
     """,
     unsafe_allow_html=True,
@@ -1338,44 +1293,20 @@ def render_bullish_candidates_tab(
     company_profiles = load_company_profiles(tuple(summary["ticker"].astype(str).tolist()))
     summary = add_company_profile_columns(summary, company_profiles)
     fundamental_analyses = load_or_generate_fundamental_analyses(ranked, top_n=FUNDAMENTAL_TOP_N)
-    with st.container(key="candidate_table_sticky"):
-        toggle_label = "^" if st.session_state.candidate_table_expanded else "v"
-        toggle_col, title_col = st.columns(
-            [0.06, 0.94],
-            vertical_alignment="center",
-        )
-        if toggle_col.button(
-            toggle_label,
-            key="toggle_candidate_table",
+    with st.container(key="candidate_table"):
+        st.markdown("**Top bullish candidates**")
+        table_state = st.dataframe(
+            summary,
             width="stretch",
-            help=(
-                "Collapse candidate table"
-                if st.session_state.candidate_table_expanded
-                else "Expand candidate table"
-            ),
-        ):
-            st.session_state.candidate_table_expanded = not st.session_state.candidate_table_expanded
-            st.rerun()
-        title_col.markdown("**Top bullish candidates**")
+            hide_index=True,
+            on_select="rerun",
+            selection_mode="single-row",
+            height=280,
+        )
+        selected_rows = table_state.selection.rows
+        if selected_rows and selected_rows[0] < len(summary):
+            st.session_state.selected_candidate_index = selected_rows[0]
 
-        if st.session_state.candidate_table_expanded:
-            table_state = st.dataframe(
-                summary,
-                width="stretch",
-                hide_index=True,
-                on_select="rerun",
-                selection_mode="single-row",
-                height=280,
-            )
-            selected_rows = table_state.selection.rows
-            if selected_rows and selected_rows[0] < len(summary):
-                st.session_state.selected_candidate_index = selected_rows[0]
-
-    spacer_height = 410 if st.session_state.candidate_table_expanded else 140
-    st.markdown(
-        f'<div style="height: {spacer_height}px;"></div>',
-        unsafe_allow_html=True,
-    )
     selected_index = st.session_state.selected_candidate_index
     if selected_index >= len(summary):
         selected_index = 0
@@ -1515,8 +1446,6 @@ def render_stock_pick_returns_tab() -> None:
 
 
 def main() -> None:
-    if "candidate_table_expanded" not in st.session_state:
-        st.session_state.candidate_table_expanded = True
     if "selected_candidate_index" not in st.session_state:
         st.session_state.selected_candidate_index = 0
 
