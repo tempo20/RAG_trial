@@ -83,7 +83,22 @@ def _latest_valid_value(series: pd.Series | None) -> float | None:
     return float(valid.iloc[-1])
 
 
+def _percentile_rank(value: float | None, values: list[float]) -> float | None:
+    if value is None or not values:
+        return None
+    less = sum(1 for item in values if item < value)
+    equal = sum(1 for item in values if item == value)
+    if equal == 0:
+        return round(100.0 * less / len(values), 1)
+    return round(100.0 * (less + (equal + 1) / 2) / len(values), 1)
+
+
 def result_summary_df(results: list[SignalResult], top_n: int) -> pd.DataFrame:
+    all_rs_scores = [
+        r.relative_strength_score
+        for r in results
+        if r.relative_strength_score is not None
+    ]
     rows = []
     for rank, r in enumerate(results[:top_n], start=1):
         latest_spread = _latest_valid_value(r.spread)
@@ -95,6 +110,7 @@ def result_summary_df(results: list[SignalResult], top_n: int) -> pd.DataFrame:
             "bullish_impulse_score": round(r.bullish_impulse_score, 2) if r.bullish_impulse_score is not None else None,
             "pre_golden_score": round(r.pre_golden_score, 2) if r.pre_golden_score is not None else None,
             "relative_strength_score": round(r.relative_strength_score, 2) if r.relative_strength_score is not None else None,
+            "rs_pct_rank": _percentile_rank(r.relative_strength_score, all_rs_scores),
             "overbought_status": r.overbought_status,
             "overbought_score": round(r.overbought_score, 2) if r.overbought_score is not None else None,
             "spread_%": round(latest_spread * 100, 2) if latest_spread is not None else None,
@@ -110,6 +126,7 @@ def result_summary_df(results: list[SignalResult], top_n: int) -> pd.DataFrame:
 
 def selected_result_details_df(r: SignalResult) -> pd.DataFrame:
     latest_spread = _latest_valid_value(r.spread)
+    latest_adx = _latest_valid_value(r.adx)
     latest_extension_atr = _latest_valid_value(r.extension_atr)
     latest_distance_from_sma50 = _latest_valid_value(r.distance_from_sma50)
     latest_stoch_rsi = _latest_valid_value(r.stoch_rsi)
@@ -137,6 +154,14 @@ def selected_result_details_df(r: SignalResult) -> pd.DataFrame:
         (
             "Liquidity/volume score",
             f"{r.liquidity_volume_score:.2f}" if r.liquidity_volume_score is not None else "None",
+        ),
+        (
+            "ADX",
+            f"{latest_adx:.2f}" if latest_adx is not None else "None",
+        ),
+        (
+            "Momentum score",
+            f"{r.momentum_score:.2f}" if r.momentum_score is not None else "None",
         ),
         ("Overbought status", r.overbought_status or "None"),
         (
@@ -189,6 +214,7 @@ def selected_result_reasons_df(r: SignalResult) -> pd.DataFrame:
         [{"category": "bullish_impulse", "reason": reason} for reason in r.bullish_impulse_reasons]
         + [{"category": "pre_golden", "reason": reason} for reason in r.pre_golden_reasons]
         + [{"category": "relative_strength", "reason": reason} for reason in r.relative_strength_reasons]
+        + [{"category": "momentum", "reason": reason} for reason in r.momentum_reasons]
         + [{"category": "overbought", "reason": reason} for reason in r.overbought_reasons]
     )
     if not rows:
@@ -977,12 +1003,12 @@ def _add_series_trace(
 
 def make_signal_chart(r: SignalResult, cfg: PipelineConfig) -> go.Figure:
     fig = make_subplots(
-        rows=4,
+        rows=5,
         cols=1,
         shared_xaxes=True,
         vertical_spacing=0.04,
-        row_heights=[0.50, 0.18, 0.17, 0.15],
-        subplot_titles=("Price", "SMA spread %", "MACD", "RSI"),
+        row_heights=[0.43, 0.16, 0.15, 0.13, 0.13],
+        subplot_titles=("Price", "SMA spread %", "MACD", "RSI", "OBV"),
     )
 
     _add_series_trace(fig, r.close, name="Close", row=1, col=1, color="#4da3ff")
@@ -1149,6 +1175,8 @@ def make_signal_chart(r: SignalResult, cfg: PipelineConfig) -> go.Figure:
     fig.add_hline(y=cfg.overbought_rsi_level, line_dash="dot", row=4, col=1)
     fig.add_hline(y=cfg.severe_overbought_rsi_level, line_dash="dash", row=4, col=1)
 
+    _add_series_trace(fig, r.obv, name="OBV", row=5, col=1, color="#34d399")
+
     final_score_text = f"{r.final_bullish_score:.2f}" if r.final_bullish_score is not None else "N/A"
     overbought_score_text = f"{r.overbought_score:.2f}" if r.overbought_score is not None else "N/A"
     fig.update_layout(
@@ -1157,7 +1185,7 @@ def make_signal_chart(r: SignalResult, cfg: PipelineConfig) -> go.Figure:
             f"Final Score={final_score_text} | "
             f"Overbought={r.overbought_status or 'N/A'} ({overbought_score_text})"
         ),
-        height=980,
+        height=1100,
         hovermode="x unified",
         template="plotly_dark",
         legend={
@@ -1173,7 +1201,8 @@ def make_signal_chart(r: SignalResult, cfg: PipelineConfig) -> go.Figure:
     fig.update_yaxes(title_text="Spread %", row=2, col=1)
     fig.update_yaxes(title_text="MACD", row=3, col=1)
     fig.update_yaxes(title_text="RSI", row=4, col=1)
-    fig.update_xaxes(title_text="Date", row=4, col=1)
+    fig.update_yaxes(title_text="OBV", row=5, col=1)
+    fig.update_xaxes(title_text="Date", row=5, col=1)
     return fig
 
 

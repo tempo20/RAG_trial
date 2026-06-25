@@ -111,6 +111,7 @@ class PipelineConfig:
     cheap_momentum_50d_weight: float = 0.5
     cheap_relative_volume_weight: float = 0.25
     cheap_liquidity_weight: float = 0.05
+    prefilter_52w_high_max_distance: float = 0.20
 
     start_date: str = "2022-01-01"
     vwma_period: int = 50
@@ -143,10 +144,17 @@ class PipelineConfig:
         default_factory=lambda: ["QQQ", "SOXX", "SMH"]
     )
     relative_strength_window: int = 20
-    bullish_impulse_weight: float = 0.35
-    pre_golden_weight: float = 0.25
+    # Explicit momentum-enhancement weights total 0.85 as requested.
+    bullish_impulse_weight: float = 0.25
+    pre_golden_weight: float = 0.20
     relative_strength_weight: float = 0.15
     liquidity_volume_weight: float = 0.10
+    adx_period: int = 14
+    adx_trending_threshold: float = 25.0
+    adx_strong_threshold: float = 40.0
+    obv_slope_window: int = 10
+    obv_high_window: int = 20
+    momentum_weight: float = 0.15
     overbought_rsi_level: float = 70.0
     severe_overbought_rsi_level: float = 80.0
     stoch_rsi_period: int = 14
@@ -194,6 +202,7 @@ class CheapMarketSignal:
     momentum_50d: float
     relative_volume_5d: float
     above_sma_200: bool | None
+    distance_from_52w_high: float | None = None
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -820,6 +829,17 @@ def _cheap_market_signal(
         sma_200 = float(close.rolling(200).mean().iloc[-1])
         above_sma_200 = latest_price > sma_200
 
+    high_52w = (
+        float(close.rolling(252).max().iloc[-1])
+        if len(close) >= 252
+        else float(close.max())
+    )
+    distance_from_52w_high = None
+    if high_52w > 0:
+        distance_from_52w_high = (latest_price - high_52w) / high_52w
+        if distance_from_52w_high < -cfg.prefilter_52w_high_max_distance:
+            return None
+
     trend_score = cfg.cheap_trend_weight if above_sma_200 else 0.0
     momentum_score = (
         max(momentum_20d, 0.0) * cfg.cheap_momentum_20d_weight
@@ -844,6 +864,7 @@ def _cheap_market_signal(
         momentum_50d=momentum_50d,
         relative_volume_5d=relative_volume,
         above_sma_200=above_sma_200,
+        distance_from_52w_high=distance_from_52w_high,
     )
 
 
@@ -947,6 +968,8 @@ class SignalResult:
     relative_strength_score: float | None = None
     relative_strength_reasons: list[str] = field(default_factory=list)
     liquidity_volume_score: float | None = None
+    momentum_score: float | None = None
+    momentum_reasons: list[str] = field(default_factory=list)
     final_bullish_score: float | None = None
     regime_label: str | None = None
     overbought_score: float | None = None
@@ -961,6 +984,8 @@ class SignalResult:
     ema_20: pd.Series | None = None
     extension_atr: pd.Series | None = None
     stoch_rsi: pd.Series | None = None
+    adx: pd.Series | None = None
+    obv: pd.Series | None = None
     bb_position: pd.Series | None = None
     distance_from_sma50: pd.Series | None = None
     ema_8: pd.Series | None = None
@@ -1330,6 +1355,125 @@ def compute_stoch_rsi(rsi: pd.Series, period: int) -> pd.Series:
     rsi_max = rsi.rolling(period).max()
     denominator = (rsi_max - rsi_min).replace(0, np.nan)
     return ((rsi - rsi_min) / denominator).replace([np.inf, -np.inf], np.nan)
+
+
+def compute_adx(
+    high: pd.Series,
+    low: pd.Series,
+    close: pd.Series,
+    period: int = 14,
+) -> pd.Series:
+    """
+    Compute Average Directional Index using Wilder smoothing.
+
+    Returns a Series aligned to close, with NaN where there is insufficient data.
+    """
+    close = pd.to_numeric(close, errors="coerce").sort_index()
+    high = pd.to_numeric(high, errors="coerce").reindex(close.index)
+    low = pd.to_numeric(low, errors="coerce").reindex(close.index)
+
+    up_move = high.diff()
+    down_move = -low.diff()
+    plus_dm = pd.Series(
+        np.where((up_move > down_move) & (up_move > 0), up_move, 0.0),
+        index=close.index,
+    )
+    minus_dm = pd.Series(
+        np.where((down_move > up_move) & (down_move > 0), down_move, 0.0),
+        index=close.index,
+    )
+
+    prev_close = close.shift(1)
+    true_range = pd.concat(
+        [
+            high - low,
+            (high - prev_close).abs(),
+            (low - prev_close).abs(),
+        ],
+        axis=1,
+    ).max(axis=1, skipna=True)
+    alpha = 1 / period
+    atr = true_range.ewm(alpha=alpha, adjust=False, min_periods=period).mean()
+    plus_di = 100 * plus_dm.ewm(alpha=alpha, adjust=False, min_periods=period).mean() / atr.replace(0, np.nan)
+    minus_di = 100 * minus_dm.ewm(alpha=alpha, adjust=False, min_periods=period).mean() / atr.replace(0, np.nan)
+    dx = (100 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan))
+    return dx.ewm(alpha=alpha, adjust=False, min_periods=period).mean().replace(
+        [np.inf, -np.inf],
+        np.nan,
+    )
+
+
+def compute_obv(
+    close: pd.Series,
+    volume: pd.Series,
+) -> pd.Series:
+    """Compute On-Balance Volume aligned to close."""
+    close = pd.to_numeric(close, errors="coerce").sort_index()
+    volume = pd.to_numeric(volume, errors="coerce").reindex(close.index).fillna(0.0)
+    direction = np.sign(close.diff()).fillna(0.0)
+    obv_delta = volume.where(direction > 0, 0.0)
+    obv_delta = obv_delta.where(direction >= 0, -volume)
+    return obv_delta.cumsum().replace([np.inf, -np.inf], np.nan)
+
+
+def compute_momentum_metrics(
+    close: pd.Series,
+    high: pd.Series,
+    low: pd.Series,
+    volume: pd.Series,
+    cfg: PipelineConfig,
+) -> tuple[float, list[str], pd.Series, pd.Series]:
+    """Score momentum quality using ADX trend strength and OBV confirmation."""
+    close = pd.to_numeric(close, errors="coerce").sort_index()
+    high = pd.to_numeric(high, errors="coerce").reindex(close.index)
+    low = pd.to_numeric(low, errors="coerce").reindex(close.index)
+    volume = pd.to_numeric(volume, errors="coerce").reindex(close.index)
+
+    adx = compute_adx(high=high, low=low, close=close, period=cfg.adx_period)
+    obv = compute_obv(close=close, volume=volume)
+    score = 0.0
+    reasons: list[str] = []
+
+    latest_adx = _latest_valid_value(adx)
+    adx_5d_ago = _value_days_ago(adx, 5)
+    latest_obv = _latest_valid_value(obv)
+    obv_window_ago = _value_days_ago(obv, cfg.obv_slope_window)
+    latest_close = _latest_valid_value(close)
+    close_window_ago = _value_days_ago(close, cfg.obv_slope_window)
+
+    if latest_adx is not None and latest_adx > cfg.adx_trending_threshold:
+        score += 2.0
+        reasons.append(f"ADX above {cfg.adx_trending_threshold:g}")
+    if latest_adx is not None and latest_adx > cfg.adx_strong_threshold:
+        score += 1.0
+        reasons.append(f"ADX above {cfg.adx_strong_threshold:g}")
+    if latest_adx is not None and adx_5d_ago is not None and latest_adx > adx_5d_ago:
+        score += 1.0
+        reasons.append("ADX rising over 5 days")
+
+    if latest_obv is not None and obv_window_ago is not None and latest_obv > obv_window_ago:
+        score += 1.5
+        reasons.append(f"OBV rising over {cfg.obv_slope_window} days")
+
+    obv_high_window = obv.dropna().tail(cfg.obv_high_window)
+    if latest_obv is not None and not obv_high_window.empty and latest_obv >= float(obv_high_window.max()):
+        score += 1.5
+        reasons.append(f"OBV at {cfg.obv_high_window}-day high")
+
+    if (
+        latest_close is not None
+        and close_window_ago is not None
+        and latest_obv is not None
+        and obv_window_ago is not None
+        and latest_close > close_window_ago
+        and latest_obv < obv_window_ago
+    ):
+        score -= 2.0
+        reasons.append("OBV divergence: price rising while OBV falls")
+
+    if not reasons:
+        reasons.append("momentum neutral")
+    return score, reasons, adx, obv
 
 
 def classify_overbought(score: float, cfg: PipelineConfig) -> str:
@@ -1827,6 +1971,13 @@ def compute_signals(
             rsi=rsi,
             cfg=cfg,
         )
+        momentum_score, momentum_reasons, adx, obv = compute_momentum_metrics(
+            close=close,
+            high=high,
+            low=low,
+            volume=volume,
+            cfg=cfg,
+        )
         relative_strength_score, relative_strength_reasons = compute_relative_strength_score(
             ticker=ticker,
             close=close,
@@ -1838,6 +1989,7 @@ def compute_signals(
             + cfg.pre_golden_weight * pre_golden_score
             + cfg.relative_strength_weight * relative_strength_score
             + cfg.liquidity_volume_weight * liquidity_volume_score
+            + cfg.momentum_weight * momentum_score
         )
         latest_close = _series_value(close)
         latest_sma_50 = _series_value(sma_50)
@@ -1923,12 +2075,13 @@ def compute_signals(
         latest_signal = cross_colors[-1] if cross_colors else None
         latest_date = cross_dates[-1] if cross_dates else None
         log.info(
-            "%s regime=%s final_score=%.2f impulse=%.2f pre_golden=%.2f overbought=%s %.2f",
+            "%s regime=%s final_score=%.2f impulse=%.2f pre_golden=%.2f momentum=%.2f overbought=%s %.2f",
             ticker,
             regime_label,
             final_bullish_score,
             bullish_impulse_score,
             pre_golden_score,
+            momentum_score,
             overbought_metrics.status,
             overbought_metrics.score,
         )
@@ -1962,6 +2115,8 @@ def compute_signals(
             relative_strength_score=relative_strength_score,
             relative_strength_reasons=relative_strength_reasons,
             liquidity_volume_score=liquidity_volume_score,
+            momentum_score=momentum_score,
+            momentum_reasons=momentum_reasons,
             final_bullish_score=final_bullish_score,
             regime_label=regime_label,
             overbought_score=overbought_metrics.score,
@@ -1976,6 +2131,8 @@ def compute_signals(
             ema_20=overbought_metrics.ema_20,
             extension_atr=overbought_metrics.extension_atr,
             stoch_rsi=overbought_metrics.stoch_rsi,
+            adx=adx,
+            obv=obv,
             bb_position=overbought_metrics.bb_position,
             distance_from_sma50=overbought_metrics.distance_from_sma50,
             ema_8=ema_8,
