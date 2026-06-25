@@ -1,0 +1,15 @@
+simple scraper -> tgrag_setup -> macro_extract -> neo4j_sync -> chatter
+
+Package entrypoints:
+.\venv\Scripts\python.exe -m rag_trial.ingestion.simple_scraper
+.\venv\Scripts\python.exe -m rag_trial.ingestion.tgrag_setup
+.\venv\Scripts\python.exe -m rag_trial.analysis.macro_extract
+.\venv\Scripts\python.exe -m rag_trial.ingestion.neo4j_sync
+.\venv\Scripts\python.exe -m rag_trial.chat.chatter
+
+# TradingEconomics stream briefs (auxiliary source)
+ENABLE_TRADINGECONOMICS_STREAM=1
+TRADINGECONOMICS_STREAM_URL=https://tradingeconomics.com/stream
+TRADINGECONOMICS_MAX_ITEMS=60
+TRADINGECONOMICS_MIN_WORDS=20
+TRADINGECONOMICS_MAX_WORDS=120

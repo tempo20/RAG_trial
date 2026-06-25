@@ -1,0 +1,7 @@
+.\venv\Scripts\python.exe -m rag_trial.ingestion.tgrag_setup --reset --ticker-map .\data\reference\ticker_company_map.csv
+
+.\venv\Scripts\python.exe -m rag_trial.ingestion.hist_to_db --parquet .\data\market\hist_data.parquet
+
+.\venv\Scripts\python.exe -m rag_trial.chat.chatter
+
+.\venv\Scripts\python.exe -m rag_trial.ingestion.update_v2 --reset

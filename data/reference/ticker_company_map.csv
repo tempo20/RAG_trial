@@ -1,0 +1,80 @@
+ticker,company_name,aliases
+AAPL,Apple Inc.,Apple;Apple Inc
+MSFT,Microsoft Corporation,Microsoft;Microsoft Corp;Microsoft Corp.
+GOOGL,Alphabet Inc. (Class A),Alphabet;Alphabet Inc;Google;Google LLC
+AMZN,"Amazon.com, Inc.",Amazon;Amazon.com;Amazon Inc;Amazon.com Inc
+NVDA,Nvidia Corporation,Nvidia;NVIDIA;NVIDIA Corp;NVIDIA Corporation
+META,"Meta Platforms, Inc.",Meta;Meta Platforms;Facebook;Facebook Inc
+TSLA,"Tesla, Inc.",Tesla;Tesla Inc;Tesla Motors
+LLY,Eli Lilly and Company,Eli Lilly;Lilly
+AVGO,Broadcom Inc.,Broadcom;Broadcom Inc
+JPM,JPMorgan Chase & Co.,JPMorgan;JPMorgan Chase;JP Morgan;J.P. Morgan
+V,Visa Inc.,Visa;Visa Inc
+XOM,Exxon Mobil Corporation,Exxon;Exxon Mobil;ExxonMobil
+UNH,UnitedHealth Group Incorporated,UnitedHealth;UnitedHealth Group
+MA,Mastercard Incorporated,Mastercard;MasterCard
+COST,Costco Wholesale Corporation,Costco;Costco Wholesale
+HD,"The Home Depot, Inc.",Home Depot;The Home Depot
+PG,The Procter & Gamble Company,Procter & Gamble;P&G;Procter and Gamble
+JNJ,Johnson & Johnson,J&J;Johnson and Johnson
+ORCL,Oracle Corporation,Oracle;Oracle Corp
+ADBE,Adobe Inc.,Adobe;Adobe Systems
+CRM,"Salesforce, Inc.",Salesforce;Salesforce Inc;Salesforce.com
+KO,The Coca-Cola Company,Coca-Cola;Coke;Coca Cola
+PEP,"PepsiCo, Inc.",PepsiCo;Pepsi
+ABBV,AbbVie Inc.,AbbVie;Abbvie
+CVX,Chevron Corporation,Chevron;Chevron Corp
+MRK,"Merck & Co., Inc.",Merck;Merck & Co;Merck and Co
+BAC,Bank of America Corporation,Bank of America;BofA;BoA
+WMT,Walmart Inc.,Walmart;Wal-Mart
+MCD,McDonald's Corporation,McDonald's;McDonalds
+CSCO,"Cisco Systems, Inc.",Cisco;Cisco Systems
+ACN,Accenture plc,Accenture
+INTC,Intel Corporation,Intel;Intel Corp
+AMD,"Advanced Micro Devices, Inc.",Advanced Micro Devices;AMD Inc
+NFLX,"Netflix, Inc.",Netflix;Netflix Inc
+QCOM,QUALCOMM Incorporated,Qualcomm;Qualcomm Inc
+TXN,Texas Instruments Incorporated,Texas Instruments;TI
+LIN,Linde plc,Linde
+NEE,"NextEra Energy, Inc.",NextEra;NextEra Energy
+PM,Philip Morris International Inc.,Philip Morris;Philip Morris International
+AMGN,Amgen Inc.,Amgen
+IBM,International Business Machines Corporation,IBM;International Business Machines
+HON,Honeywell International Inc.,Honeywell
+INTU,Intuit Inc.,Intuit
+UPS,"United Parcel Service, Inc.",UPS;United Parcel Service
+RTX,RTX Corporation,RTX;Raytheon;Raytheon Technologies
+LOW,"Lowe's Companies, Inc.",Lowe's;Lowes;Lowe's Companies
+CAT,Caterpillar Inc.,Caterpillar;CAT Inc
+SPGI,S&P Global Inc.,S&P Global;SP Global;Standard & Poor's Global
+GS,"The Goldman Sachs Group, Inc.",Goldman Sachs;Goldman Sachs Group
+BLK,"BlackRock, Inc.",BlackRock;Blackrock
+DE,Deere & Company,Deere;John Deere;Deere and Company
+TMO,Thermo Fisher Scientific Inc.,Thermo Fisher;Thermo Fisher Scientific
+ISRG,"Intuitive Surgical, Inc.",Intuitive Surgical
+AXP,American Express Company,American Express;AmEx;Amex
+SYK,Stryker Corporation,Stryker
+BKNG,Booking Holdings Inc.,Booking Holdings;Booking.com;Priceline
+MDLZ,"Mondelez International, Inc.",Mondelez;Mondelez International;Mondelēz
+GILD,"Gilead Sciences, Inc.",Gilead;Gilead Sciences
+ADP,"Automatic Data Processing, Inc.",ADP;Automatic Data Processing
+LMT,Lockheed Martin Corporation,Lockheed Martin
+CB,Chubb Limited,Chubb
+MO,"Altria Group, Inc.",Altria;Altria Group
+ZTS,Zoetis Inc.,Zoetis
+PNC,"The PNC Financial Services Group, Inc.",PNC;PNC Financial;PNC Financial Services
+CI,The Cigna Group,Cigna;The Cigna Group
+MMC,"Marsh & McLennan Companies, Inc.",Marsh McLennan;Marsh & McLennan;MMC
+PLD,"Prologis, Inc.",Prologis
+ELV,"Elevance Health, Inc.",Elevance Health;Anthem
+DUK,Duke Energy Corporation,Duke Energy
+SO,The Southern Company,Southern Company
+VRTX,Vertex Pharmaceuticals Incorporated,Vertex Pharmaceuticals;Vertex
+REGN,"Regeneron Pharmaceuticals, Inc.",Regeneron;Regeneron Pharmaceuticals
+BDX,"Becton, Dickinson and Company","Becton Dickinson;BD;Becton, Dickinson"
+ETN,Eaton Corporation plc,Eaton;Eaton Corp
+APD,"Air Products and Chemicals, Inc.",Air Products;Air Products and Chemicals
+SHW,The Sherwin-Williams Company,Sherwin-Williams;Sherwin Williams
+ITW,Illinois Tool Works Inc.,Illinois Tool Works;ITW
+EOG,"EOG Resources, Inc.",EOG Resources;EOG
+FDX,FedEx Corporation,FedEx;Federal Express
