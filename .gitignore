@@ -1,31 +1,21 @@
 venv/
-notebooks/
-Notebooks/
 runtime/
-data/articles/
-data/market/
 .env
 .env.*
 !.env.example
-*.txt 
-*.json
-*.ipynb
 __pycache__/
 *.parquet
 *.db
 *.sqlite
 *.sqlite3
+.streamlit/config.toml
+.env.example
+
+# Bulk/generated data
 *.csv
-!requirements.txt
-test_simple_scraper_v2.py
-test_financial_entity_linker.py
-my_database.db
-my_database_snapshot.db
-notebooks/test.py
-timesfm*
-test*.py
-parallel_progress_suite.py
-tests/test*.py
-# test_ta_cache.py
-overbought_test.py
-pytest-cache*
+!data/reference/*.csv
+data/articles/
+data/market/
+
+# Notebooks (optional — remove or narrow if you want them tracked)
+*.ipynb
