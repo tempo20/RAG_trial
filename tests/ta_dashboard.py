@@ -27,7 +27,13 @@ from plotly.subplots import make_subplots
 
 from rag_trial.chat import chatter
 from rag_trial.db import ta_cache
-from ta_pipe import PipelineConfig, compute_signals, run_pipeline, SignalResult
+from ta_pipe import (
+    PipelineConfig,
+    SignalResult,
+    classify_regime,
+    compute_signals,
+    run_pipeline,
+)
 
 if not all(
     hasattr(ta_cache, name)
@@ -81,6 +87,454 @@ def _latest_valid_value(series: pd.Series | None) -> float | None:
     if valid.empty:
         return None
     return float(valid.iloc[-1])
+
+
+def _series_value_on_date(
+    series: pd.Series | None,
+    target_date: date,
+) -> float | None:
+    """Return the value on target_date, or the nearest prior valid value."""
+    if series is None or series.empty:
+        return None
+
+    values = pd.to_numeric(series, errors="coerce").replace(
+        [float("inf"), -float("inf")],
+        pd.NA,
+    ).dropna()
+    if values.empty:
+        return None
+
+    values = values.copy()
+    values.index = pd.to_datetime(values.index)
+    if isinstance(values.index, pd.DatetimeIndex) and values.index.tz is not None:
+        values.index = values.index.tz_localize(None)
+    values = values.sort_index()
+    prior = values[values.index <= pd.Timestamp(target_date)]
+    if prior.empty:
+        return None
+    return float(prior.iloc[-1])
+
+
+def _clean_close_series(result: SignalResult) -> pd.Series:
+    if result.close is None:
+        return pd.Series(dtype="float64")
+
+    close = pd.to_numeric(result.close, errors="coerce").replace(
+        [float("inf"), -float("inf")],
+        pd.NA,
+    ).dropna()
+    if close.empty:
+        return close.astype("float64")
+
+    close = close.astype("float64").copy()
+    close.index = pd.to_datetime(close.index)
+    if isinstance(close.index, pd.DatetimeIndex) and close.index.tz is not None:
+        close.index = close.index.tz_localize(None)
+    return close.sort_index()
+
+
+def _position_slice_from_entry(
+    close: pd.Series,
+    entry_date: date,
+) -> dict[str, Any]:
+    """Resolve the market bar and price slice used for entry-date context."""
+    if close is None or close.empty:
+        empty = close.iloc[0:0] if close is not None else pd.Series(dtype="float64")
+        return {
+            "entry_bar_date": None,
+            "entry_bar_close": None,
+            "from_entry": empty,
+            "entry_data_warning": "No close price data is available.",
+        }
+
+    first_available = close.index.min().date()
+    last_available = close.index.max().date()
+    entry_ts = pd.Timestamp(entry_date)
+
+    if entry_date < first_available:
+        return {
+            "entry_bar_date": None,
+            "entry_bar_close": None,
+            "from_entry": close.iloc[0:0],
+            "entry_data_warning": (
+                f"Entry date {entry_date} is before the available price history "
+                f"starting on {first_available}. Date-based position metrics are unavailable."
+            ),
+        }
+
+    from_raw_entry = close[close.index >= entry_ts]
+    up_to_entry = close[close.index <= entry_ts]
+    if not from_raw_entry.empty:
+        entry_bar_date = from_raw_entry.index[0].date()
+        entry_bar_close = float(from_raw_entry.iloc[0])
+        warning = None
+    elif not up_to_entry.empty:
+        entry_bar_date = up_to_entry.index[-1].date()
+        entry_bar_close = float(up_to_entry.iloc[-1])
+        warning = (
+            f"Entry date {entry_date} is after the latest loaded price bar "
+            f"({last_available}); using the latest available bar for date-based metrics."
+        )
+    else:
+        entry_bar_date = None
+        entry_bar_close = None
+        warning = "Could not resolve an entry bar from the available price history."
+
+    from_entry = (
+        close[close.index >= pd.Timestamp(entry_bar_date)]
+        if entry_bar_date is not None
+        else close.iloc[0:0]
+    )
+    return {
+        "entry_bar_date": entry_bar_date,
+        "entry_bar_close": entry_bar_close,
+        "from_entry": from_entry,
+        "entry_data_warning": warning,
+    }
+
+
+def compute_position_context(
+    result: SignalResult,
+    cfg: PipelineConfig,
+    entry_price: float,
+    entry_date: date,
+) -> dict[str, Any]:
+    close = _clean_close_series(result)
+    slice_info = _position_slice_from_entry(close, entry_date)
+    entry_bar_date = slice_info["entry_bar_date"]
+    from_entry = slice_info["from_entry"]
+
+    if not from_entry.empty:
+        highest_close_since_entry = float(from_entry.max())
+        highest_close_date = from_entry.idxmax().date()
+    else:
+        highest_close_since_entry = None
+        highest_close_date = None
+
+    if entry_bar_date is not None:
+        regime_on_entry = classify_regime(
+            latest_close=_series_value_on_date(result.close, entry_bar_date),
+            latest_sma_50=_series_value_on_date(result.sma_50, entry_bar_date),
+            latest_sma_200=_series_value_on_date(result.sma_200, entry_bar_date),
+            latest_spread=_series_value_on_date(result.spread, entry_bar_date),
+            bullish_impulse_score=result.bullish_impulse_score,
+            pre_golden_score=result.pre_golden_score,
+            cfg=cfg,
+        )
+        regime_on_entry_is_approx = True
+    else:
+        regime_on_entry = None
+        regime_on_entry_is_approx = False
+
+    trading_days_held = max(len(from_entry) - 1, 0) if not from_entry.empty else 0
+    latest_close = _latest_valid_value(result.close)
+    return_pct = (
+        (latest_close - entry_price) / entry_price * 100
+        if latest_close is not None and entry_price > 0
+        else None
+    )
+    days_remaining_in_window = max(cfg.forward_days - trading_days_held, 0)
+
+    return {
+        "entry_bar_date": entry_bar_date,
+        "entry_bar_close": slice_info["entry_bar_close"],
+        "entry_data_warning": slice_info["entry_data_warning"],
+        "latest_close": latest_close,
+        "return_pct": return_pct,
+        "days_held": max((date.today() - entry_date).days, 0),
+        "trading_days_held": trading_days_held,
+        "days_remaining_in_window": days_remaining_in_window,
+        "window_expired": trading_days_held >= cfg.forward_days,
+        "highest_close_since_entry": highest_close_since_entry,
+        "highest_close_date": highest_close_date,
+        "regime_on_entry": regime_on_entry,
+        "regime_on_entry_is_approx": regime_on_entry_is_approx,
+        "regime_now": result.regime_label,
+        "regime_changed": (
+            regime_on_entry is not None
+            and result.regime_label is not None
+            and regime_on_entry != result.regime_label
+        ),
+    }
+
+
+def compute_exit_levels(
+    result: SignalResult,
+    cfg: PipelineConfig,
+    entry_price: float,
+    entry_date: date,
+) -> dict[str, float | None]:
+    close = _clean_close_series(result)
+    from_entry = _position_slice_from_entry(close, entry_date)["from_entry"]
+    latest_atr = _latest_valid_value(result.atr_14)
+    latest_close = _latest_valid_value(result.close)
+
+    stop_atr_1x = entry_price - latest_atr if latest_atr is not None else None
+    stop_atr_2x = entry_price - 2.0 * latest_atr if latest_atr is not None else None
+    highest_since_entry = float(from_entry.max()) if not from_entry.empty else None
+    stop_trailing_atr_2x = (
+        highest_since_entry - 2.0 * latest_atr
+        if highest_since_entry is not None and latest_atr is not None
+        else None
+    )
+
+    target_atr_1x = entry_price + latest_atr if latest_atr is not None else None
+    target_atr_2x = entry_price + 2.0 * latest_atr if latest_atr is not None else None
+    target_atr_3x = entry_price + 3.0 * latest_atr if latest_atr is not None else None
+    target_extension_1_5x = (
+        entry_price + cfg.overbought_extension_atr * latest_atr
+        if latest_atr is not None
+        else None
+    )
+    target_extension_2_5x = (
+        entry_price + cfg.severe_overbought_extension_atr * latest_atr
+        if latest_atr is not None
+        else None
+    )
+    target_extension_3x = (
+        entry_price + cfg.exhaustion_extension_atr * latest_atr
+        if latest_atr is not None
+        else None
+    )
+
+    if close.empty:
+        target_bb_upper = None
+    else:
+        rolling_mean = close.rolling(cfg.bollinger_period).mean()
+        rolling_std = close.rolling(cfg.bollinger_period).std()
+        target_bb_upper = _latest_valid_value(
+            rolling_mean + cfg.bollinger_std_mult * rolling_std
+        )
+
+    risk = entry_price - stop_atr_2x if stop_atr_2x is not None else None
+
+    def _rr(target: float | None) -> float | None:
+        if target is None or risk is None or risk <= 0:
+            return None
+        return (target - entry_price) / risk
+
+    return {
+        "latest_atr": latest_atr,
+        "latest_close": latest_close,
+        "atr_pct": (
+            latest_atr / entry_price * 100
+            if latest_atr is not None and entry_price > 0
+            else None
+        ),
+        "highest_since_entry": highest_since_entry,
+        "stop_atr_1x": stop_atr_1x,
+        "stop_atr_2x": stop_atr_2x,
+        "stop_trailing_atr_2x": stop_trailing_atr_2x,
+        "stop_sma50": _latest_valid_value(result.sma_50),
+        "stop_ema21": _latest_valid_value(result.ema_21),
+        "target_atr_1x": target_atr_1x,
+        "target_atr_2x": target_atr_2x,
+        "target_atr_3x": target_atr_3x,
+        "target_extension_1_5x": target_extension_1_5x,
+        "target_extension_2_5x": target_extension_2_5x,
+        "target_extension_3x": target_extension_3x,
+        "target_donchian_20": _latest_valid_value(result.donchian_20_high),
+        "target_donchian_55": _latest_valid_value(result.donchian_55_high),
+        "target_bb_upper": target_bb_upper,
+        "target_sma200": _latest_valid_value(result.sma_200),
+        "rr_atr_1x": _rr(target_atr_1x),
+        "rr_atr_2x": _rr(target_atr_2x),
+        "rr_atr_3x": _rr(target_atr_3x),
+        "rr_extension_1_5x": _rr(target_extension_1_5x),
+        "rr_extension_2_5x": _rr(target_extension_2_5x),
+        "rr_extension_3x": _rr(target_extension_3x),
+        "rr_donchian_20": _rr(_latest_valid_value(result.donchian_20_high)),
+        "rr_donchian_55": _rr(_latest_valid_value(result.donchian_55_high)),
+        "rr_bb_upper": _rr(target_bb_upper),
+        "rr_sma200": _rr(_latest_valid_value(result.sma_200)),
+    }
+
+
+def recommended_exits(
+    levels: dict[str, float | None],
+    context: dict[str, Any],
+    entry_price: float,
+    cfg: PipelineConfig,
+) -> list[dict[str, Any]]:
+    del entry_price
+    exits: list[dict[str, Any]] = []
+    keyed_positions: dict[str, int] = {}
+
+    if context["window_expired"]:
+        exits.append({
+            "label": "Signal window expired — review exit",
+            "type": "stop",
+            "price": None,
+            "rr": None,
+            "rationale": (
+                f"Position has been held for {context['trading_days_held']} trading days, "
+                f"beyond the {cfg.forward_days}-trading-day signal window. This is a review "
+                "flag, not an automatic sell signal."
+            ),
+            "priority": 1,
+        })
+    if context["regime_changed"] and context["regime_now"] in {
+        "bearish_or_weak",
+        "neutral",
+    }:
+        exits.append({
+            "label": "Regime deteriorated — review position",
+            "type": "stop",
+            "price": None,
+            "rr": None,
+            "rationale": (
+                f"Regime changed from {context['regime_on_entry']} to "
+                f"{context['regime_now']} since entry."
+            ),
+            "priority": 1,
+        })
+
+    def add(
+        label: str,
+        kind: str,
+        price_key: str,
+        rr_key: str | None,
+        rationale: str,
+        priority: int,
+    ) -> None:
+        item = {
+            "label": label,
+            "type": kind,
+            "price": levels.get(price_key),
+            "rr": levels.get(rr_key) if rr_key else None,
+            "rationale": rationale,
+            "priority": priority,
+        }
+        existing_position = keyed_positions.get(price_key)
+        if existing_position is None:
+            keyed_positions[price_key] = len(exits)
+            exits.append(item)
+        elif priority < exits[existing_position]["priority"]:
+            exits[existing_position] = item
+
+    targets = {
+        "target_atr_1x": (
+            "1× ATR target",
+            "rr_atr_1x",
+            "Conservative volatility-based profit objective.",
+        ),
+        "target_atr_2x": (
+            "2× ATR target",
+            "rr_atr_2x",
+            "Standard volatility-based profit objective.",
+        ),
+        "target_extension_1_5x": (
+            "1.5× ATR extension",
+            "rr_extension_1_5x",
+            "Configured overbought-extension threshold for a fast bullish impulse.",
+        ),
+        "target_extension_2_5x": (
+            "2.5× ATR extension",
+            "rr_extension_2_5x",
+            "Configured severe-overbought extension threshold.",
+        ),
+        "target_extension_3x": (
+            "Exhaustion ceiling",
+            "rr_extension_3x",
+            "Informational ATR level associated with price exhaustion risk.",
+        ),
+        "target_donchian_20": (
+            "20-day high resistance",
+            "rr_donchian_20",
+            "Near-term Donchian breakout or resistance level.",
+        ),
+        "target_donchian_55": (
+            "55-day high resistance",
+            "rr_donchian_55",
+            "Longer-term Donchian breakout or resistance level.",
+        ),
+        "target_bb_upper": (
+            "Bollinger upper band",
+            "rr_bb_upper",
+            "Current upper Bollinger price band.",
+        ),
+        "target_sma200": (
+            "SMA200 reclaim target",
+            "rr_sma200",
+            "Key long-term trend and price-reclaim level.",
+        ),
+    }
+
+    regime_targets = {
+        "confirmed_bullish": [
+            ("target_atr_2x", 1),
+            ("target_donchian_55", 2),
+            ("target_extension_2_5x", 2),
+        ],
+        "bullish_impulse": [
+            ("target_extension_1_5x", 1),
+            ("target_atr_2x", 2),
+            ("target_donchian_20", 2),
+        ],
+        "bullish_transition": [
+            ("target_sma200", 1),
+            ("target_atr_1x", 2),
+            ("target_bb_upper", 2),
+        ],
+        "pre_golden_setup": [
+            ("target_sma200", 1),
+            ("target_atr_1x", 2),
+            ("target_bb_upper", 2),
+        ],
+    }
+    selected_targets = regime_targets.get(
+        context["regime_now"],
+        [("target_atr_1x", 1), ("target_bb_upper", 2)],
+    )
+    for price_key, priority in selected_targets:
+        label, rr_key, rationale = targets[price_key]
+        add(label, "target", price_key, rr_key, rationale, priority)
+
+    for price_key in ("target_donchian_55", "target_extension_3x"):
+        label, rr_key, rationale = targets[price_key]
+        add(label, "target", price_key, rr_key, rationale, 3)
+
+    add(
+        "Trailing 2× ATR stop",
+        "stop",
+        "stop_trailing_atr_2x",
+        None,
+        "Two ATR below the highest close since entry.",
+        1,
+    )
+    add(
+        "2× ATR stop from entry",
+        "stop",
+        "stop_atr_2x",
+        None,
+        "Primary volatility-adjusted stop measured from entry price.",
+        1,
+    )
+    add(
+        "1× ATR stop, tight",
+        "stop",
+        "stop_atr_1x",
+        None,
+        "Tighter volatility-adjusted stop measured from entry price.",
+        2,
+    )
+    add(
+        "SMA50 structural stop",
+        "stop",
+        "stop_sma50",
+        None,
+        "Current intermediate-trend support level.",
+        2,
+    )
+    add(
+        "EMA21 trailing stop",
+        "stop",
+        "stop_ema21",
+        None,
+        "Current fast-trend support, emphasized during bullish impulse regimes.",
+        2 if context["regime_now"] == "bullish_impulse" else 3,
+    )
+    return exits
 
 
 def _percentile_rank(value: float | None, values: list[float]) -> float | None:
@@ -1206,6 +1660,77 @@ def make_signal_chart(r: SignalResult, cfg: PipelineConfig) -> go.Figure:
     return fig
 
 
+def _make_exit_plan_chart(
+    result: SignalResult,
+    cfg: PipelineConfig,
+    entry_price: float,
+    entry_date: date,
+    exits: list[dict[str, Any]],
+    context: dict[str, Any],
+) -> go.Figure:
+    fig = make_signal_chart(result, cfg)
+    fig.add_vline(
+        x=pd.Timestamp(entry_date),
+        line_dash="dash",
+        line_color="#ffffff",
+    )
+    fig.add_annotation(
+        x=pd.Timestamp(entry_date),
+        y=1,
+        xref="x",
+        yref="paper",
+        text=f"Entry ${entry_price:.2f}",
+        showarrow=False,
+        xanchor="left",
+        yanchor="top",
+    )
+    fig.add_hline(
+        y=entry_price,
+        line_dash="dash",
+        line_color="#ffffff",
+        annotation_text="Entry",
+        annotation_position="top right",
+        row=1,
+        col=1,
+    )
+
+    line_styles = {
+        ("target", 1): ("solid", "#22c55e"),
+        ("target", 2): ("dash", "#fbbf24"),
+        ("target", 3): ("dot", "#94a3b8"),
+        ("stop", 1): ("solid", "#ef4444"),
+        ("stop", 2): ("dash", "#f97316"),
+        ("stop", 3): ("dot", "#f97316"),
+    }
+    for item in exits:
+        price = item.get("price")
+        if price is None:
+            continue
+        line_dash, line_color = line_styles[(item["type"], item["priority"])]
+        fig.add_hline(
+            y=price,
+            line_dash=line_dash,
+            line_color=line_color,
+            annotation_text=item["label"],
+            annotation_position="top right",
+            row=1,
+            col=1,
+        )
+
+    highest_close = context.get("highest_close_since_entry")
+    if highest_close is not None:
+        fig.add_hline(
+            y=highest_close,
+            line_dash="dot",
+            line_color="#38bdf8",
+            annotation_text=f"High since entry ${highest_close:.2f}",
+            annotation_position="top left",
+            row=1,
+            col=1,
+        )
+    return fig
+
+
 def dashboard_pipeline_config() -> PipelineConfig:
     return PipelineConfig(
         top_n=FUNDAMENTAL_TOP_N,
@@ -1387,6 +1912,173 @@ def render_ticker_search_tab(cfg: PipelineConfig) -> None:
     )
 
 
+def render_exit_planner_tab(cfg: PipelineConfig) -> None:
+    st.subheader("Exit Planner")
+    st.caption(
+        "Monitor current exit levels for an existing position. Levels use the latest loaded "
+        "indicators and are not a historical backtest."
+    )
+
+    col_ticker, col_price, col_date, col_button = st.columns(
+        [0.50, 0.20, 0.20, 0.10],
+        vertical_alignment="bottom",
+    )
+    with col_ticker:
+        raw_ticker = st.text_input("Ticker", key="exit_planner_ticker_input")
+    with col_price:
+        raw_entry_price = st.number_input(
+            "Entry price",
+            min_value=0.01,
+            step=0.01,
+            format="%.2f",
+            key="exit_planner_price_input",
+        )
+    with col_date:
+        raw_entry_date = st.date_input(
+            "Entry date",
+            key="exit_planner_date_input",
+            max_value=date.today(),
+        )
+    with col_button:
+        clicked = st.button(
+            "Search",
+            width="stretch",
+            key="exit_planner_search_button",
+        )
+
+    if not clicked:
+        st.info("Enter a ticker, entry price, and entry date, then click Search.")
+        return
+
+    ticker = normalize_search_ticker(raw_ticker)
+    if ticker is None:
+        st.warning("Enter a valid ticker (e.g. AAPL).")
+        return
+    if raw_entry_price is None or raw_entry_price <= 0:
+        st.warning("Entry price must be greater than zero.")
+        return
+    if raw_entry_date > date.today():
+        st.warning("Entry date cannot be in the future.")
+        return
+
+    entry_price = float(raw_entry_price)
+    entry_date = raw_entry_date
+    result, exit_cfg = load_search_result(ticker)
+    exit_cfg = exit_cfg or cfg
+
+    error = getattr(result, "error", None)
+    if error or result.close is None or result.close.dropna().empty:
+        st.warning(f"{ticker}: {error or 'no price data'}")
+        return
+
+    context = compute_position_context(result, exit_cfg, entry_price, entry_date)
+    levels = compute_exit_levels(result, exit_cfg, entry_price, entry_date)
+    exits = recommended_exits(levels, context, entry_price, exit_cfg)
+
+    if context.get("entry_data_warning"):
+        st.warning(context["entry_data_warning"])
+    if context["regime_on_entry_is_approx"]:
+        st.caption(
+            "Regime on entry is approximate: entry-date moving-average values are used, "
+            "but impulse/pre-golden scores come from the current loaded signal result."
+        )
+
+    def fmt_money(value: float | None) -> str:
+        return f"${value:.2f}" if value is not None else "N/A"
+
+    def fmt_pct(value: float | None) -> str:
+        return f"{value:+.2f}%" if value is not None else "N/A"
+
+    m1, m2, m3, m4, m5, m6 = st.columns(6)
+    m1.metric("Latest close", fmt_money(context["latest_close"]))
+    m2.metric(
+        "Return",
+        fmt_pct(context["return_pct"]),
+        delta=(
+            fmt_pct(context["return_pct"])
+            if context["return_pct"] is not None
+            else None
+        ),
+    )
+    m3.metric(
+        "Days held",
+        f"{context['days_held']}d ({context['trading_days_held']} trading)",
+    )
+    m4.metric(
+        "Signal window",
+        (
+            "Expired"
+            if context["window_expired"]
+            else f"{context['days_remaining_in_window']} trading days left"
+        ),
+    )
+    m5.metric(
+        "ATR % of entry",
+        f"{levels['atr_pct']:.2f}%" if levels["atr_pct"] is not None else "N/A",
+    )
+    m6.metric("Overbought", result.overbought_status or "N/A")
+
+    regime_label = context["regime_now"] or "N/A"
+    if context["regime_changed"]:
+        regime_label += " — changed"
+    left, right = st.columns(2)
+    left.info(f"Regime on entry: {context['regime_on_entry'] or 'N/A'}")
+    right.info(f"Regime now: {regime_label}")
+
+    if context["highest_close_since_entry"] is not None:
+        trailing_stop = levels["stop_trailing_atr_2x"]
+        trailing_note = (
+            f" | Trailing 2× ATR stop: ${trailing_stop:.2f}"
+            if trailing_stop is not None
+            else ""
+        )
+        st.caption(
+            f"Highest close since entry: ${context['highest_close_since_entry']:.2f} "
+            f"on {context['highest_close_date']}{trailing_note}"
+        )
+
+    sorted_exits = sorted(
+        exits,
+        key=lambda item: (
+            item["priority"],
+            item["price"] is None,
+            -(item["price"] if item["price"] is not None else 0.0),
+        ),
+    )
+    display_df = pd.DataFrame(sorted_exits)
+    display_df["price"] = display_df["price"].map(
+        lambda value: f"${value:.2f}" if pd.notna(value) else "—"
+    )
+    display_df["rr"] = display_df["rr"].map(
+        lambda value: f"{value:.2f}x" if pd.notna(value) and value > 0 else "—"
+    )
+    st.caption(
+        f"Exit plan for {ticker} | Entry: ${entry_price:.2f} on {entry_date} | "
+        f"Current regime: {context['regime_now'] or 'N/A'}"
+    )
+    st.dataframe(display_df, hide_index=True, width="stretch")
+
+    with st.expander("All computed levels"):
+        rows = [
+            {
+                "level": key,
+                "value": f"{value:.4f}" if isinstance(value, (int, float)) else "—",
+            }
+            for key, value in levels.items()
+        ]
+        st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
+
+    fig = _make_exit_plan_chart(
+        result,
+        exit_cfg,
+        entry_price,
+        entry_date,
+        exits,
+        context,
+    )
+    st.plotly_chart(fig, width="stretch")
+
+
 def render_ticker_counts_tab(cfg: PipelineConfig) -> None:
     selected_news_days = st.selectbox(
         "News mention window",
@@ -1480,14 +2172,19 @@ def main() -> None:
 
     ranked, cfg = load_results()
 
-    candidates_tab, search_tab, ticker_counts_tab, stock_pick_returns_tab = st.tabs(
-        [
-            "Bullish candidates",
-            "Ticker search",
-            "Ticker News Mentions",
-            "Stock Pick Returns",
-        ]
-    )
+    (
+        candidates_tab,
+        search_tab,
+        ticker_counts_tab,
+        stock_pick_returns_tab,
+        exit_tab,
+    ) = st.tabs([
+        "Bullish candidates",
+        "Ticker search",
+        "Ticker News Mentions",
+        "Stock Pick Returns",
+        "Exit Planner",
+    ])
     with candidates_tab:
         render_bullish_candidates_tab(ranked, cfg)
     with search_tab:
@@ -1496,6 +2193,8 @@ def main() -> None:
         render_ticker_counts_tab(cfg)
     with stock_pick_returns_tab:
         render_stock_pick_returns_tab()
+    with exit_tab:
+        render_exit_planner_tab(cfg)
 
 
 if __name__ == "__main__":
