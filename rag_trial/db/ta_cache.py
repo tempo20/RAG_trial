@@ -50,6 +50,14 @@ CREATE TABLE IF NOT EXISTS ta_stock_pick_snapshots (
     tickers_json TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS ta_company_profiles (
+    ticker TEXT PRIMARY KEY,
+    description TEXT,
+    sector TEXT,
+    industry TEXT,
+    fetched_at_utc TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS ta_fundamental_analyses (
     ticker TEXT PRIMARY KEY,
     company_name TEXT,
@@ -613,6 +621,98 @@ def load_stock_pick_dates(
     finally:
         conn.close()
     return [str(row["pick_date"]) for row in rows]
+
+
+def upsert_company_profiles(
+    profiles: dict[str, dict[str, Any]] | list[dict[str, Any]],
+    *,
+    fetched_at_utc: str | None = None,
+    db_path: str | Path | None = None,
+) -> int:
+    if isinstance(profiles, dict):
+        iterable = profiles.items()
+    else:
+        iterable = (
+            (str(profile.get("ticker") or ""), profile)
+            for profile in profiles
+            if isinstance(profile, dict)
+        )
+
+    rows: dict[str, tuple[str | None, str | None, str | None, str]] = {}
+    default_fetched_at = fetched_at_utc or utc_now_iso()
+    for ticker, profile in iterable:
+        if not isinstance(profile, dict):
+            continue
+        ticker_key = _normalize_ticker(ticker or profile.get("ticker"))
+        if not ticker_key:
+            continue
+
+        description = profile.get("description")
+        sector = profile.get("sector")
+        industry = profile.get("industry")
+        if not any(value is not None for value in (description, sector, industry)):
+            continue
+
+        rows[ticker_key] = (
+            description,
+            sector,
+            industry,
+            fetched_at_utc or profile.get("fetched_at_utc") or default_fetched_at,
+        )
+
+    if not rows:
+        return 0
+
+    ensure_cache_db(db_path)
+    conn = connect(db_path)
+    try:
+        conn.executemany(
+            """
+            INSERT INTO ta_company_profiles (
+                ticker, description, sector, industry, fetched_at_utc
+            )
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(ticker) DO UPDATE SET
+                description = excluded.description,
+                sector = excluded.sector,
+                industry = excluded.industry,
+                fetched_at_utc = excluded.fetched_at_utc
+            """,
+            [
+                (ticker, description, sector, industry, fetched_at)
+                for ticker, (description, sector, industry, fetched_at) in rows.items()
+            ],
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    return len(rows)
+
+
+def load_company_profiles(
+    tickers: list[str] | tuple[str, ...],
+    *,
+    db_path: str | Path | None = None,
+) -> dict[str, dict[str, Any]]:
+    normalized = _normalize_ticker_list([str(ticker) for ticker in tickers])
+    if not normalized:
+        return {}
+
+    ensure_cache_db(db_path)
+    placeholders = ",".join("?" for _ in normalized)
+    conn = connect(db_path)
+    try:
+        rows = conn.execute(
+            f"""
+            SELECT ticker, description, sector, industry, fetched_at_utc
+            FROM ta_company_profiles
+            WHERE ticker IN ({placeholders})
+            """,
+            tuple(normalized),
+        ).fetchall()
+    finally:
+        conn.close()
+    return {str(row["ticker"]): dict(row) for row in rows}
 
 
 def upsert_fundamental_analysis(

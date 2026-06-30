@@ -43,6 +43,8 @@ if not all(
         "load_articles_since",
         "load_stock_pick_dates",
         "load_stock_pick_snapshot",
+        "load_company_profiles",
+        "upsert_company_profiles",
         "upsert_stock_pick_snapshot",
     )
 ):
@@ -1145,32 +1147,66 @@ def _normalized_profile_tickers(tickers: tuple[str, ...]) -> tuple[str, ...]:
     return tuple(normalized)
 
 
-@st.cache_data(show_spinner=True, ttl=86400)
-def load_company_profiles(tickers: tuple[str, ...]) -> dict[str, dict[str, Any]]:
+def load_company_profiles(
+    tickers: tuple[str, ...],
+    *,
+    db_path: str | Path | None = None,
+    toolkit_factory: Callable[..., Any] = Toolkit,
+) -> dict[str, dict[str, Any]]:
     normalized = _normalized_profile_tickers(tickers)
     if not normalized:
         return {}
 
+    cached = ta_cache.load_company_profiles(normalized, db_path=db_path)
+    missing = tuple(ticker for ticker in normalized if ticker not in cached)
+    if not missing:
+        return cached
+
     api_key = os.getenv("FMP_API_KEY")
     if not api_key:
         error = "FMP_API_KEY is not set."
-        return {ticker: _empty_profile_payload(ticker, error) for ticker in normalized}
-
-    try:
-        toolkit = Toolkit(list(normalized), api_key=api_key)
-        profile = toolkit.get_profile()
-    except Exception as exc:
-        error = _profile_error_text(exc, api_key)
-        return {ticker: _empty_profile_payload(ticker, error) for ticker in normalized}
-
-    if profile is None or profile.empty:
         return {
-            ticker: _empty_profile_payload(ticker, "FinanceToolkit returned no profile data.")
+            ticker: cached.get(ticker, _empty_profile_payload(ticker, error))
             for ticker in normalized
         }
 
-    return {
+    try:
+        toolkit = toolkit_factory(list(missing), api_key=api_key)
+        profile = toolkit.get_profile()
+    except Exception as exc:
+        error = _profile_error_text(exc, api_key)
+        return {
+            ticker: cached.get(ticker, _empty_profile_payload(ticker, error))
+            for ticker in normalized
+        }
+
+    if profile is None or profile.empty:
+        error = "FinanceToolkit returned no profile data."
+        return {
+            ticker: cached.get(ticker, _empty_profile_payload(ticker, error))
+            for ticker in normalized
+        }
+
+    fetched = {
         ticker: _profile_payload_from_frame(ticker, profile)
+        for ticker in missing
+    }
+    persistable = {
+        ticker: payload
+        for ticker, payload in fetched.items()
+        if any(
+            payload.get(field) is not None
+            for field in ("description", "sector", "industry")
+        )
+    }
+    ta_cache.upsert_company_profiles(persistable, db_path=db_path)
+
+    unavailable_error = "FinanceToolkit returned no profile data for this ticker."
+    return {
+        ticker: cached.get(
+            ticker,
+            persistable.get(ticker, _empty_profile_payload(ticker, unavailable_error)),
+        )
         for ticker in normalized
     }
 
