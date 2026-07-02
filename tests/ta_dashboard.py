@@ -34,6 +34,11 @@ from ta_pipe import (
     compute_signals,
     run_pipeline,
 )
+from reddit_mentions import (
+    REDDIT_CACHE_PROVIDER,
+    RedditMentionReport,
+    collect_reddit_mentions,
+)
 
 if not all(
     hasattr(ta_cache, name)
@@ -41,10 +46,13 @@ if not all(
         "load_fresh_fundamental_analysis",
         "load_articles_for_ticker",
         "load_articles_since",
+        "latest_article_published_at",
         "load_stock_pick_dates",
         "load_stock_pick_snapshot",
         "load_company_profiles",
         "upsert_company_profiles",
+        "upsert_articles",
+        "upsert_news_ticker_mentions",
         "upsert_stock_pick_snapshot",
     )
 ):
@@ -2137,6 +2145,8 @@ def render_ticker_counts_tab(cfg: PipelineConfig) -> None:
         )
         return
 
+    ta_cache.upsert_news_ticker_mentions(counts["ticker"].tolist())
+
     st.caption(
         f"Cached article-symbol counts from the last {selected_news_days} "
         f"day{'s' if selected_news_days != 1 else ''}"
@@ -2158,6 +2168,153 @@ def render_ticker_counts_tab(cfg: PipelineConfig) -> None:
     )
     st.dataframe(
         article_rows,
+        width="stretch",
+        hide_index=True,
+        column_config={
+            "url": st.column_config.LinkColumn("URL"),
+        },
+    )
+
+
+def load_reddit_mentions_report() -> RedditMentionReport:
+    return collect_reddit_mentions()
+
+
+def _reddit_cutoff_date(news_days: int) -> str:
+    return (
+        datetime.now(timezone.utc) - timedelta(days=news_days)
+    ).date().isoformat()
+
+
+def load_cached_reddit_mentions(
+    news_days: int,
+    *,
+    db_path: str | Path | None = None,
+) -> list[dict[str, Any]]:
+    return ta_cache.load_articles_since(
+        _reddit_cutoff_date(news_days),
+        provider=REDDIT_CACHE_PROVIDER,
+        db_path=db_path,
+    )
+
+
+def reddit_cache_has_recent_posts(
+    *,
+    db_path: str | Path | None = None,
+) -> bool:
+    latest_published_at = ta_cache.latest_article_published_at(
+        provider=REDDIT_CACHE_PROVIDER,
+        db_path=db_path,
+    )
+    return bool(
+        latest_published_at
+        and latest_published_at[:10] >= _reddit_cutoff_date(7)
+    )
+
+
+def persist_reddit_mentions_report(
+    report: RedditMentionReport,
+    *,
+    db_path: str | Path | None = None,
+) -> int:
+    return ta_cache.upsert_articles(
+        [post.as_cache_article() for post in report.posts],
+        provider=REDDIT_CACHE_PROVIDER,
+        fetched_at_utc=report.fetched_at_utc,
+        db_path=db_path,
+    )
+
+
+def reddit_mentions_df(articles: list[dict[str, Any]]) -> pd.DataFrame:
+    ticker_counter = Counter(
+        str(article.get("symbol") or "").strip().upper()
+        for article in articles
+        if article.get("symbol")
+    )
+    rows = [
+        {"ticker": ticker, "post_count": count}
+        for ticker, count in sorted(
+            ticker_counter.items(),
+            key=lambda item: (-item[1], item[0]),
+        )
+    ]
+    return pd.DataFrame(rows, columns=["ticker", "post_count"])
+
+
+def reddit_posts_df(articles: list[dict[str, Any]]) -> pd.DataFrame:
+    rows = [
+        {
+            "published": article.get("publishedDate") or "",
+            "ticker": str(article.get("symbol") or "").strip().upper(),
+            "source": article.get("site") or "",
+            "title": article.get("title") or "",
+            "url": article.get("url") or "",
+        }
+        for article in articles
+        if article.get("symbol")
+    ]
+    return pd.DataFrame(
+        rows,
+        columns=["published", "ticker", "source", "title", "url"],
+    )
+
+
+def render_reddit_mentions_tab() -> None:
+    selected_news_days = st.selectbox(
+        "Reddit mention window",
+        TICKER_NEWS_DAY_OPTIONS,
+        index=0,
+        format_func=lambda days: f"Last {days} day{'s' if days != 1 else ''}",
+    )
+    has_recent_cache = reddit_cache_has_recent_posts()
+    button_label = "Refresh Reddit mentions" if has_recent_cache else "Load Reddit mentions"
+
+    if st.button(button_label, key="reddit_mentions_load_refresh"):
+        try:
+            with st.spinner("Loading Reddit RSS feeds and validating tickers..."):
+                report = load_reddit_mentions_report()
+                persist_reddit_mentions_report(report)
+            st.session_state["reddit_mentions_fetch_report"] = report
+            has_recent_cache = reddit_cache_has_recent_posts()
+        except Exception as exc:
+            st.warning(f"Reddit mentions could not be loaded: {exc}")
+
+    report = st.session_state.get("reddit_mentions_fetch_report")
+    if report is not None:
+        for feed_url, error in report.feed_errors.items():
+            st.warning(f"{feed_url}: {error}")
+        if report.validation_error:
+            st.warning(f"Yahoo Finance validation: {report.validation_error}")
+
+    if not has_recent_cache:
+        st.info("Select Load Reddit mentions to fetch the configured RSS feeds.")
+        return
+
+    articles = load_cached_reddit_mentions(selected_news_days)
+    counts = reddit_mentions_df(articles)
+    if counts.empty:
+        st.info(
+            "No cached Reddit ticker mentions were found for the selected window."
+        )
+        return
+
+    st.caption(
+        f"Cached Reddit post-symbol counts from the last {selected_news_days} "
+        f"day{'s' if selected_news_days != 1 else ''}"
+    )
+    st.dataframe(
+        counts,
+        width="stretch",
+        hide_index=True,
+    )
+
+    post_rows = reddit_posts_df(articles)
+    st.caption(
+        f"Cached Reddit posts from the last {selected_news_days} "
+        f"day{'s' if selected_news_days != 1 else ''}"
+    )
+    st.dataframe(
+        post_rows,
         width="stretch",
         hide_index=True,
         column_config={
@@ -2212,12 +2369,14 @@ def main() -> None:
         candidates_tab,
         search_tab,
         ticker_counts_tab,
+        reddit_mentions_tab,
         stock_pick_returns_tab,
         exit_tab,
     ) = st.tabs([
         "Bullish candidates",
         "Ticker search",
         "Ticker News Mentions",
+        "Reddit Mentions",
         "Stock Pick Returns",
         "Exit Planner",
     ])
@@ -2227,6 +2386,8 @@ def main() -> None:
         render_ticker_search_tab(cfg)
     with ticker_counts_tab:
         render_ticker_counts_tab(cfg)
+    with reddit_mentions_tab:
+        render_reddit_mentions_tab()
     with stock_pick_returns_tab:
         render_stock_pick_returns_tab()
     with exit_tab:

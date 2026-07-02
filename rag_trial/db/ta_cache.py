@@ -31,6 +31,10 @@ CREATE TABLE IF NOT EXISTS ta_article_symbols (
     FOREIGN KEY(article_id) REFERENCES ta_articles(article_id)
 );
 
+CREATE TABLE IF NOT EXISTS news_ticker_mentions (
+    ticker TEXT PRIMARY KEY
+);
+
 CREATE TABLE IF NOT EXISTS ta_historical_daily_bars (
     ticker TEXT NOT NULL,
     bar_date TEXT NOT NULL,
@@ -535,6 +539,32 @@ def _normalize_ticker_list(tickers: list[str]) -> list[str]:
         seen.add(ticker)
         out.append(ticker)
     return out
+
+
+def upsert_news_ticker_mentions(
+    tickers: list[str],
+    *,
+    db_path: str | Path | None = None,
+) -> int:
+    normalized = _normalize_ticker_list(tickers)
+    if not normalized:
+        return 0
+
+    ensure_cache_db(db_path)
+    conn = connect(db_path)
+    try:
+        conn.executemany(
+            """
+            INSERT OR IGNORE INTO news_ticker_mentions (ticker)
+            VALUES (?)
+            """,
+            [(ticker,) for ticker in normalized],
+        )
+        written = conn.total_changes
+        conn.commit()
+    finally:
+        conn.close()
+    return written
 
 
 def upsert_stock_pick_snapshot(
